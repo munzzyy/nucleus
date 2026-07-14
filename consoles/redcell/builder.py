@@ -163,27 +163,56 @@ def _build_commix(p: dict) -> str:
     return _cmd(parts)
 
 
+def _build_amass(p: dict) -> str:
+    parts = ["amass", "enum", "-d", _ph(p, "domain", "DOMAIN")]
+    if p.get("active_flag"):
+        parts.append("-active")
+    if p.get("brute_flag"):
+        parts.append("-brute")
+    parts += ["-timeout", shlex.quote(_clean(p.get("timeout")) or "30")]
+    return _cmd(parts)
+
+
 BUILDERS = {
     "hydra": {"build": _build_hydra, "desc": "Online login brute-force (many protocols).",
-              "fields": ["target", "service", "login", "login_is_file", "password", "pass_is_file", "tasks"]},
+              "fields": ["target", "service", "login", "login_is_file", "password", "pass_is_file", "tasks"],
+              "note": "Credential attacks aren't a web-button action — you run this yourself."},
     "hashcat": {"build": _build_hashcat, "desc": "Offline hash cracking.",
-                "fields": ["hash_file", "mode", "attack", "wordlist_or_mask"]},
-    "sqlmap": {"build": _build_sqlmap, "desc": "Automated SQL injection testing.",
-               "fields": ["url", "data", "cookie", "level", "risk"]},
+                "fields": ["hash_file", "mode", "attack", "wordlist_or_mask"],
+                "note": "Offline cracking, long-running, GPU-bound — run it yourself."},
+    "sqlmap": {"build": _build_sqlmap, "desc": "SQL injection testing, including enumeration/dump (full power — "
+               "for detection-only, use the Run tab's sqlmap instead).",
+               "fields": ["url", "data", "cookie", "level", "risk"],
+               "note": "The Run tab only ever does safe detection (level=1, risk=1, no dump/shell). "
+               "Anything past that — higher level/risk, --dump, --os-shell — is here so you run it yourself."},
     "metasploit": {"build": _build_metasploit, "desc": "Exploit module resource script (msfconsole -x).",
-                   "fields": ["module", "rhosts", "rport", "payload", "lhost"]},
+                   "fields": ["module", "rhosts", "rport", "payload", "lhost"],
+                   "note": "Exploitation, not scanning — always run this yourself."},
     "medusa": {"build": _build_medusa, "desc": "Parallel online login brute-force.",
-               "fields": ["target", "service", "login", "login_is_file", "password", "pass_is_file", "tasks"]},
+               "fields": ["target", "service", "login", "login_is_file", "password", "pass_is_file", "tasks"],
+               "note": "Credential attacks aren't a web-button action — you run this yourself."},
     "john": {"build": _build_john, "desc": "Offline password hash cracking.",
-             "fields": ["hash_file", "format", "wordlist"]},
-    "ffuf": {"build": _build_ffuf, "desc": "Fast web fuzzing / directory brute-force.",
+             "fields": ["hash_file", "format", "wordlist"],
+             "note": "Offline cracking, long-running — run it yourself."},
+    "ffuf": {"build": _build_ffuf, "desc": "Fast web fuzzing / directory brute-force — arbitrary wordlist path, "
+             "any extensions/threads (the Run tab's ffuf is wordlist-registry-gated; this one isn't).",
              "fields": ["url", "wordlist", "filter_code", "threads"]},
-    "gobuster": {"build": _build_gobuster, "desc": "Directory / DNS / vhost brute-force.",
+    "gobuster": {"build": _build_gobuster, "desc": "Directory / DNS / vhost brute-force — arbitrary wordlist path "
+                 "(the Run tab's gobuster is wordlist-registry-gated; this one isn't).",
                  "fields": ["mode", "target", "wordlist", "extensions", "threads"]},
-    "wpscan": {"build": _build_wpscan, "desc": "Aggressive WordPress vuln + enumeration scan.",
+    "wpscan": {"build": _build_wpscan, "desc": "WordPress vuln + enumeration scan with a raw API token field "
+               "(the Run tab's wpscan reads the token from var/.env instead of a form field).",
                "fields": ["url", "enumerate", "api_token"]},
     "commix": {"build": _build_commix, "desc": "Automated command-injection exploitation.",
-               "fields": ["url", "data", "cookie", "level"]},
+               "fields": ["url", "data", "cookie", "level"],
+               "note": "Exploitation, not scanning — always run this yourself."},
+    "amass": {"build": _build_amass, "desc": "Subdomain enum — passive by default, -active attempts zone "
+              "transfers/cert grabs, -brute runs a wordlist brute after searches.",
+              "fields": ["domain", "active_flag", "brute_flag", "timeout"],
+              "note": "Not run from here on purpose: `amass enum` starts a local 'engine' daemon that binds "
+              "0.0.0.0:4000 with no authentication (confirmed live on this box) and can outlive the command "
+              "that started it. Run it yourself so you control when that's up — check "
+              "`pgrep -af 'amass engine'` after and `pkill -f 'amass engine'` if you don't need it anymore."},
 }
 
 

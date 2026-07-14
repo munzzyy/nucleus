@@ -10,6 +10,7 @@ ROUTES = {
     "GET /api/inventory": inventory.handle_inventory,
     "POST /api/run": runners.handle_run,
     "GET /api/history": runners.handle_history,
+    "GET /api/wordlists": runners.handle_wordlists,
     "POST /api/build": builder.handle_build,
     "POST /api/local-tool": runners.handle_local_tool,
 }

@@ -8,6 +8,8 @@
 .authcard h2 { color: var(--redcell); display: flex; align-items: center; gap: 10px; }
 .auth-line { font-weight: 700; font-size: 14px; }
 
+.build-note { border-left: 2px solid var(--redcell); padding-left: 10px; }
+
 .local-tool-card { display: flex; flex-direction: column; gap: 8px; }
 .local-tool-card .row2 { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .local-tool-card .path-input { display: flex; gap: 8px; margin-top: 4px; }

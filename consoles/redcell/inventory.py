@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from shared import common
-from consoles.redcell import runners, builder
+from consoles.redcell import runners, builder, wordlists
 
 CATEGORIES: dict[str, str] = {
     "recon": "Recon / OSINT",
@@ -337,16 +337,25 @@ def build_inventory(force_refresh: bool = False) -> dict:
 
     safe_runners = []
     for key, spec in runners.SAFE_RUNNERS.items():
+        options = [{
+            "name": name, "label": opt.label, "default": opt.default,
+            "choices": sorted(opt.choices),
+        } for name, opt in spec.options.items()]
         safe_runners.append({
             "key": key, "desc": spec.desc, "kind": spec.kind, "bin": spec.bin,
             "installed": common.which(spec.bin) is not None, "install": spec.install,
-            "option_key": spec.option_key,
-            "option_choices": sorted(spec.option_choices) if spec.option_choices else None,
-            "option_default": spec.option_default,
+            "timeout": spec.timeout, "options": options,
+            "needs_wordlist": spec.needs_wordlist,
         })
 
-    build_tools = [{"key": k, "desc": v["desc"], "fields": v["fields"]}
+    build_tools = [{"key": k, "desc": v["desc"], "fields": v["fields"], "note": v.get("note", "")}
                    for k, v in builder.BUILDERS.items()]
+
+    try:
+        wordlists_common = wordlists.common_list()
+        wordlists_total = wordlists.registry_count()
+    except Exception:
+        wordlists_common, wordlists_total = [], 0
 
     data = {
         "tools": tools,
@@ -355,6 +364,8 @@ def build_inventory(force_refresh: bool = False) -> dict:
         "local_tools": local_tools,
         "safe_runners": safe_runners,
         "build_tools": build_tools,
+        "wordlists_common": wordlists_common,
+        "wordlists_total": wordlists_total,
         "generated_at": time.time(),
     }
     _CACHE["ts"] = now

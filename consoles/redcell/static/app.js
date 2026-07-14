@@ -6,6 +6,7 @@
   let ACTIVE_CAT = "";
   let INV_SEARCH = "";
   let EXPANDED = new Set(); // categories the user has manually opened in the arsenal accordion
+  let WL_SEARCH_TIMER = null;
 
   document.addEventListener("DOMContentLoaded", init);
 
@@ -214,26 +215,56 @@
   function renderRunnerDetail() {
     const spec = currentRunnerSpec();
     const descEl = document.getElementById("run-desc");
-    const optWrap = document.getElementById("run-option-wrap");
-    const optSel = document.getElementById("run-option");
-    const optLabel = document.getElementById("run-option-label");
-    if (!spec) { descEl.textContent = ""; optWrap.classList.add("hidden"); return; }
-    descEl.textContent = spec.desc + (spec.installed ? "" : `  — not installed: ${spec.install}`);
-    if (spec.option_key) {
-      optWrap.classList.remove("hidden");
-      optLabel.textContent = spec.option_key;
-      optSel.innerHTML = "";
-      spec.option_choices.forEach(v => optSel.appendChild(N.el("option", {
-        value: v, text: v + (v === spec.option_default ? " (default)" : ""),
+    const optRow = document.getElementById("run-options-row");
+    const wlRow = document.getElementById("run-wordlist-row");
+    optRow.innerHTML = "";
+    if (!spec) { descEl.textContent = ""; wlRow.classList.add("hidden"); return; }
+    descEl.textContent = spec.desc + (spec.installed ? "" : `  — not installed: ${spec.install}`)
+      + `  (timeout ${spec.timeout}s)`;
+
+    (spec.options || []).forEach(opt => {
+      const field = N.el("div", { class: "field w-220" });
+      field.appendChild(N.el("label", { text: opt.label || opt.name }));
+      const sel = N.el("select", { "data-option": opt.name });
+      opt.choices.forEach(v => sel.appendChild(N.el("option", {
+        value: v, text: v + (v === opt.default ? " (default)" : ""),
       })));
-      optSel.value = spec.option_default;
+      sel.value = opt.default;
+      field.appendChild(sel);
+      optRow.appendChild(field);
+    });
+
+    if (spec.needs_wordlist) {
+      wlRow.classList.remove("hidden");
+      document.getElementById("run-wordlist-search").value = "";
+      populateWordlistSelect(INV.wordlists_common || []);
     } else {
-      optWrap.classList.add("hidden");
+      wlRow.classList.add("hidden");
     }
+  }
+
+  function populateWordlistSelect(results) {
+    const sel = document.getElementById("run-wordlist");
+    const countEl = document.getElementById("run-wordlist-count");
+    sel.innerHTML = "";
+    results.forEach(w => sel.appendChild(N.el("option", {
+      value: w.id, text: `${w.label}  (${w.root}, ${(w.size / 1024).toFixed(1)}KB)`,
+    })));
+    countEl.textContent = results.length ? `· ${results.length} shown` : "· no matches";
   }
 
   function wireRunner() {
     document.getElementById("run-btn").addEventListener("click", runSafeTool);
+    document.getElementById("run-wordlist-search").addEventListener("input", e => {
+      const q = e.target.value.trim();
+      clearTimeout(WL_SEARCH_TIMER);
+      WL_SEARCH_TIMER = setTimeout(async () => {
+        try {
+          const r = await N.get("/api/wordlists?q=" + encodeURIComponent(q) + "&limit=50");
+          populateWordlistSelect(r.results || []);
+        } catch (err) { /* leave the previous list showing */ }
+      }, 200);
+    });
   }
 
   async function runSafeTool() {
@@ -248,7 +279,16 @@
     if (!authorized) { N.toast("check the authorization box first", "bad"); return; }
 
     const body = { tool: spec.key, target, authorized, lab };
-    if (spec.option_key) body.options = { [spec.option_key]: document.getElementById("run-option").value };
+    const optSelects = document.querySelectorAll("#run-options-row [data-option]");
+    if (optSelects.length) {
+      body.options = {};
+      optSelects.forEach(sel => { body.options[sel.getAttribute("data-option")] = sel.value; });
+    }
+    if (spec.needs_wordlist) {
+      const wl = document.getElementById("run-wordlist").value;
+      if (!wl) { N.toast("pick a wordlist first", "bad"); return; }
+      body.wordlist = wl;
+    }
 
     status.textContent = "running...";
     out.classList.remove("hidden");
@@ -261,6 +301,7 @@
       text += (r.stdout || "").trim();
       if (r.stderr && r.stderr.trim()) text += "\n\n[stderr]\n" + r.stderr.trim();
       if (r.error) text += "\n\n[error] " + r.error;
+      if (r.out_path) text += "\n\n[saved] " + r.out_path;
       out.textContent = text || "(no output)";
       loadHistory();
     } catch (e) {
@@ -291,19 +332,33 @@
   function renderBuilderFields() {
     const spec = currentBuildSpec();
     const wrap = document.getElementById("build-fields");
+    const descEl = document.getElementById("build-desc");
+    const noteEl = document.getElementById("build-note");
     wrap.innerHTML = "";
     document.getElementById("build-result-wrap").classList.add("hidden");
+    descEl.textContent = spec ? spec.desc : "";
+    if (spec && spec.note) { noteEl.textContent = spec.note; noteEl.classList.remove("hidden"); }
+    else { noteEl.textContent = ""; noteEl.classList.add("hidden"); }
     if (!spec) return;
     spec.fields.forEach(f => {
-      const isFlag = f.endsWith("_is_file");
+      const isFileFlag = f.endsWith("_is_file");
+      const isBoolFlag = f.endsWith("_flag");
       const field = N.el("div", { class: "field" });
-      field.appendChild(N.el("label", { text: f.replace(/_/g, " ") }));
-      if (isFlag) {
+      if (isFileFlag) {
+        field.appendChild(N.el("label", { text: f.replace(/_/g, " ") }));
         const line = N.el("label", { class: "checkline" });
         line.appendChild(N.el("input", { type: "checkbox", "data-field": f }));
         line.appendChild(document.createTextNode("treat as a file/list path"));
         field.appendChild(line);
+      } else if (isBoolFlag) {
+        const name = f.replace(/_flag$/, "").replace(/_/g, " ");
+        field.appendChild(N.el("label", { text: name }));
+        const line = N.el("label", { class: "checkline" });
+        line.appendChild(N.el("input", { type: "checkbox", "data-field": f }));
+        line.appendChild(document.createTextNode("on"));
+        field.appendChild(line);
       } else {
+        field.appendChild(N.el("label", { text: f.replace(/_/g, " ") }));
         field.appendChild(N.el("input", { type: "text", "data-field": f, placeholder: f }));
       }
       wrap.appendChild(field);

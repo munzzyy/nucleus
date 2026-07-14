@@ -2,6 +2,7 @@
 var/.env
 var/*.jsonl
 var/*.log
+var/redcell-out/
 engine/reports/
 __pycache__/
 *.pyc

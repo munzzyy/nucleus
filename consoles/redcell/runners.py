@@ -10,12 +10,18 @@ Order every run passes through, and every one of these can refuse the run:
   2. authorized:true must be present in the POST body
   3. target must pass strict validation for the runner's target kind
   4. target must be in scope (public) unless lab:true is set
-  5. the binary must actually be installed
+  5. every declared option must resolve through a fixed server-side choice
+     dict — an unrecognized option key is refused, never passed through
+  6. a runner that needs a wordlist gets one ONLY via a registry id
+     (see wordlists.py) — never a raw path
+  7. the binary must actually be installed
 
-Only after all five does a subprocess get spawned. The user-supplied target
-is inserted as exactly one argv element by the runner's `build` callback —
-never split, never used to build a flag, never touched by string
-interpolation.
+Only after all seven does a subprocess get spawned. The user-supplied target
+is inserted as exactly one argv element by the runner's `build` callback.
+Every other argv element is either a fixed literal baked into this file, or
+a value looked up from a server-side dict keyed by a validated enum/id — the
+client's raw enum key or wordlist id is NEVER itself placed in argv, only
+the looked-up fixed value is.
 """
 
 from __future__ import annotations
@@ -23,17 +29,20 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import secrets
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from shared import common
+from shared import common, apikeys
+from consoles.redcell import wordlists
 
 MAX_OUTPUT = 200_000          # chars kept per stream; degrades gracefully past this
 AUDIT_LOG = common.REPO_ROOT / "var" / "redcell-scans.jsonl"
+OUT_DIR = common.REPO_ROOT / "var" / "redcell-out"
 
 
 # --------------------------------------------------------------------------
@@ -67,7 +76,17 @@ def validate_host(raw: str) -> tuple[bool, str]:
 
 def validate_url(raw: str) -> tuple[bool, str, str]:
     """Accept an http(s) URL with a validated host and no embedded credentials.
-    Returns (ok, host_or_reason, cleaned_url)."""
+    Returns (ok, host_or_reason, cleaned_url).
+
+    NOTE: the shared bad-char set (_BAD_CHARS) blocks '?', '&', '*', '!', '~'
+    — which means a URL with a query string is refused here. That's an
+    existing, deliberately strict control shared with every host validator
+    in this file; loosening it to allow query strings (needed for real
+    GET-parameter SQLi/XSS testing via nikto/wpscan/sqlmap/ffuf) is a
+    separate security decision this change does not make unilaterally. Until
+    that's revisited, url-kind runners only take bare/path URLs — anything
+    needing a query string goes through the Build tab.
+    """
     if not isinstance(raw, str) or not raw or len(raw) > 2048:
         return False, "target is empty or too long", ""
     if raw.startswith("-"):
@@ -104,95 +123,332 @@ def scope_check(host: str, lab: bool) -> tuple[bool, str]:
 
 
 # --------------------------------------------------------------------------
-# Safe runner allowlist. Fixed argv templates; TARGET (and, for a couple of
-# runners, ONE enum-validated option) are the only variable positions.
+# Output paths — server-controlled, never a client-supplied path. Used by
+# the handful of runners whose findings are worth persisting to disk in
+# addition to the stdout we already capture (nmap, nuclei).
 # --------------------------------------------------------------------------
+def _ensure_out_dir() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        OUT_DIR.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _out_path(tool: str, ext: str) -> str:
+    _ensure_out_dir()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fname = f"{tool}-{ts}-{secrets.token_hex(4)}.{ext}"
+    return str(OUT_DIR / fname)
+
+
+# --------------------------------------------------------------------------
+# Runner specs. A runner declares its target kind, a fixed timeout, zero or
+# more named OPTIONS (each a closed choice-dict — the client's chosen key is
+# validated then swapped for the server-side fixed value before it ever
+# reaches build()), whether it needs a wordlist (resolved through
+# wordlists.resolve(), never a path), and whether it wants a server-picked
+# output file. `build(ctx)` only ever sees already-validated/looked-up
+# values — it does no validation of its own.
+# --------------------------------------------------------------------------
+@dataclass
+class BuildCtx:
+    target: str
+    options: dict = field(default_factory=dict)   # name -> resolved fixed value
+    wordlist: Optional[str] = None                 # resolved absolute path
+    out_path: Optional[str] = None                 # server-picked output path
+    apikey: Optional[str] = None                   # resolved secret value, if any
+
+
+@dataclass
+class OptionSpec:
+    choices: dict                    # client key -> resolved fixed value (str or list[str])
+    default: str
+    label: str = ""
+
+
 @dataclass
 class RunnerSpec:
     bin: str
     kind: str                      # "host" | "url"
-    build: Callable[[str, str], list]
+    build: Callable[[BuildCtx], list]
     timeout: float
     install: str
     desc: str
-    option_key: Optional[str] = None
-    option_choices: Optional[dict] = None   # allowed-value -> substituted argv value
-    option_default: Optional[str] = None
+    options: dict = field(default_factory=dict)     # name -> OptionSpec
+    needs_wordlist: bool = False
+    needs_output: Optional[str] = None               # file extension, or None
+    uses_apikey: Optional[str] = None                # env-var name, or None
+
+
+# ---- nmap: fixed scan-profile enum, -Pn -T3 always, persisted -oN copy ----
+_NMAP_PROFILES = {
+    "quick":   ["-T3", "-Pn", "--top-ports", "100"],
+    "service": ["-T3", "-Pn", "-sV", "--top-ports", "100"],
+    "scripts": ["-T3", "-Pn", "-sV", "-sC", "--top-ports", "100"],
+    "vuln":    ["-T3", "-Pn", "-sV", "--script", "vuln", "--top-ports", "100"],
+    "full":    ["-T3", "-Pn", "-sV", "-p-"],
+}
+
+
+def _build_nmap(ctx: BuildCtx) -> list:
+    argv = ["nmap"] + ctx.options["profile"]
+    if ctx.out_path:
+        argv += ["-oN", ctx.out_path]
+    argv.append(ctx.target)
+    return argv
+
+
+def _build_nuclei(ctx: BuildCtx) -> list:
+    argv = ["nuclei", "-u", ctx.target, "-rl", ctx.options["rate"],
+            "-timeout", "10", "-silent", "-etags", "dos,intrusive,fuzz"]
+    tag = ctx.options.get("tags")
+    if tag:
+        argv += ["-tags", tag]
+    else:
+        argv += ["-severity", "info,low,medium,high,critical"]
+    if ctx.out_path:
+        argv += ["-o", ctx.out_path]
+    return argv
+
+
+def _build_gobuster_dir(ctx: BuildCtx) -> list:
+    return ["gobuster", "dir", "-u", ctx.target, "-w", ctx.wordlist, "-q", "-t", "10"]
+
+
+def _build_gobuster_dns(ctx: BuildCtx) -> list:
+    return ["gobuster", "dns", "--domain", ctx.target, "-w", ctx.wordlist, "-q", "-t", "10"]
+
+
+def _build_ffuf(ctx: BuildCtx) -> list:
+    url = ctx.target.rstrip("/") + "/FUZZ"
+    return ["ffuf", "-u", url, "-w", ctx.wordlist, "-t", "20", "-s",
+            "-mc", "200-299,301,302,307,401,403,405"]
+
+
+def _build_feroxbuster(ctx: BuildCtx) -> list:
+    return ["feroxbuster", "-u", ctx.target, "-w", ctx.wordlist, "-d", "2", "-q"]
+
+
+def _build_wfuzz(ctx: BuildCtx) -> list:
+    url = ctx.target.rstrip("/") + "/FUZZ"
+    return ["wfuzz", "-w", ctx.wordlist, "-t", "20", "--hc", "404", url]
+
+
+def _build_wpscan(ctx: BuildCtx) -> list:
+    argv = ["wpscan", "--url", ctx.target, "--enumerate", "vp,vt,u",
+            "--random-user-agent", "--no-banner"]
+    if ctx.apikey:
+        argv += ["--api-token", ctx.apikey]
+    return argv
 
 
 SAFE_RUNNERS: dict[str, RunnerSpec] = {
+    # ---- recon / enum ----
     "nmap": RunnerSpec(
-        bin="nmap", kind="host", timeout=120,
+        bin="nmap", kind="host", timeout=600,
         install="sudo pacman -S nmap",
-        desc="Service + version detection, top ports, no ping sweep (-Pn), non-aggressive timing.",
-        option_key="top_ports", option_choices={"100": "100", "1000": "1000"}, option_default="100",
-        build=lambda t, opt: ["nmap", "-sV", "-T3", "--top-ports", opt, "-Pn", t],
+        desc="Scan-profile enum, always -Pn -T3 (non-aggressive timing, no ping sweep). "
+             "'full' scans all 65535 ports and can take several minutes. Also writes a "
+             "normal-format copy under var/redcell-out/.",
+        options={"profile": OptionSpec(
+            choices=_NMAP_PROFILES, default="quick",
+            label="quick=top-100 · service=version detect · scripts=-sC · vuln=--script vuln · full=all ports")},
+        needs_output="txt",
+        build=_build_nmap,
     ),
     "whatweb": RunnerSpec(
         bin="whatweb", kind="url", timeout=60,
         install="yay -S whatweb",
         desc="Web technology fingerprinting at the lowest aggression level.",
-        build=lambda t, opt: ["whatweb", "--no-errors", "-a", "1", t],
+        build=lambda ctx: ["whatweb", "--no-errors", "-a", "1", ctx.target],
     ),
-    "nuclei": RunnerSpec(
-        bin="nuclei", kind="url", timeout=120,
-        install="yay -S nuclei",
-        desc="Template-based scan, rate-limited, DoS/intrusive/fuzz template tags excluded.",
-        option_key="rate", option_choices={"5": "5", "10": "10", "20": "20"}, option_default="10",
-        build=lambda t, opt: ["nuclei", "-u", t, "-rl", opt,
-                               "-severity", "info,low,medium,high,critical",
-                               "-etags", "dos,intrusive,fuzz",
-                               "-timeout", "10", "-silent"],
+    "dnsenum": RunnerSpec(
+        bin="dnsenum", kind="host", timeout=180,
+        install="yay -S dnsenum2",
+        desc="NS/MX/zone-transfer enum + default bundled dictionary brute (--noreverse skips "
+             "the netblock reverse-lookup sweep; no google scraping, no -w whois netrange).",
+        build=lambda ctx: ["dnsenum", "--noreverse", "--threads", "5", ctx.target],
     ),
     "sslscan": RunnerSpec(
         bin="sslscan", kind="host", timeout=90,
         install="sudo pacman -S sslscan",
         desc="Read-only TLS/cipher posture check.",
-        build=lambda t, opt: ["sslscan", "--no-colour", t],
+        build=lambda ctx: ["sslscan", "--no-colour", ctx.target],
     ),
     "testssl": RunnerSpec(
         bin="testssl", kind="host", timeout=120,
         install="sudo pacman -S testssl.sh",
         desc="Read-only TLS/SSL posture check (fast mode).",
-        build=lambda t, opt: ["testssl", "--fast", "--quiet", "--color", "0", t],
+        build=lambda ctx: ["testssl", "--fast", "--quiet", "--color", "0", ctx.target],
     ),
+    "wafw00f": RunnerSpec(
+        bin="wafw00f", kind="url", timeout=30,
+        install="pipx install wafw00f",
+        desc="WAF fingerprinting — passive/low-volume GET probes, reports every WAF that matches.",
+        build=lambda ctx: ["wafw00f", "-a", "-T", "10", ctx.target],
+    ),
+    "enum4linux": RunnerSpec(
+        bin="enum4linux", kind="host", timeout=120,
+        install="yay -S enum4linux",
+        desc="SMB/Samba null-session enumeration (users, shares, groups, policy, OS info).",
+        build=lambda ctx: ["enum4linux", "-a", ctx.target],
+    ),
+    "httpx": RunnerSpec(
+        bin="httpx", kind="host", timeout=30,
+        install="go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
+        desc="Fast HTTP probe — status, title, tech-detect, server header.",
+        build=lambda ctx: ["httpx", "-u", ctx.target, "-sc", "-title", "-td",
+                            "-server", "-timeout", "10", "-silent"],
+    ),
+
+    # ---- subdomain / OSINT ----
     "subfinder": RunnerSpec(
         bin="subfinder", kind="host", timeout=90,
         install="yay -S subfinder",
         desc="Passive subdomain enumeration.",
-        build=lambda t, opt: ["subfinder", "-d", t, "-silent", "-timeout", "10"],
-    ),
-    "amass": RunnerSpec(
-        bin="amass", kind="host", timeout=120,
-        install="yay -S amass",
-        desc="Passive-only subdomain enumeration (-passive, never active).",
-        build=lambda t, opt: ["amass", "enum", "-passive", "-d", t, "-timeout", "2"],
+        build=lambda ctx: ["subfinder", "-d", ctx.target, "-silent", "-timeout", "10"],
     ),
     "theharvester": RunnerSpec(
         bin="theHarvester", kind="host", timeout=90,
         install="yay -S theharvester-git",
         desc="Passive OSINT harvesting from certificate-transparency logs (crt.sh). No -c/-p (no active brute/scan flags).",
-        build=lambda t, opt: ["theHarvester", "-d", t, "-l", "100", "-b", "crtsh"],
+        build=lambda ctx: ["theHarvester", "-d", ctx.target, "-l", "100", "-b", "crtsh"],
     ),
+    "sublist3r": RunnerSpec(
+        bin="sublist3r", kind="host", timeout=90,
+        install="pipx install sublist3r",
+        desc="Passive subdomain enumeration via search-engine aggregation (no -b bruteforce module).",
+        build=lambda ctx: ["sublist3r", "-d", ctx.target, "-n"],
+    ),
+    "dnsrecon": RunnerSpec(
+        bin="dnsrecon", kind="host", timeout=60,
+        install="pipx install dnsrecon",
+        desc="Standard DNS record enumeration (NS/SOA/MX/TXT/A/AAAA/SRV). "
+             "Currently broken on this box: the pipx venv's Python 3.14 removed "
+             "urllib.request.FancyURLopener, which dnsrecon's bingenum module imports at "
+             "load time — every invocation errors before it can run. Not patched here "
+             "(third-party site-packages); wired anyway so it fails loud with a real "
+             "traceback in stderr instead of silently.",
+        build=lambda ctx: ["dnsrecon", "-d", ctx.target, "-t", "std"],
+    ),
+
+    # ---- web content discovery (brute — wordlist required) ----
+    "gobuster-dir": RunnerSpec(
+        bin="gobuster", kind="url", timeout=300,
+        install="sudo pacman -S gobuster",
+        desc="Directory/file brute-force. Needs a wordlist.",
+        needs_wordlist=True,
+        build=_build_gobuster_dir,
+    ),
+    "gobuster-dns": RunnerSpec(
+        bin="gobuster", kind="host", timeout=300,
+        install="sudo pacman -S gobuster",
+        desc="DNS subdomain brute-force. Needs a wordlist.",
+        needs_wordlist=True,
+        build=_build_gobuster_dns,
+    ),
+    "ffuf": RunnerSpec(
+        bin="ffuf", kind="url", timeout=300,
+        install="yay -S ffuf",
+        desc="Fast web fuzzer — brutes the target's top-level path with FUZZ auto-appended. Needs a wordlist.",
+        needs_wordlist=True,
+        build=_build_ffuf,
+    ),
+    "feroxbuster": RunnerSpec(
+        bin="feroxbuster", kind="url", timeout=300,
+        install="yay -S feroxbuster",
+        desc="Fast recursive content discovery, recursion capped at depth 2. Needs a wordlist.",
+        needs_wordlist=True,
+        build=_build_feroxbuster,
+    ),
+    "wfuzz": RunnerSpec(
+        bin="wfuzz", kind="url", timeout=300,
+        install="yay -S wfuzz",
+        desc="Web fuzzer — brutes the target's top-level path with FUZZ auto-appended. Needs a wordlist. "
+             "Currently broken on this box: missing the 'pkg_resources' module (setuptools) "
+             "in its interpreter — not patched here (system package); wired anyway so it "
+             "fails loud instead of silently.",
+        needs_wordlist=True,
+        build=_build_wfuzz,
+    ),
+
+    # ---- vuln scan ----
+    "nuclei": RunnerSpec(
+        bin="nuclei", kind="url", timeout=180,
+        install="yay -S nuclei",
+        desc="Template-based scan, rate-limited, dos/intrusive/fuzz tags always excluded. "
+             "Also writes a copy of findings under var/redcell-out/.",
+        options={
+            "rate": OptionSpec(choices={"5": "5", "10": "10", "20": "20"}, default="10",
+                                label="requests/sec"),
+            "tags": OptionSpec(choices={
+                "all": "", "cves": "cve", "exposures": "exposure",
+                "misconfig": "misconfig", "default-logins": "default-login",
+            }, default="all", label="template focus"),
+        },
+        needs_output="txt",
+        build=_build_nuclei,
+    ),
+    "nikto": RunnerSpec(
+        bin="nikto", kind="url", timeout=300,
+        install="sudo pacman -S nikto",
+        desc="Web server vuln/misconfig scanner, DoS-tuning-category excluded (-Tuning x6).",
+        build=lambda ctx: ["nikto", "-h", ctx.target, "-Tuning", "x6", "-nointeractive", "-ask", "no"],
+    ),
+    "wpscan": RunnerSpec(
+        bin="wpscan", kind="url", timeout=300,
+        install="sudo pacman -S wpscan",
+        desc="WordPress plugin/theme/user enumeration (-e vp,vt,u). A free WPScan API token "
+             "(WPSCAN_API_TOKEN in var/.env) unlocks the live vulnerability database — "
+             "without one this still enumerates what's installed, just without CVE matching.",
+        uses_apikey="WPSCAN_API_TOKEN",
+        build=_build_wpscan,
+    ),
+
+    # ---- SQLi detection (safe mode only — see sqlmap builder for anything past detection) ----
+    "sqlmap": RunnerSpec(
+        bin="sqlmap", kind="url", timeout=180,
+        install="sudo pacman -S sqlmap",
+        desc="SQLi DETECTION only — --batch --crawl=0 --level=1 --risk=1. Never dumps, never "
+             "opens a shell. (Query-string URLs are rejected by the target validator; see the "
+             "note on validate_url. For anything beyond detection, or a URL with parameters, "
+             "use the Build tab.)",
+        build=lambda ctx: ["sqlmap", "-u", ctx.target, "--batch", "--crawl=0", "--level=1", "--risk=1"],
+    ),
+
+    # ---- simple lookups ----
     "dig": RunnerSpec(
         bin="dig", kind="host", timeout=20,
         install="sudo pacman -S bind",
         desc="DNS record lookup.",
-        build=lambda t, opt: ["dig", t, "+noall", "+answer"],
+        build=lambda ctx: ["dig", ctx.target, "+noall", "+answer"],
     ),
     "host": RunnerSpec(
         bin="host", kind="host", timeout=20,
         install="sudo pacman -S bind",
         desc="Simple DNS lookup.",
-        build=lambda t, opt: ["host", t],
+        build=lambda ctx: ["host", ctx.target],
     ),
     "whois": RunnerSpec(
         bin="whois", kind="host", timeout=20,
         install="sudo pacman -S whois",
         desc="WHOIS registration lookup.",
-        build=lambda t, opt: ["whois", t],
+        build=lambda ctx: ["whois", ctx.target],
     ),
 }
+
+# amass is deliberately NOT wired here. OWASP Amass v5's `amass enum` starts a
+# local "engine" daemon (client/server split) that — as tested live against
+# this exact binary — binds 0.0.0.0:4000 (and 127.0.0.1:6060 for pprof) with
+# no authentication, and that process is not a child of the `enum` process
+# run_tool's timeout kills, so it can outlive the request that spawned it.
+# That's a wildcard-bind, unauthenticated network listener triggered by a web
+# button — directly against this whole suite's loopback-only threat model.
+# Nothing in amass's CLI (`amass engine -h`) exposes a bind-address flag to
+# fix this. subfinder already covers passive subdomain enum without the
+# daemon. amass stays in builder.py — Cole runs it himself, on his own
+# terminal, when he decides to.
 
 
 def _cap(s: str) -> str:
@@ -208,6 +464,37 @@ def _append_audit(entry: dict) -> None:
             f.write(json.dumps(entry, default=str) + "\n")
     except OSError:
         pass  # audit logging must never be why a request 500s
+
+
+def _redact_argv(argv: list, secret: Optional[str]) -> list:
+    """Copy of argv with any element exactly equal to `secret` replaced.
+    Used so an API key never reaches the audit log or the HTTP response —
+    only the literal subprocess call (which never leaves this process) sees it."""
+    if not secret:
+        return list(argv)
+    return [("***REDACTED***" if a == secret else a) for a in argv]
+
+
+def _resolve_options(spec: RunnerSpec, body: dict) -> tuple[Optional[dict], Optional["common.Response"]]:
+    """Validate every declared option against its fixed choice-dict. Returns
+    (resolved, None) or (None, error_response). The client's raw key is
+    checked against spec.options[name].choices and then DISCARDED — only the
+    looked-up value is kept, so the raw key never reaches build()/argv."""
+    resolved: dict = {}
+    supplied = body.get("options")
+    if not isinstance(supplied, dict):
+        supplied = {}
+    for name, opt in spec.options.items():
+        key = supplied.get(name)
+        if key is None:
+            resolved[name] = opt.choices[opt.default]
+            continue
+        key = str(key)
+        if key not in opt.choices:
+            return None, common.Response.error(
+                400, f"invalid {name}: must be one of {sorted(opt.choices)}")
+        resolved[name] = opt.choices[key]
+    return resolved, None
 
 
 def handle_run(req) -> "common.Response":
@@ -245,44 +532,55 @@ def handle_run(req) -> "common.Response":
     if not in_scope:
         return common.Response.error(403, reason)
 
-    opt_value = spec.option_default
-    if spec.option_key:
-        options = body.get("options") or {}
-        if not isinstance(options, dict):
-            options = {}
-        supplied = options.get(spec.option_key)
-        if supplied is not None:
-            supplied = str(supplied)
-            if supplied not in (spec.option_choices or {}):
-                return common.Response.error(400,
-                    f"invalid {spec.option_key}: must be one of {sorted(spec.option_choices)}")
-            opt_value = spec.option_choices[supplied]
+    resolved_options, err = _resolve_options(spec, body)
+    if err is not None:
+        return err
+
+    wordlist_path = None
+    wordlist_id = None
+    if spec.needs_wordlist:
+        wordlist_id = body.get("wordlist")
+        if not isinstance(wordlist_id, str) or not wordlist_id:
+            return common.Response.error(400, f"'{tool}' needs a wordlist — pick one from the list")
+        wordlist_path = wordlists.resolve(wordlist_id)
+        if wordlist_path is None:
+            return common.Response.error(400, f"unknown wordlist id: {wordlist_id!r}")
 
     path = common.which(spec.bin)
     if not path:
         return common.Response.error(409,
             f"{spec.bin} is not installed — install it with: {spec.install}")
 
-    argv = spec.build(argv_target, opt_value)
+    out_path = _out_path(tool, spec.needs_output) if spec.needs_output else None
+    apikey = apikeys.get_key(spec.uses_apikey) if spec.uses_apikey else None
+    apikey = apikey or None  # "" -> None, so build() can just check truthiness
+
+    ctx = BuildCtx(target=argv_target, options=resolved_options,
+                   wordlist=wordlist_path, out_path=out_path, apikey=apikey)
+    argv = spec.build(ctx)
     result = common.run_tool(argv, timeout=spec.timeout)
+
+    safe_argv = _redact_argv(argv, apikey)
 
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "tool": tool, "argv": argv, "target": argv_target,
+        "tool": tool, "argv": safe_argv, "target": argv_target,
         "authorized": authorized, "lab": lab,
+        "wordlist": wordlist_id, "out_path": out_path,
         "returncode": result.returncode, "duration": result.duration,
         "timed_out": result.timed_out,
     }
     _append_audit(entry)
 
     return common.Response.json({
-        "argv": argv,
+        "argv": safe_argv,
         "returncode": result.returncode,
         "stdout": _cap(result.stdout),
         "stderr": _cap(result.stderr),
         "duration": result.duration,
         "timed_out": result.timed_out,
         "error": result.error,
+        "out_path": out_path,
     })
 
 
@@ -305,6 +603,19 @@ def handle_history(req) -> "common.Response":
         except json.JSONDecodeError:
             continue
     return common.Response.json({"runs": runs, "total_logged": len(lines)})
+
+
+def handle_wordlists(req) -> "common.Response":
+    q = req.q("q", "")
+    limit = 50
+    try:
+        limit = max(1, min(int(req.q("limit", "50")), 200))
+    except ValueError:
+        pass
+    return common.Response.json({
+        "results": wordlists.search(q, limit=limit),
+        "total_registered": wordlists.registry_count(),
+    })
 
 
 # --------------------------------------------------------------------------
@@ -441,5 +752,3 @@ def handle_local_tool(req) -> "common.Response":
         "timed_out": result.timed_out,
         "error": result.error,
     })
-
-

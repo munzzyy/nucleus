@@ -50,8 +50,9 @@
 
     <div class="card mb">
       <h2>Safe runner</h2>
-      <p class="sub">Non-destructive only: version/service detection, passive OSINT, read-only TLS checks.
-         Fixed argv templates — your target fills exactly one slot, nothing else.</p>
+      <p class="sub">Fixed argv templates — your target fills exactly one slot. Any other choice you make
+         (scan profile, tags, wordlist) is validated against a server-side list; only the looked-up fixed
+         value ever reaches the command.</p>
       <div class="row mt">
         <div class="field w-220">
           <label>Tool</label>
@@ -61,9 +62,16 @@
           <label>Target</label>
           <input type="text" id="run-target" placeholder="scanme.nmap.org or https://example.com">
         </div>
-        <div class="field w-160" id="run-option-wrap">
-          <label id="run-option-label">Option</label>
-          <select id="run-option"></select>
+      </div>
+      <div class="row mt" id="run-options-row"></div>
+      <div class="row mt hidden" id="run-wordlist-row">
+        <div class="field grow-2">
+          <label>Wordlist search</label>
+          <input type="text" id="run-wordlist-search" placeholder="type to filter, e.g. 'common', 'subdomains', 'raft'…">
+        </div>
+        <div class="field w-320">
+          <label>Wordlist <span id="run-wordlist-count" class="sub"></span></label>
+          <select id="run-wordlist"></select>
         </div>
       </div>
       <div id="run-desc" class="sub mb"></div>
@@ -115,6 +123,8 @@
           <select id="build-tool"></select>
         </div>
       </div>
+      <div id="build-desc" class="sub mb"></div>
+      <div id="build-note" class="sub build-note hidden"></div>
       <div id="build-fields" class="grid cols-3"></div>
       <button id="build-btn" type="button">Build command</button>
       <div class="mt hidden" id="build-result-wrap">
