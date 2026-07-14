@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""nucleus — launch and manage the whole command center.
+
+  nucleus up            start the hub + all three consoles (Ctrl-C stops all)
+  nucleus up --open     ...and open the hub in your browser
+  nucleus up --only recon,bastion   start just those
+  nucleus status        show what's online
+  nucleus open [name]   open a console in the browser (default: hub)
+  nucleus doctor        environment / port sanity check
+
+Every console runs on 127.0.0.1 only. Each is also independently launchable
+(`python3 consoles/recon/app.py`) so you can run one per machine if you like —
+this launcher is just the convenience of one command on one box.
+"""
+
+import argparse
+import importlib
+import socket
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from shared import common  # noqa: E402
+
+# slug -> module path exposing build_app()
+MODULES = {
+    "hub": "hub.app",
+    "recon": "consoles.recon.app",
+    "redcell": "consoles.redcell.app",
+    "bastion": "consoles.bastion.app",
+}
+ORDER = ["hub", "recon", "redcell", "bastion"]
+PORT = {c["slug"]: c["port"] for c in common.CONSOLES}
+
+
+def _port_busy(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def cmd_up(args):
+    only = [s.strip() for s in args.only.split(",")] if args.only else ORDER
+    only = [s for s in ORDER if s in only]  # keep canonical order
+    servers = []
+    started = []
+    print("Nucleus — starting command center\n")
+    for slug in only:
+        port = PORT[slug]
+        if _port_busy(port):
+            print(f"  •  {slug:8} :{port}  already listening — leaving it alone")
+            started.append(slug)
+            continue
+        try:
+            mod = importlib.import_module(MODULES[slug])
+            app = mod.build_app()
+        except Exception as e:  # a console not built yet shouldn't block the rest
+            print(f"  ✗  {slug:8} :{port}  not available ({type(e).__name__}: {e})")
+            continue
+        try:
+            srv = common.serve(app, port=port, block=False)
+        except OSError as e:
+            print(f"  ✗  {slug:8} :{port}  could not bind ({e})")
+            continue
+        servers.append(srv)
+        started.append(slug)
+        name = common.CONSOLE_BY_SLUG[slug]["name"]
+        print(f"  ✓  {name:8} http://127.0.0.1:{port}/")
+
+    if not started:
+        print("\nNothing started. Run `nucleus doctor`.")
+        return 1
+
+    print(f"\n  {len(started)} up. Hub → http://127.0.0.1:{PORT['hub']}/   (Ctrl-C to stop all)")
+    if args.open:
+        time.sleep(0.6)
+        target = PORT["hub"] if "hub" in started else PORT[started[0]]
+        webbrowser.open(f"http://127.0.0.1:{target}/")
+
+    if not servers:  # everything was already running elsewhere
+        print("  (all requested consoles were already running; nothing to hold open)")
+        return 0
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nStopping…")
+        for s in servers:
+            try:
+                s.shutdown()
+            except Exception:
+                pass
+        print("Stopped.")
+    return 0
+
+
+def cmd_status(args):
+    print("Nucleus status:")
+    any_up = False
+    for slug in ORDER:
+        port = PORT[slug]
+        up = _port_busy(port)
+        any_up = any_up or up
+        name = common.CONSOLE_BY_SLUG[slug]["name"]
+        print(f"  {'● up  ' if up else '○ down'}  {name:8} http://127.0.0.1:{port}/")
+    for a in common.EXTERNAL_APPS:
+        up = _port_busy(a["port"])
+        print(f"  {'● up  ' if up else '○ down'}  {a['name']:8} http://127.0.0.1:{a['port']}/  (external)")
+    return 0 if any_up else 1
+
+
+def cmd_open(args):
+    slug = args.name or "hub"
+    if slug not in PORT:
+        print(f"unknown console: {slug} (choose from {', '.join(ORDER)})")
+        return 1
+    webbrowser.open(f"http://127.0.0.1:{PORT[slug]}/")
+    return 0
+
+
+def cmd_doctor(args):
+    ok = True
+    print("Nucleus doctor\n")
+    v = sys.version_info
+    print(f"  python {v.major}.{v.minor}.{v.micro}  {'ok' if v >= (3, 9) else 'NEEDS >= 3.9'}")
+    if v < (3, 9):
+        ok = False
+    for slug in ORDER:
+        modpath = MODULES[slug]
+        try:
+            importlib.import_module(modpath)
+            built = "ok"
+        except Exception as e:
+            built = f"NOT BUILT ({type(e).__name__})"
+            ok = False
+        busy = _port_busy(PORT[slug])
+        print(f"  {slug:8} module {built:28} port {PORT[slug]} {'busy' if busy else 'free'}")
+    print("\n" + ("All good." if ok else "Some consoles are not importable yet."))
+    return 0 if ok else 1
+
+
+def main():
+    p = argparse.ArgumentParser(prog="nucleus", description="Nucleus command center launcher")
+    sub = p.add_subparsers(dest="cmd")
+
+    up = sub.add_parser("up", help="start the hub + consoles")
+    up.add_argument("--open", action="store_true", help="open the hub in a browser")
+    up.add_argument("--only", default="", help="comma list: recon,redcell,bastion,hub")
+    up.set_defaults(func=cmd_up)
+
+    st = sub.add_parser("status", help="show what's online")
+    st.set_defaults(func=cmd_status)
+
+    op = sub.add_parser("open", help="open a console in the browser")
+    op.add_argument("name", nargs="?", help="hub|recon|redcell|bastion")
+    op.set_defaults(func=cmd_open)
+
+    dr = sub.add_parser("doctor", help="environment sanity check")
+    dr.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        p.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

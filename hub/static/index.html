@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nucleus — Command Center</title>
+  <link rel="stylesheet" href="/shared/nucleus.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-app="hub" data-auto-shell data-accent="hub">
+  <div class="wrap">
+    <div class="page-head">
+      <h1>Command Center</h1>
+      <p>One place for the whole kit — recon, offense, defense — plus the local apps and the tools you've shipped. Every console can run on its own machine; this hub ties them together.</p>
+    </div>
+
+    <div class="section-title">Consoles</div>
+    <div class="grid cols-3" id="consoles"><p class="faint">Loading…</p></div>
+
+    <div class="grid cols-3 mt" id="stats"></div>
+
+    <div class="section-title">Connected local apps</div>
+    <div class="grid cols-3" id="apps"></div>
+
+    <div class="section-title">Your shipped tools</div>
+    <div class="grid cols-3" id="published"></div>
+
+    <p class="faint mt small">
+      Nucleus binds to 127.0.0.1 only. Authorized / lab / educational use.
+    </p>
+  </div>
+  <script src="/shared/nucleus.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

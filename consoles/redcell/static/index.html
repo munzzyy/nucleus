@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redcell — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/redcell.css">
+</head>
+<body data-app="redcell" data-auto-shell data-accent="redcell">
+<div class="wrap">
+
+  <div class="page-head">
+    <h1>Redcell <span class="tag">offensive</span></h1>
+    <p>The pentest kit — tool inventory, authorized runners, and a command builder for everything too
+       aggressive to run from here. Authorized use only: your own systems, or written-scope engagements/labs/CTFs.</p>
+  </div>
+
+  <div class="card mb" id="authbox">
+    <h2>Authorization</h2>
+    <p class="sub">Every run on this page is gated server-side. Nothing executes without this box checked,
+       and the gate can't be bypassed from the browser.</p>
+    <label class="checkline mt-10">
+      <input type="checkbox" id="g-authorized">
+      <span>I am authorized to test the target I enter below — it's mine, or I have written permission
+        (lab / CTF / pentest scope).</span>
+    </label>
+    <label class="checkline mt-8">
+      <input type="checkbox" id="g-lab">
+      <span>This target is my own lab/localhost/private network (required to scan RFC1918, loopback, or
+        link-local addresses — logged when used).</span>
+    </label>
+  </div>
+
+  <div class="section-title">Tool inventory</div>
+  <div class="card mb">
+    <div class="row mb-14">
+      <div class="field w-220">
+        <label>Category</label>
+        <select id="inv-cat"><option value="">All categories</option></select>
+      </div>
+      <div class="field w-160">
+        <label>&nbsp;</label>
+        <label class="checkline"><input type="checkbox" id="inv-installed-only"><span>Installed only</span></label>
+      </div>
+      <div class="field w-140">
+        <label>&nbsp;</label>
+        <button class="ghost" id="inv-refresh" type="button">Rescan</button>
+      </div>
+      <div class="field grow-2">
+        <label>&nbsp;</label>
+        <div id="inv-summary" class="sub"></div>
+      </div>
+    </div>
+    <div id="inv-cats" class="grid cols-4 mb"></div>
+    <table id="inv-table">
+      <thead><tr><th>Tool</th><th>Category</th><th>Purpose</th><th>Status</th><th>Version</th><th>Install</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="section-title">Safe runners</div>
+  <div class="card mb">
+    <p class="sub">Non-destructive only: version/service detection, passive OSINT, read-only TLS checks.
+       Fixed argv templates — your target fills exactly one slot, nothing else.</p>
+    <div class="row mt">
+      <div class="field w-220">
+        <label>Tool</label>
+        <select id="run-tool"></select>
+      </div>
+      <div class="field grow-2">
+        <label>Target</label>
+        <input type="text" id="run-target" placeholder="scanme.nmap.org or https://example.com">
+      </div>
+      <div class="field w-160" id="run-option-wrap">
+        <label id="run-option-label">Option</label>
+        <select id="run-option"></select>
+      </div>
+    </div>
+    <div id="run-desc" class="sub mb"></div>
+    <button id="run-btn" type="button" disabled>Run</button>
+    <span id="run-status" class="sub ml-10"></span>
+    <pre class="term mt hidden" id="run-output"></pre>
+  </div>
+
+  <div class="section-title">Command builder — copy &amp; run yourself</div>
+  <div class="card mb">
+    <p class="sub">Aggressive tools (brute force, exploitation, injection). This only assembles a command
+      string — Redcell never executes anything here. Every field is shell-quoted so it's safe to paste even
+      if a value looks weird.</p>
+    <div class="row mt">
+      <div class="field w-220">
+        <label>Tool</label>
+        <select id="build-tool"></select>
+      </div>
+    </div>
+    <div id="build-fields" class="grid cols-3"></div>
+    <button id="build-btn" type="button">Build command</button>
+    <div class="mt hidden" id="build-result-wrap">
+      <label>Command (run this yourself in a terminal)</label>
+      <pre class="term" id="build-result"></pre>
+      <button class="ghost mt" id="build-copy" type="button">Copy to clipboard</button>
+    </div>
+  </div>
+
+  <div class="section-title">Published tools</div>
+  <div class="card mb">
+    <p class="sub">Cole's own CLIs. Best-effort: runs if installed (pipx or a local checkout), otherwise shows
+      the repo + install hint.</p>
+    <div id="local-tools" class="grid cols-2"></div>
+  </div>
+
+  <div class="section-title">Recent scan history</div>
+  <div class="card">
+    <table id="hist-table">
+      <thead><tr><th>Time</th><th>Tool</th><th>Target</th><th>Authorized</th><th>Lab</th><th>Exit</th><th>Duration</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="sub" id="hist-empty">No runs logged yet.</p>
+  </div>
+
+</div>
+<script src="/shared/nucleus.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

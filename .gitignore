@@ -1,0 +1,8 @@
+# local state + secrets — never commit
+var/.env
+var/*.jsonl
+var/*.log
+engine/reports/
+__pycache__/
+*.pyc
+.DS_Store

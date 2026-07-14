@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bastion — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/bastion.css">
+</head>
+<body data-app="bastion" data-auto-shell data-accent="bastion">
+  <div class="wrap">
+    <div class="page-head">
+      <h1>Bastion <span class="tag">defensive</span></h1>
+      <p>Local hardening posture, opsec status, and a passive OSINT report engine — read-only, loopback-bound.</p>
+    </div>
+
+    <div class="section-title">Posture</div>
+    <div id="posture-headline" class="grid cols-3 mb"></div>
+    <div id="posture-grid" class="grid cols-3"></div>
+
+    <div class="section-title">Hardening scripts — ~/security-setup</div>
+    <p class="muted pull-up">Bastion never runs these. Copy the command and run it yourself.</p>
+    <div id="hardening-list" class="grid cols-2"></div>
+
+    <div class="section-title">OSINT report engine</div>
+    <div class="card">
+      <h2>Assess a domain</h2>
+      <div class="row">
+        <div class="field grow">
+          <label for="report-domain">Domain</label>
+          <input type="text" id="report-domain" placeholder="example.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field fit">
+          <button id="report-run">Assess</button>
+        </div>
+      </div>
+      <p class="faint m0">Passive sources only — DNS, HTTP response headers, certificate-transparency logs, Shodan InternetDB. No active scanning.</p>
+    </div>
+    <div id="report-result" class="mt"></div>
+  </div>
+
+  <script src="/shared/nucleus.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

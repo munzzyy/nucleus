@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recon — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-app="recon" data-auto-shell data-accent="recon">
+
+<div class="wrap">
+  <div class="page-head">
+    <h1>Recon <span class="tag">OSINT</span></h1>
+    <p>Paste a username, email, domain, IP, or phone number. Recon auto-detects the type and
+      runs live passive lookups. Everything else (names, companies, crypto addresses, images,
+      coordinates) gets curated pivot links and dork queries instead. Passive, public sources only.</p>
+  </div>
+
+  <div class="card">
+    <form id="scan-form">
+      <div class="row">
+        <div class="field grow">
+          <label for="q">Selector</label>
+          <input type="text" id="q" name="q" autocomplete="off" spellcheck="false"
+                 placeholder="e.g. torvalds, jane@example.com, example.com, 8.8.8.8, +14155552671">
+        </div>
+        <div class="field w160">
+          <label for="type">Type</label>
+          <select id="type" name="type">
+            <option value="auto" selected>Auto-detect</option>
+            <option value="username">Username</option>
+            <option value="email">Email</option>
+            <option value="domain">Domain</option>
+            <option value="ip">IP address</option>
+            <option value="phone">Phone</option>
+            <option value="name">Name</option>
+            <option value="company">Company</option>
+            <option value="crypto">Crypto address</option>
+            <option value="image">Image URL</option>
+            <option value="geo">Geo coordinates</option>
+          </select>
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="submit" id="scan-btn">Scan</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div id="status-line" class="mt faint hidden"></div>
+
+  <div id="results" class="mt"></div>
+
+  <div class="section-title">Local Arsenal</div>
+  <div id="arsenal" class="grid cols-3"></div>
+</div>
+
+<script src="/shared/nucleus.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

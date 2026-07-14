@@ -1,0 +1,15 @@
+[Unit]
+Description=Nucleus — security command center (hub + all consoles, 127.0.0.1 only)
+After=network.target
+
+[Service]
+Type=simple
+# %h is the user's home. Adjust if the repo lives elsewhere.
+ExecStart=/usr/bin/env python3 %h/Projects/nucleus/bin/nucleus up
+Restart=on-failure
+RestartSec=3
+# Nucleus binds loopback only; keep it that way.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
