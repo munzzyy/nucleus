@@ -431,6 +431,15 @@ def assess(domain: str) -> dict:
 # --------------------------------------------------------------------------
 # rendering
 # --------------------------------------------------------------------------
+def _md_safe(value) -> str:
+    """Neutralize external content before it enters the Markdown report — so a
+    hostile DNS/SPF/DMARC record or HTTP banner can't inject markup, break out of
+    a code span, or add lines (which also blocks prompt-injection if the .md is
+    later read by an agent that treats file text as instructions)."""
+    s = "".join(ch if ch >= " " else " " for ch in str(value))
+    return s.replace("`", "'").replace("<", "(").replace(">", ")").replace("|", "/")
+
+
 def render_markdown(report: dict) -> str:
     d = report["domain"]
     lines = [
@@ -454,21 +463,21 @@ def render_markdown(report: dict) -> str:
         "",
         f"- A: {', '.join(report['dns']['A']) or 'none'}",
         f"- AAAA: {', '.join(report['dns']['AAAA']) or 'none'}",
-        f"- MX: {', '.join(report['dns']['MX']) or 'none'}",
-        f"- NS: {', '.join(report['dns']['NS']) or 'none'}",
+        f"- MX: {_md_safe(', '.join(report['dns']['MX'])) or 'none'}",
+        f"- NS: {_md_safe(', '.join(report['dns']['NS'])) or 'none'}",
         "",
         "## Email security",
         "",
         f"- SPF: {'present' if report['email_security']['spf']['present'] else 'absent'}"
-        + (f" — `{report['email_security']['spf']['record']}`" if report['email_security']['spf']['present'] else ""),
-        f"- DMARC: {'present, policy=' + str(report['email_security']['dmarc']['policy']) if report['email_security']['dmarc']['present'] else 'absent'}",
-        f"- DKIM hint: {'found (selector: ' + str(report['email_security']['dkim_hint']['selector']) + ')' if report['email_security']['dkim_hint']['found'] else 'not detected (common selectors only)'}",
+        + (f" — `{_md_safe(report['email_security']['spf']['record'])}`" if report['email_security']['spf']['present'] else ""),
+        f"- DMARC: {'present, policy=' + _md_safe(report['email_security']['dmarc']['policy']) if report['email_security']['dmarc']['present'] else 'absent'}",
+        f"- DKIM hint: {'found (selector: ' + _md_safe(report['email_security']['dkim_hint']['selector']) + ')' if report['email_security']['dkim_hint']['found'] else 'not detected (common selectors only)'}",
         "",
         "## Web / TLS",
         "",
         f"- HTTPS reachable: {report['web']['https']['ok']} (status {report['web']['https']['status']})",
         f"- HTTP -> HTTPS redirect (inferred): {report['web']['redirects_to_https']}",
-        f"- Server banner: {report['web']['banner'].get('server') or 'not disclosed'}",
+        f"- Server banner: {_md_safe(report['web']['banner'].get('server')) if report['web']['banner'].get('server') else 'not disclosed'}",
         "",
         "## Attack surface",
         "",

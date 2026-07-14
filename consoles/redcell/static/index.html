@@ -27,6 +27,8 @@
       role="tab" aria-selected="false" aria-controls="tab-tools" tabindex="-1">Tools</button>
     <button type="button" class="tab-btn" id="tabbtn-history" data-tab="history"
       role="tab" aria-selected="false" aria-controls="tab-history" tabindex="-1">History</button>
+    <button type="button" class="tab-btn" id="tabbtn-expert" data-tab="expert"
+      role="tab" aria-selected="false" aria-controls="tab-expert" tabindex="-1">Expert</button>
   </div>
 
   <!-- ================= RUN (hero) ================= -->
@@ -157,6 +159,42 @@
         <tbody></tbody>
       </table>
       <p class="sub" id="hist-empty">No runs logged yet.</p>
+    </div>
+  </div>
+
+  <!-- ================= EXPERT ================= -->
+  <div class="tab-panel hidden" id="tab-expert" role="tabpanel" aria-labelledby="tabbtn-expert" tabindex="0">
+    <div class="card mb authcard">
+      <h2>Expert run <span class="tag">gate</span></h2>
+      <p class="sub">Run any installed tool from your kit with your own arguments. Arguments are split into a
+        real argv and executed directly — <b>never through a shell</b>, so nothing can break out. Only your
+        pentest tools are runnable here (not arbitrary system commands). You own the target choice — same as
+        your terminal, so only point it at what you're authorized to test.</p>
+      <label class="checkline mt-10 auth-line">
+        <input type="checkbox" id="x-authorized">
+        <span>I am authorized to test the target in my command below.</span>
+      </label>
+      <label class="checkline mt-8">
+        <input type="checkbox" id="x-ack">
+        <span>I understand I'm running my own arguments and I'm responsible for them.</span>
+      </label>
+    </div>
+    <div class="card">
+      <div class="row">
+        <div class="field w-220">
+          <label>Tool</label>
+          <select id="x-tool"></select>
+        </div>
+        <div class="field grow-2">
+          <label>Arguments</label>
+          <input type="text" id="x-args" placeholder="-sV -p 80,443 --script vuln scanme.nmap.org" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field fit">
+          <button id="x-run" disabled>Run</button>
+        </div>
+      </div>
+      <p class="sub" id="x-preview"></p>
+      <pre class="term hidden" id="x-output"></pre>
     </div>
   </div>
 

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
   const N = window.Nucleus;
-  const TABS = ["run", "arsenal", "build", "tools", "history"];
+  const TABS = ["run", "arsenal", "build", "tools", "history", "expert"];
   let INV = null;          // last /api/inventory payload
   let ACTIVE_CAT = "";
   let INV_SEARCH = "";
@@ -16,6 +16,7 @@
     wireRunner();
     wireBuilder();
     wireArsenal();
+    wireExpert();
     document.getElementById("hist-refresh").addEventListener("click", loadHistory);
     await loadInventory(false);
     await loadHistory();
@@ -55,6 +56,7 @@
     });
     if (history.replaceState) history.replaceState(null, "", "#" + tab);
     if (tab === "history") loadHistory();
+    if (tab === "expert") loadExpertTools();
   }
 
   // ------------------------------------------------------------------
@@ -64,6 +66,75 @@
     const box = document.getElementById("g-authorized");
     const btn = document.getElementById("run-btn");
     box.addEventListener("change", () => { btn.disabled = !box.checked; });
+  }
+
+  // ------------------------------------------------------------------
+  // Expert mode — run any installed tool with your own args (argv, no shell)
+  // ------------------------------------------------------------------
+  let EXPERT_LOADED = false;
+  async function loadExpertTools() {
+    if (EXPERT_LOADED) return;
+    const sel = document.getElementById("x-tool");
+    try {
+      const j = await N.get("/api/expert-tools");
+      sel.innerHTML = "";
+      (j.tools || []).forEach(t => {
+        const o = document.createElement("option");
+        o.value = t; o.textContent = t; sel.appendChild(o);
+      });
+      EXPERT_LOADED = true;
+      updateExpertPreview();
+    } catch (e) { N.toast("expert tools load failed: " + e.message, "bad"); }
+  }
+
+  function updateExpertPreview() {
+    const tool = document.getElementById("x-tool").value;
+    const args = document.getElementById("x-args").value;
+    document.getElementById("x-preview").textContent = tool ? (tool + " " + args) : "";
+  }
+
+  function expertGateOk() {
+    return document.getElementById("x-authorized").checked &&
+           document.getElementById("x-ack").checked;
+  }
+
+  function wireExpert() {
+    const btn = document.getElementById("x-run");
+    const sync = () => { btn.disabled = !expertGateOk(); };
+    document.getElementById("x-authorized").addEventListener("change", sync);
+    document.getElementById("x-ack").addEventListener("change", sync);
+    document.getElementById("x-tool").addEventListener("change", updateExpertPreview);
+    const args = document.getElementById("x-args");
+    args.addEventListener("input", updateExpertPreview);
+    args.addEventListener("keydown", e => { if (e.key === "Enter" && !btn.disabled) runExpert(); });
+    btn.addEventListener("click", runExpert);
+  }
+
+  async function runExpert() {
+    const btn = document.getElementById("x-run");
+    const out = document.getElementById("x-output");
+    const tool = document.getElementById("x-tool").value;
+    const args = document.getElementById("x-args").value;
+    btn.disabled = true;
+    out.classList.remove("hidden");
+    out.textContent = "running " + tool + " …";
+    try {
+      const r = await N.post("/api/expert", {
+        tool, args,
+        authorized: document.getElementById("x-authorized").checked,
+        expert_ack: document.getElementById("x-ack").checked,
+      });
+      const head = "$ " + (r.argv || []).join(" ") + "\n[exit " + r.returncode +
+        " · " + r.duration + "s" + (r.timed_out ? " · TIMED OUT" : "") + "]\n\n";
+      // raw tool output via textContent — never innerHTML — so it can't inject markup
+      out.textContent = head + (r.stdout || "") + (r.stderr ? "\n" + r.stderr : "");
+      loadHistory();
+    } catch (e) {
+      out.textContent = "error: " + (e.message || "run failed");
+      N.toast(e.message || "expert run failed", "bad");
+    } finally {
+      btn.disabled = !expertGateOk();
+    }
   }
 
   // ------------------------------------------------------------------

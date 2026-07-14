@@ -154,10 +154,13 @@ def _origin_ok(origin: str, port: int) -> bool:
         return False
     try:
         u = urlparse(origin)
+        # .port validates lazily and raises ValueError on a bad port ("8890.evil")
+        # — it must be read inside the try, or a crafted Origin crashes the guard.
+        oport = u.port
     except ValueError:
         return False
     return (u.hostname in ("127.0.0.1", "localhost", "::1")
-            and (u.port == port or (u.port is None and u.scheme in ("http", "https"))))
+            and (oport == port or (oport is None and u.scheme in ("http", "https"))))
 
 
 def host_is_public(hostname: str) -> bool:
@@ -256,6 +259,7 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
     method = "POST" if data is not None else "GET"
     current = url
     body_data = data
+    origin_host = (urlparse(url).hostname or "").lower()
     for _hop in range(_MAX_REDIRECTS + 1):
         u = urlparse(current)
         if u.scheme not in ("http", "https"):
@@ -271,8 +275,12 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
 
         req_headers = {"User-Agent": _UA, "Accept-Encoding": "identity",
                        "Connection": "close"}
-        for k, v in (headers or {}).items():
-            req_headers[k] = v
+        # Caller headers may carry API keys. Only send them to the ORIGINAL host —
+        # if a redirect points anywhere else, drop them so a key can never ride a
+        # 3xx to an attacker-chosen host.
+        if host.lower() == origin_host:
+            for k, v in (headers or {}).items():
+                req_headers[k] = v
 
         sock = socket.create_connection((ip, port), timeout=timeout)
         try:

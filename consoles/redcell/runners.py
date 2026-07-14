@@ -30,6 +30,7 @@ import ipaddress
 import json
 import re
 import secrets
+import shlex
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,6 +55,12 @@ _BAD_CHARS = re.compile(r"[\s;&|`$(){}<>'\"\\\[\]!*?~\x00-\x1f]")
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
 )
+# The full RFC 3986 URL character set. Safe to allow in a URL target because the
+# value only ever becomes ONE argv element (no shell), so '?' '&' '=' etc. are
+# just characters passed to the tool — this is what lets sqlmap/nuclei/ffuf test
+# real GET-parameter URLs. Whitespace, control chars, quotes, backtick, and
+# < > { } | ^ \ are still refused (none belong in a URL, none are needed).
+_URL_CHARS = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$")
 
 
 def validate_host(raw: str) -> tuple[bool, str]:
@@ -78,21 +85,18 @@ def validate_url(raw: str) -> tuple[bool, str, str]:
     """Accept an http(s) URL with a validated host and no embedded credentials.
     Returns (ok, host_or_reason, cleaned_url).
 
-    NOTE: the shared bad-char set (_BAD_CHARS) blocks '?', '&', '*', '!', '~'
-    — which means a URL with a query string is refused here. That's an
-    existing, deliberately strict control shared with every host validator
-    in this file; loosening it to allow query strings (needed for real
-    GET-parameter SQLi/XSS testing via nikto/wpscan/sqlmap/ffuf) is a
-    separate security decision this change does not make unilaterally. Until
-    that's revisited, url-kind runners only take bare/path URLs — anything
-    needing a query string goes through the Build tab.
+    Query strings ARE allowed (the URL charset is validated against _URL_CHARS,
+    not the strict host bad-char set), so real GET-parameter targets like
+    http://site/page?id=1 work with sqlmap/nuclei/ffuf/nikto/wpscan. The value
+    is passed as a single argv element (never a shell), so URL punctuation is
+    inert. The host portion is still validated strictly via validate_host.
     """
     if not isinstance(raw, str) or not raw or len(raw) > 2048:
         return False, "target is empty or too long", ""
     if raw.startswith("-"):
         return False, "target may not start with '-' (argument injection)", ""
-    if _BAD_CHARS.search(raw):
-        return False, "target contains disallowed characters", ""
+    if not _URL_CHARS.match(raw):
+        return False, "URL contains disallowed characters (no spaces/quotes/backticks)", ""
     try:
         u = urlparse(raw)
     except ValueError:
@@ -475,6 +479,14 @@ def _redact_argv(argv: list, secret: Optional[str]) -> list:
     return [("***REDACTED***" if a == secret else a) for a in argv]
 
 
+def _redact_str(text: str, secret: Optional[str]) -> str:
+    """Scrub a secret out of tool stdout/stderr before it reaches the browser —
+    in case a tool echoes its own token in an error/debug line."""
+    if not secret or not text:
+        return text
+    return text.replace(secret, "***REDACTED***")
+
+
 def _resolve_options(spec: RunnerSpec, body: dict) -> tuple[Optional[dict], Optional["common.Response"]]:
     """Validate every declared option against its fixed choice-dict. Returns
     (resolved, None) or (None, error_response). The client's raw key is
@@ -575,12 +587,89 @@ def handle_run(req) -> "common.Response":
     return common.Response.json({
         "argv": safe_argv,
         "returncode": result.returncode,
-        "stdout": _cap(result.stdout),
-        "stderr": _cap(result.stderr),
+        "stdout": _redact_str(_cap(result.stdout), apikey),
+        "stderr": _redact_str(_cap(result.stderr), apikey),
         "duration": result.duration,
         "timed_out": result.timed_out,
         "error": result.error,
         "out_path": out_path,
+    })
+
+
+# --------------------------------------------------------------------------
+# Expert mode — run any INSTALLED pentest tool from the inventory with your own
+# arguments. Safe because: only inventory binaries (never an arbitrary system
+# command), args tokenized with shlex to an argv list (NO shell, so metachars
+# are inert), the authorization + expert-ack gates, secret redaction, output
+# caps, and the same Origin/host guards as everything else. Cole owns the target
+# choice here (like his terminal) — the guardrail is 'no shell, no arbitrary
+# binary', not 'no dangerous flags'.
+# --------------------------------------------------------------------------
+# General-purpose / privesc binaries that happen to be in the kit but must NOT
+# be reachable as an arbitrary-arg runner (docker is root-equivalent; the rest
+# are code-exec shells/interpreters).
+_EXPERT_DENY = {"docker", "python", "python3", "python2", "ruby", "perl", "sh",
+                "bash", "zsh", "fish", "tmux", "jq", "pip", "pipx", "go", "gcc",
+                "msfconsole", "msfvenom"}
+
+
+def _expert_binaries() -> set:
+    from consoles.redcell import inventory
+    bins = {s.bin for s in inventory.REGISTRY
+            if getattr(s, "kind", "bin") == "bin" and s.bin}
+    return {b for b in bins if b not in _EXPERT_DENY and common.which(b)}
+
+
+def _redact_all(text: str) -> str:
+    if not text:
+        return text
+    for spec in apikeys.CATALOG:
+        v = apikeys.get_key(spec["name"])
+        if v:
+            text = text.replace(v, "***REDACTED***")
+    return text
+
+
+def handle_expert_tools(req) -> "common.Response":
+    return common.Response.json({"tools": sorted(_expert_binaries())})
+
+
+def handle_expert(req) -> "common.Response":
+    body = req.json()
+    if body.get("authorized") is not True:
+        return common.Response.error(403, "authorization required — check the box first")
+    if body.get("expert_ack") is not True:
+        return common.Response.error(403, "expert mode: acknowledge you're running your own arguments on a target you're authorized to test")
+    tool = str(body.get("tool", "")).strip()
+    args_raw = str(body.get("args", ""))
+    if tool not in _expert_binaries():
+        return common.Response.error(400, "expert mode only runs installed pentest tools from the inventory (not arbitrary commands)")
+    try:
+        tokens = shlex.split(args_raw, posix=True)
+    except ValueError as e:
+        return common.Response.error(400, f"couldn't parse arguments: {e}")
+    if len(tokens) > 80:
+        return common.Response.error(400, "too many arguments (max 80)")
+    for t in tokens:
+        if len(t) > 4096:
+            return common.Response.error(400, "an argument is too long")
+        if any((ord(c) < 9 or (13 < ord(c) < 32) or ord(c) == 127) for c in t):
+            return common.Response.error(400, "an argument contains control characters")
+    argv = [tool] + tokens
+    result = common.run_tool(argv, timeout=600)
+    safe_argv = [_redact_all(a) for a in argv]
+    _append_audit({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tool": tool, "argv": safe_argv, "mode": "expert",
+        "authorized": True, "returncode": result.returncode,
+        "duration": result.duration, "timed_out": result.timed_out,
+    })
+    return common.Response.json({
+        "argv": safe_argv, "returncode": result.returncode,
+        "stdout": _redact_all(_cap(result.stdout)),
+        "stderr": _redact_all(_cap(result.stderr)),
+        "duration": result.duration, "timed_out": result.timed_out,
+        "error": result.error,
     })
 
 
