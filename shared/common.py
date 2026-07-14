@@ -395,12 +395,21 @@ def run_tool(argv: list[str], *, timeout: float = 120.0,
 # Sibling health (server-side, so the browser stays same-origin)
 # --------------------------------------------------------------------------
 def _ping(port: int) -> bool:
+    """Our own consoles answer /healthz with 200."""
     try:
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/healthz", timeout=_HEALTH_TIMEOUT) as r:
             return r.status == 200
     except (OSError, urllib.error.URLError):
         return False
+
+
+def _tcp_open(port: int) -> bool:
+    """External apps (e.g. coleos-hub) may not expose /healthz — a bound port is
+    the honest 'reachable' signal for them."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(_HEALTH_TIMEOUT)
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]:
@@ -425,12 +434,13 @@ def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]
 
 def siblings_status() -> list[dict]:
     """Health of every console + known external app, checked in parallel."""
+    our_ports = {c["port"] for c in CONSOLES}
     items = [dict(c) for c in CONSOLES] + [dict(a) for a in EXTERNAL_APPS]
     results: dict[int, bool] = {}
     lock = threading.Lock()
 
     def worker(port):
-        up = _ping(port)
+        up = _ping(port) if port in our_ports else _tcp_open(port)
         with lock:
             results[port] = up
 

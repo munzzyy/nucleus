@@ -42,6 +42,28 @@ def _port_busy(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _start_coleos_hub():
+    """Start Cole's vault hub (:4747) too, if it's present and not already up."""
+    server = Path.home() / "Projects" / "coleos-hub" / "server.py"
+    if _port_busy(4747) or not server.exists():
+        return None
+    try:
+        import subprocess
+        return subprocess.Popen([sys.executable, str(server)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError:
+        return None
+
+
+def cmd_app(args):
+    """Launch the native desktop window (the real app)."""
+    import runpy
+    sys.argv = [str(REPO / "bin" / "nucleus_app.py")]
+    runpy.run_path(str(REPO / "bin" / "nucleus_app.py"), run_name="__main__")
+    return 0
+
+
 def cmd_up(args):
     only = [s.strip() for s in args.only.split(",")] if args.only else ORDER
     only = [s for s in ORDER if s in only]  # keep canonical order
@@ -74,6 +96,10 @@ def cmd_up(args):
         print("\nNothing started. Run `nucleus doctor`.")
         return 1
 
+    coleos = _start_coleos_hub()
+    if coleos:
+        print("  ✓  COLE-OS Hub http://127.0.0.1:4747/  (external, linked)")
+
     print(f"\n  {len(started)} up. Hub → http://127.0.0.1:{PORT['hub']}/   (Ctrl-C to stop all)")
     if args.open:
         time.sleep(0.6)
@@ -91,6 +117,11 @@ def cmd_up(args):
         for s in servers:
             try:
                 s.shutdown()
+            except Exception:
+                pass
+        if coleos:
+            try:
+                coleos.terminate()
             except Exception:
                 pass
         print("Stopped.")
@@ -143,10 +174,15 @@ def cmd_doctor(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="nucleus", description="Nucleus command center launcher")
+    p = argparse.ArgumentParser(
+        prog="nucleus", description="Nucleus command center launcher",
+        epilog="With no command, launches the desktop app.")
     sub = p.add_subparsers(dest="cmd")
 
-    up = sub.add_parser("up", help="start the hub + consoles")
+    ap = sub.add_parser("app", help="launch the native desktop app (default)")
+    ap.set_defaults(func=cmd_app)
+
+    up = sub.add_parser("up", help="start the hub + consoles (headless, no window)")
     up.add_argument("--open", action="store_true", help="open the hub in a browser")
     up.add_argument("--only", default="", help="comma list: recon,redcell,bastion,hub")
     up.set_defaults(func=cmd_up)
@@ -163,8 +199,8 @@ def main():
 
     args = p.parse_args()
     if not getattr(args, "func", None):
-        p.print_help()
-        return 0
+        # no subcommand → launch the app, the friendly default
+        return cmd_app(args)
     return args.func(args)
 
 

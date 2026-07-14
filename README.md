@@ -13,27 +13,33 @@ Everything binds to `127.0.0.1` only. Pure stdlib Python, zero dependencies. Not
 
 ## Run it
 
+It's a real desktop app. One command opens a single native window with everything inside it:
+
 ```bash
 cd ~/Projects/nucleus
-python3 bin/nucleus up --open      # starts all four, opens the hub in your browser
+python3 bin/nucleus            # opens the native app window
 ```
 
-That's the whole thing. `Ctrl-C` stops everything. Other commands:
+Or install it and just click the **Nucleus** icon in your app menu:
 
 ```bash
+bash bin/install.sh           # PATH command + app-menu entry + icon
+nucleus                       # from anywhere
+```
+
+Install puts `nucleus` on your PATH (`~/.local/bin`), adds a **Nucleus** app-menu entry with an icon (one click, no terminal), and drops in a systemd `--user` unit for optional autostart. No root, loopback only, fully reversible (undo lines print at the end).
+
+The app starts every console — and your coleos-hub, if it's there — in the background, then opens the hub. The switcher at the top moves between consoles inside the same window. Set your API keys from the hub's **Settings** panel; no file editing.
+
+### Headless / power use
+
+```bash
+python3 bin/nucleus up             # start everything, no window (Ctrl-C stops all)
 python3 bin/nucleus status         # what's online
 python3 bin/nucleus up --only recon,bastion
 python3 bin/nucleus doctor         # sanity check the environment
-python3 bin/nucleus open bastion   # open one console
+python3 bin/nucleus open bastion   # open one console in the browser
 ```
-
-### Install it as a real app
-
-```bash
-bash bin/install.sh
-```
-
-Puts `nucleus` on your PATH (`~/.local/bin`), adds a **Nucleus** entry to your app menu with an icon, and drops in a systemd `--user` unit you can enable for autostart (`systemctl --user enable --now nucleus.service`). No root, loopback only, fully reversible (undo lines are printed at the end).
 
 ### Run a console on its own machine
 

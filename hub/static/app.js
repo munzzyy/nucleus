@@ -63,6 +63,43 @@
     });
   }
 
+  async function loadSettings() {
+    const wrap = document.getElementById("settings");
+    if (!wrap) return;
+    let s;
+    try { s = await N.get("/api/settings"); } catch (_) { return; }
+    wrap.innerHTML = "";
+    (s.keys || []).forEach(k => {
+      const card = N.el("div", { class: "card" });
+      const head = N.el("div", { class: "row-top" });
+      head.appendChild(N.el("h2", { text: k.label }));
+      head.appendChild(N.el("span", { class: "pill " + (k.set ? "ok" : "warn"),
+        html: '<span class="dot"></span>' + (k.set ? "configured" : "not set") }));
+      card.appendChild(head);
+      const input = N.el("input", { type: "text", placeholder: k.set ? "•••••••• (saved) — paste a new key to replace" : "paste your key" });
+      const field = N.el("div", { class: "field" }); field.appendChild(input);
+      card.appendChild(field);
+      const row = N.el("div", { class: "row" });
+      const save = N.el("button", { text: "Save" });
+      save.addEventListener("click", async () => {
+        save.disabled = true;
+        try {
+          const r = await N.post("/api/settings", { name: k.name, value: input.value.trim() });
+          N.toast(r.set ? "Saved — Recon phone lookups are live" : "Cleared", "ok");
+          loadSettings();
+        } catch (e) { N.toast(e.message || "save failed", "bad"); save.disabled = false; }
+      });
+      const clear = N.el("button", { class: "ghost", text: "Clear" });
+      clear.addEventListener("click", async () => {
+        try { await N.post("/api/settings", { name: k.name, value: "" }); N.toast("Cleared", "ok"); loadSettings(); }
+        catch (e) { N.toast(e.message || "failed", "bad"); }
+      });
+      row.appendChild(save); if (k.set) row.appendChild(clear);
+      card.appendChild(row);
+      wrap.appendChild(card);
+    });
+  }
+
   function consoleCard(c) {
     const card = N.el("div", { class: "card console-card accent-" + c.slug });
     const top = N.el("div", { class: "row-top" });
@@ -107,5 +144,7 @@
     const card = N.el("div", { class: "card" }); card.appendChild(inner); return card;
   }
 
-  document.addEventListener("DOMContentLoaded", () => { load(); setInterval(load, 8000); });
+  document.addEventListener("DOMContentLoaded", () => {
+    load(); loadSettings(); setInterval(load, 8000);
+  });
 })();

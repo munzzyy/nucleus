@@ -23,37 +23,29 @@ ln -sf "$REPO/bin/nucleus" "$BIN/nucleus"
 chmod +x "$REPO/bin/nucleus"
 echo "   • command:  $BIN/nucleus  (make sure ~/.local/bin is on your PATH)"
 
-# 2) icon
+# 2) icon (png + svg)
 cp -f "$REPO/bin/nucleus.svg" "$ICONS/nucleus.svg"
+mkdir -p "$HOME/.local/share/icons/hicolor/256x256/apps"
+[ -f "$REPO/bin/nucleus.png" ] && cp -f "$REPO/bin/nucleus.png" "$HOME/.local/share/icons/hicolor/256x256/apps/nucleus.png"
 
-# 3) app-menu launcher (starts the suite, opens the hub)
+# 3) app-menu launcher — one click opens the native desktop window
 cat > "$APPS/nucleus.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Nucleus
 GenericName=Security Command Center
 Comment=Recon, offense, defense — one local command center
-Exec=/usr/bin/env python3 $REPO/bin/nucleus up --open
-Icon=$ICONS/nucleus.svg
-Terminal=true
+Exec=/usr/bin/env python3 $REPO/bin/nucleus_app.py
+Icon=nucleus
+Terminal=false
+StartupWMClass=Nucleus
 Categories=Security;Network;Development;
 Keywords=osint;pentest;security;opsec;recon;
 EOF
-echo "   • menu entry: Nucleus"
-
-# 3b) direct-open entry (assumes it's already running)
-cat > "$APPS/nucleus-hub.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Nucleus Hub
-Comment=Open the Nucleus command center (must already be running)
-Exec=xdg-open http://127.0.0.1:8890/
-Icon=$ICONS/nucleus.svg
-Terminal=false
-Categories=Security;Network;
-EOF
+echo "   • menu entry: Nucleus (native app, one click)"
 
 update-desktop-database "$APPS" >/dev/null 2>&1 || true
+gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 
 # 4) optional systemd --user service (installed, NOT enabled — your call)
 sed "s|%h/Projects/nucleus|$REPO|g" "$REPO/bin/nucleus.service" > "$UNITS/nucleus.service"
@@ -65,5 +57,5 @@ echo
 echo "Done. Start it now with:  nucleus up --open"
 echo
 echo "UNDO:"
-echo "  rm -f $BIN/nucleus $APPS/nucleus.desktop $APPS/nucleus-hub.desktop $ICONS/nucleus.svg"
+echo "  rm -f $BIN/nucleus $APPS/nucleus.desktop $ICONS/nucleus.svg"
 echo "  systemctl --user disable --now nucleus.service 2>/dev/null; rm -f $UNITS/nucleus.service"
