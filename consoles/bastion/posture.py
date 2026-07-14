@@ -282,6 +282,108 @@ def check_rkhunter() -> dict:
 # --------------------------------------------------------------------------
 # aggregate
 # --------------------------------------------------------------------------
+def _ipv6_global() -> list[str]:
+    """Global-scope IPv6 addresses on non-VPN interfaces (a classic leak path)."""
+    r = common.run_tool(["ip", "-6", "-o", "addr", "show", "scope", "global"], timeout=4)
+    out = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            iface, addr = parts[1], parts[3].split("/")[0]
+            if not iface.startswith(("wg", "tun", "mullvad", "proton", "nordlynx", "lo")):
+                out.append(f"{addr} on {iface}")
+    return out
+
+
+def anonymity_panel() -> dict:
+    """The OpSec page: is my real IP/location exposed right now, and what should
+    I have on. Read-only; the network verdict comes from shared opsec_status."""
+    o = common.opsec_status()
+    checks = []
+
+    # 1) the headline: VPN / exit exposure
+    if o["exposed"]:
+        checks.append(_check("vpn", "VPN / anonymity", "anonymity", "bad",
+            f"EXPOSED — {o['reason']}. Public IP {o.get('public_ip') or '?'}"
+            + (f" ({', '.join(x for x in (o.get('org'), o.get('city'), o.get('country')) if x)})" if o.get("org") else ""),
+            "Turn on Mullvad (or another VPN) before any scan. Install: yay -S mullvad-vpn"))
+    else:
+        checks.append(_check("vpn", "VPN / anonymity", "anonymity", "ok",
+            f"Protected — {o['reason']}. Exit IP {o.get('public_ip') or '?'}"
+            + (f" ({', '.join(x for x in (o.get('org'), o.get('country')) if x)})" if o.get("org") else ""),
+            ""))
+
+    # 2) Mullvad installed?
+    mv = common.which("mullvad") or common.which("mullvad-vpn")
+    if mv:
+        r = common.run_tool(["mullvad", "status"], timeout=4)
+        detail = (r.stdout or r.stderr or "").strip().splitlines()[0] if (r.stdout or r.stderr) else "installed"
+        checks.append(_check("mullvad", "Mullvad app", "anonymity", "ok" if o["mullvad"] else "warn",
+            detail, "" if o["mullvad"] else "mullvad connect"))
+    else:
+        checks.append(_check("mullvad", "Mullvad app", "anonymity", "warn",
+            "not installed", "yay -S mullvad-vpn   (then: mullvad account login, mullvad connect)"))
+
+    # 3) kill switch — traffic must not leak if the VPN drops
+    if mv:
+        r = common.run_tool(["mullvad", "lockdown-mode", "get"], timeout=4)
+        on = "on" in (r.stdout or "").lower()
+        checks.append(_check("killswitch", "Kill switch", "anonymity", "ok" if on else "warn",
+            "Mullvad lockdown mode " + ("on" if on else "off"),
+            "" if on else "mullvad lockdown-mode set on"))
+    else:
+        checks.append(_check("killswitch", "Kill switch", "anonymity", "warn",
+            "no VPN kill switch detected — traffic would leak if the tunnel drops",
+            "Use Mullvad's lockdown mode, or a firewall rule that blocks non-VPN egress."))
+
+    # 4) encrypted DNS (reuse the hardening check)
+    dns = check_dns()
+    dns["category"] = "anonymity"
+    checks.append(dns)
+
+    # 5) IPv6 leak
+    v6 = _ipv6_global()
+    if v6 and o["exposed"]:
+        checks.append(_check("ipv6", "IPv6 leak", "anonymity", "bad",
+            "Global IPv6 active with no VPN: " + "; ".join(v6[:3])
+            + " — IPv6 traffic can bypass an IPv4-only VPN.",
+            "Ensure your VPN tunnels IPv6, or disable it: sysctl -w net.ipv6.conf.all.disable_ipv6=1"))
+    elif v6:
+        checks.append(_check("ipv6", "IPv6", "anonymity", "warn",
+            "Global IPv6 present (" + v6[0] + ") — confirm your VPN tunnels it.",
+            "Verify with the VPN up: curl -6 https://am.i.mullvad.net/json"))
+    else:
+        checks.append(_check("ipv6", "IPv6", "anonymity", "ok", "no global IPv6 on physical links", ""))
+
+    # 6) Tor, 7) MAC randomization (reuse)
+    for c in (check_tor(), check_wifi_mac()):
+        c["category"] = "anonymity"
+        checks.append(c)
+
+    recs = [
+        "Install + connect Mullvad: yay -S mullvad-vpn, then `mullvad account login` and `mullvad connect`.",
+        "Turn on Mullvad's kill switch (lockdown mode) so nothing leaks if the tunnel drops: `mullvad lockdown-mode set on`.",
+        "Keep encrypted DNS (Quad9 DoT) on — run ~/security-setup/3-secure-dns.sh if it isn't.",
+        "Make sure IPv6 is tunneled by the VPN, or disable it, so it can't bypass the tunnel.",
+        "For the most sensitive work, use Tor Browser on top of the VPN.",
+        "Keep Wi-Fi MAC randomization on, and strip metadata from any file you share (mat2).",
+    ]
+    n_bad = sum(1 for c in checks if c["status"] == "bad")
+    n_warn = sum(1 for c in checks if c["status"] == "warn")
+    return {
+        "verdict": {
+            "exposed": o["exposed"], "reason": o["reason"],
+            "public_ip": o.get("public_ip", ""), "org": o.get("org", ""),
+            "city": o.get("city", ""), "country": o.get("country", ""),
+            "mullvad": o["mullvad"],
+        },
+        "checks": checks,
+        "recommendations": recs,
+        "summary": {"ok": sum(1 for c in checks if c["status"] == "ok"),
+                    "warn": n_warn, "bad": n_bad, "total": len(checks)},
+    }
+
+
 def run_all() -> dict:
     checks: list[dict] = []
     checks.append(check_sysctl())

@@ -41,3 +41,18 @@
 .finding-row.sev-info .sev { color: var(--txt-faint); }
 .finding-row .ftitle { font-weight: 600; font-size: 13.5px; }
 .finding-row .frec { color: var(--txt-dim); font-size: 12.5px; margin-top: 2px; }
+
+/* ---- opsec / anonymity verdict ---- */
+.anon-verdict { border-radius: var(--radius); padding: 20px 22px; border: 1px solid var(--line);
+  box-shadow: var(--shadow); }
+.anon-verdict .big { font-size: 26px; font-weight: 800; letter-spacing: .02em; margin-bottom: 6px; }
+.anon-verdict .line { font-size: 14px; margin-top: 3px; }
+.anon-verdict.exposed { background: linear-gradient(180deg, color-mix(in srgb, var(--bad) 22%, var(--bg)), var(--bg));
+  border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+.anon-verdict.exposed .big { color: var(--bad); }
+.anon-verdict.safe { background: linear-gradient(180deg, color-mix(in srgb, var(--ok) 16%, var(--bg)), var(--bg));
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.anon-verdict.safe .big { color: var(--ok); }
+.rec-list { margin: 6px 0 0; padding-left: 18px; }
+.rec-list li { color: var(--txt-dim); font-size: 13px; margin: 5px 0; line-height: 1.5; }
+.rec-list li code, .anon-verdict .mono { font-family: var(--mono); }

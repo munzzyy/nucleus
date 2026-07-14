@@ -76,10 +76,39 @@
     bar.appendChild(sw);
     document.body.insertBefore(bar, document.body.firstChild);
 
+    // OpSec banner sits directly under the top bar on every console.
+    const opsec = N.el("div", { class: "opsec-bar", id: "nuc-opsec" });
+    document.body.insertBefore(opsec, bar.nextSibling);
+
     renderSwitcher([], self);
     pollSiblings(self);
     setInterval(() => pollSiblings(self), 8000);
+    pollOpsec();
+    setInterval(pollOpsec, 15000);
   };
+
+  async function pollOpsec() {
+    const el = document.getElementById("nuc-opsec");
+    if (!el) return;
+    let o;
+    try { o = await N.get("/api/opsec"); }
+    catch (_) { return; }
+    window.Nucleus._opsec = o;
+    document.dispatchEvent(new CustomEvent("nucleus:opsec", { detail: o }));
+    if (o.exposed) {
+      const where = [o.org, o.city, o.country].filter(Boolean).join(" · ");
+      el.className = "opsec-bar exposed";
+      el.innerHTML =
+        '<span class="od"></span><b>EXPOSED</b> — your real IP ' +
+        '<span class="mono">' + N.esc(o.public_ip || "?") + '</span>' +
+        (where ? ' (' + N.esc(where) + ')' : '') +
+        ' is what any target sees. Turn on your VPN (Mullvad) before scanning.';
+    } else {
+      el.className = "opsec-bar safe";
+      el.innerHTML = '<span class="od"></span>Protected — ' + N.esc(o.reason || "VPN active") +
+        (o.public_ip ? ' · exit <span class="mono">' + N.esc(o.public_ip) + '</span>' : '');
+    }
+  }
 
   function portUrl(port) { return location.protocol + "//" + location.hostname + ":" + port; }
 

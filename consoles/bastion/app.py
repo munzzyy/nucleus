@@ -21,6 +21,10 @@ def h_hardening(req: common.Request) -> common.Response:
     return common.Response.json(posture.hardening_panel())
 
 
+def h_anonymity(req: common.Request) -> common.Response:
+    return common.Response.json(posture.anonymity_panel())
+
+
 def h_report(req: common.Request) -> common.Response:
     # POST-only: assessing a domain triggers outbound fetches and writes report
     # files, so it must carry a same-origin Origin (not a bare cross-origin GET).
@@ -75,6 +79,7 @@ def h_report_file(req: common.Request) -> common.Response:
 
 ROUTES = {
     "GET /api/posture": h_posture,
+    "GET /api/anonymity": h_anonymity,
     "GET /api/hardening": h_hardening,
     "POST /api/report": h_report,
     "GET /api/report-file": h_report_file,

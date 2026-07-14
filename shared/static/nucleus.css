@@ -45,6 +45,20 @@ body[data-accent="recon"]   { --accent: var(--recon); }
 body[data-accent="redcell"] { --accent: var(--redcell); }
 body[data-accent="bastion"] { --accent: var(--bastion); }
 
+/* ---- opsec banner (under the top bar, every console) ---- */
+.opsec-bar { position: sticky; top: 55px; z-index: 25; padding: 9px 20px; font-size: 13px;
+  display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }
+.opsec-bar .od { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.opsec-bar.exposed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: #ffd9de;
+  border-bottom-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+.opsec-bar.exposed .od { background: var(--bad); box-shadow: 0 0 9px var(--bad); animation: opulse 1.4s infinite; }
+.opsec-bar.exposed b { color: var(--bad); letter-spacing: .03em; }
+.opsec-bar.safe { background: color-mix(in srgb, var(--ok) 12%, var(--bg)); color: var(--txt-dim);
+  border-bottom-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.opsec-bar.safe .od { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.opsec-bar:empty { display: none; }
+@keyframes opulse { 50% { opacity: .35; } }
+
 /* ---- top bar / switcher ---- */
 .topbar {
   position: sticky; top: 0; z-index: 30;

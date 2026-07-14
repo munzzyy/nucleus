@@ -27,6 +27,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -432,6 +433,89 @@ def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]
         return None
 
 
+# --------------------------------------------------------------------------
+# OpSec / anonymity — "is my real IP exposed right now?"
+# One cached network check, shared across every console (same process), so the
+# whole app can warn before a scan ever leaves the machine.
+# --------------------------------------------------------------------------
+_opsec_cache: dict = {"data": None, "ts": 0.0}
+_opsec_lock = threading.Lock()
+OPSEC_TTL = 25.0
+
+
+def _vpn_iface_up() -> Optional[str]:
+    try:
+        for iface in os.listdir("/sys/class/net"):
+            if iface.startswith(("wg", "tun", "mullvad", "proton", "nordlynx", "tailscale")):
+                try:
+                    state = Path(f"/sys/class/net/{iface}/operstate").read_text().strip()
+                except OSError:
+                    state = ""
+                if state in ("up", "unknown"):  # tun devices often read 'unknown' when up
+                    return iface
+    except OSError:
+        pass
+    return None
+
+
+def opsec_status(force: bool = False) -> dict:
+    """What the internet sees right now + a plain exposed/protected verdict.
+
+    Uses Mullvad's own check endpoint (authoritative for 'am I behind Mullvad'),
+    falling back to a generic IP echo. Fail-safe: if it can't verify and there's
+    no VPN interface, it says EXPOSED rather than pretending you're covered.
+    Cached ~25s so console polling doesn't hammer the check service.
+    """
+    now = time.monotonic()
+    with _opsec_lock:
+        cached = _opsec_cache["data"]
+        if not force and cached and (now - _opsec_cache["ts"] < OPSEC_TTL):
+            return cached
+
+    pub: dict = {}
+    try:
+        st, body, _ = fetch("https://am.i.mullvad.net/json", timeout=5.0, max_bytes=8192)
+        if st == 200:
+            pub = json.loads(body.decode("utf-8"))
+    except (ValueError, OSError, json.JSONDecodeError):
+        pub = {}
+    if not pub:  # fallback echo (no mullvad flag, but gives the public IP/org)
+        try:
+            st, body, _ = fetch("http://ip-api.com/json/?fields=query,org,isp,city,country",
+                                timeout=5.0, max_bytes=8192)
+            if st == 200:
+                j = json.loads(body.decode("utf-8"))
+                pub = {"ip": j.get("query"), "organization": j.get("org") or j.get("isp"),
+                       "city": j.get("city"), "country": j.get("country")}
+        except (ValueError, OSError, json.JSONDecodeError):
+            pub = {}
+
+    iface = _vpn_iface_up()
+    mullvad = bool(pub.get("mullvad_exit_ip"))
+    reachable = bool(pub)
+
+    if mullvad:
+        exposed, reason = False, f"Behind Mullvad ({pub.get('mullvad_exit_ip_hostname') or 'exit node'})"
+    elif iface and reachable:
+        exposed, reason = False, f"VPN interface {iface} is up"
+    elif iface and not reachable:
+        exposed, reason = False, f"VPN interface {iface} is up (couldn't reach the check service to confirm the exit)"
+    elif reachable:
+        exposed, reason = True, "No VPN detected — your real IP and approximate location are visible to any target you scan"
+    else:
+        exposed, reason = True, "Couldn't verify your exit and no VPN interface is up — treat yourself as exposed"
+
+    data = {
+        "exposed": exposed, "reason": reason, "mullvad": mullvad, "vpn_iface": iface,
+        "reachable": reachable,
+        "public_ip": pub.get("ip", ""), "org": pub.get("organization", ""),
+        "city": pub.get("city", ""), "country": pub.get("country", ""),
+    }
+    with _opsec_lock:
+        _opsec_cache.update(data=data, ts=now)
+    return data
+
+
 def siblings_status() -> list[dict]:
     """Health of every console + known external app, checked in parallel."""
     our_ports = {c["port"] for c in CONSOLES}
@@ -532,6 +616,10 @@ def _make_handler(app: App, port: int):
             if path == "/api/siblings" and method == "GET":
                 self._send(Response.json({"consoles": siblings_status(),
                                           "self": app.slug}))
+                return
+            # built-in: opsec / anonymity (every console can warn you)
+            if path == "/api/opsec" and method == "GET":
+                self._send(Response.json(opsec_status()))
                 return
             # built-in: static
             if path == "/" and method in ("GET", "HEAD"):

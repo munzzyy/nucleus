@@ -52,6 +52,37 @@
     }
   }
 
+  // ---- opsec / anonymity ---------------------------------------------
+  async function loadAnonymity() {
+    try {
+      const j = await N.get("/api/anonymity");
+      const v = j.verdict || {};
+      const where = [v.org, v.city, v.country].filter(Boolean).join(" · ");
+      const vd = document.getElementById("anon-verdict");
+      if (v.exposed) {
+        vd.className = "anon-verdict exposed";
+        vd.innerHTML =
+          `<div class="big">⚠ EXPOSED</div>
+           <div class="line">Your real IP <span class="mono">${N.esc(v.public_ip || "?")}</span>${where ? " (" + N.esc(where) + ")" : ""} is what any target you scan will see.</div>
+           <div class="line faint">${N.esc(v.reason || "")}</div>
+           <div class="line">Turn on your VPN before scanning. Set it up below.</div>`;
+      } else {
+        vd.className = "anon-verdict safe";
+        vd.innerHTML =
+          `<div class="big">✓ PROTECTED</div>
+           <div class="line">${N.esc(v.reason || "VPN active")} — exit <span class="mono">${N.esc(v.public_ip || "?")}</span>${where ? " (" + N.esc(where) + ")" : ""}.</div>
+           <div class="line faint">Your real IP is not what targets see.</div>`;
+      }
+      document.getElementById("anon-grid").innerHTML = (j.checks || []).map(checkCard).join("");
+      const recs = document.getElementById("anon-recs");
+      recs.innerHTML = `<h2>What to have on</h2><ul class="rec-list">` +
+        (j.recommendations || []).map(r => `<li>${N.esc(r)}</li>`).join("") + `</ul>`;
+    } catch (e) {
+      document.getElementById("anon-verdict").innerHTML =
+        `<div class="card"><p class="muted">anonymity check failed: ${N.esc(e.message)}</p></div>`;
+    }
+  }
+
   // ---- hardening panel ------------------------------------------------
   function scriptCard(s) {
     const appliedPill = s.applied === true ? pill("ok")
@@ -143,6 +174,8 @@
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    loadAnonymity();
+    setInterval(loadAnonymity, 20000);
     loadPosture();
     loadHardening();
     document.getElementById("report-run").addEventListener("click", runReport);
