@@ -14,11 +14,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from shared import common  # noqa: E402
+from shared import apikeys, common  # noqa: E402
 
 ENV_FILE = Path(__file__).resolve().parents[1] / "var" / ".env"
-# The keys the settings panel is allowed to manage (name -> label).
-MANAGED_KEYS = {"NUMLOOKUP_API_KEY": "NumLookupAPI key (Recon live phone lookups)"}
 
 
 def _read_env() -> dict:
@@ -55,21 +53,26 @@ def _write_env_key(key: str, value: str):
 
 def _settings_get(req) -> common.Response:
     env = _read_env()
-    return common.Response.json({"keys": [
-        {"name": k, "label": lbl,
-         "set": bool(env.get(k) or os.environ.get(k))}
-        for k, lbl in MANAGED_KEYS.items()]})
+    keys = []
+    for spec in apikeys.CATALOG:
+        keys.append({
+            "name": spec["name"], "label": spec["label"], "provider": spec["provider"],
+            "get_url": spec["get_url"], "free": spec["free"], "unlocks": spec["unlocks"],
+            "set": bool(env.get(spec["name"]) or os.environ.get(spec["name"])),
+        })
+    return common.Response.json({"keys": keys})
 
 
 def _settings_post(req) -> common.Response:
     body = req.json()
     key = str(body.get("name", "")).strip()
     value = str(body.get("value", "")).strip()
-    if key not in MANAGED_KEYS:
+    if key not in apikeys.CATALOG_BY_NAME:
         return common.Response.error(400, "unknown setting")
-    # keys are opaque tokens; keep it to a sane charset + length, no newlines
-    if value and not re.fullmatch(r"[A-Za-z0-9_\-.]{8,128}", value):
-        return common.Response.error(400, "that doesn't look like a valid key")
+    # API keys come in many shapes (hex, base64, colon-joined id:secret). Accept
+    # any printable token, no whitespace/control chars, sane length.
+    if value and not re.fullmatch(r"[\x21-\x7e]{6,256}", value):
+        return common.Response.error(400, "that doesn't look like a valid key (no spaces; 6-256 chars)")
     _write_env_key(key, value)
     if value:
         os.environ[key] = value           # live now, no restart

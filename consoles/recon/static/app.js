@@ -46,6 +46,40 @@
     return `<div class="subdomain-list">${items.map(i => `<div>${esc(i)}</div>`).join("")}</div>`;
   }
 
+  function boolStr(v) {
+    return v === true ? "yes" : v === false ? "no" : "";
+  }
+
+  // -- keyed-source cards: only rendered when the module actually ran the
+  // source (i.e. its key was set server-side); a missing key surfaces as an
+  // unlock hint instead, never an empty card. ---------------------------
+  const SETTINGS_URL = "http://127.0.0.1:8890/#settings";
+
+  function keyedBody(o, rows) {
+    if (!o) return null;
+    if (o.ok === false) return `<p class="bad">${esc(o.error || "lookup failed")}</p>`;
+    let html = kv(rows);
+    if (o.note) html += `<p class="faint mt">${esc(o.note)}</p>`;
+    return html;
+  }
+
+  function keyedCard(title, obj, rows) {
+    const body = keyedBody(obj, rows);
+    return body ? card(title, body) : "";
+  }
+
+  function renderUnlock(unlock) {
+    if (!unlock || !unlock.length) return "";
+    const lines = unlock.map(u => {
+      const parts = u.split("Settings");
+      const html = parts.length === 2
+        ? `${esc(parts[0])}<a href="${esc(SETTINGS_URL)}" target="_blank" rel="noopener noreferrer">Settings</a>${esc(parts[1])}`
+        : esc(u);
+      return `<div class="unlock-line">${html}</div>`;
+    }).join("");
+    return `<div class="unlock-hints">${lines}</div>`;
+  }
+
   // -- pivots + dorks (shared by every type) --------------------------------
   function renderPivots(pivots) {
     if (!pivots || !pivots.length) return "";
@@ -97,6 +131,7 @@
     const bc = m.breach_check || {};
     const an = m.breach_analytics || {};
     const gv = m.gravatar || {};
+    const k = m.keyed || {};
     const summary = kv([
       ["Breached", bc.ok ? (bc.breached ? `yes — ${bc.breaches.length} breach(es)` : "no known exposure") : "check failed"],
       ["Risk", an.risk_label ? `${an.risk_label} (${an.risk_score})` : "n/a"],
@@ -114,10 +149,40 @@
         </div>`).join("");
       breachList = `<div class="mt">${breachList}</div>`;
     }
-    return card("Email", summary + breachList);
+
+    let hibpHtml = "";
+    if (k.hibp) {
+      if (k.hibp.ok === false) {
+        hibpHtml = keyedBody(k.hibp);
+      } else if (k.hibp.breach_count) {
+        hibpHtml = k.hibp.breaches.map(b => `
+          <div class="breach-row">
+            <div class="name">${esc(b.name || "unknown")}</div>
+            <div class="meta">${esc(b.date || "")}</div>
+            <div class="classes">${(b.data_classes || []).slice(0, 10).map(c => `<span class="tag">${esc(c)}</span>`).join("")}</div>
+          </div>`).join("");
+      } else {
+        hibpHtml = `<p class="ok">no breaches on file</p>`;
+      }
+    }
+
+    return card("Email", summary + breachList + renderUnlock(m.unlock))
+      + keyedCard("Hunter.io verifier", k.hunter, [
+          ["Result", k.hunter && k.hunter.result], ["Score", k.hunter && k.hunter.score],
+          ["Disposable", k.hunter && boolStr(k.hunter.disposable)],
+          ["Webmail", k.hunter && boolStr(k.hunter.webmail)],
+          ["MX records", k.hunter && boolStr(k.hunter.mx_records)],
+        ])
+      + keyedCard("IPQualityScore", k.ipqs, [
+          ["Valid", k.ipqs && boolStr(k.ipqs.valid)], ["Disposable", k.ipqs && boolStr(k.ipqs.disposable)],
+          ["Recent abuse", k.ipqs && boolStr(k.ipqs.recent_abuse)], ["Fraud score", k.ipqs && k.ipqs.fraud_score],
+          ["Leaked", k.ipqs && boolStr(k.ipqs.leaked)],
+        ])
+      + (k.hibp ? card("Have I Been Pwned", hibpHtml) : "");
   }
 
   function renderDomain(m) {
+    const k = m.keyed || {};
     const dns = m.dns || {};
     const dnsHtml = kv([
       ["A", (dns.A || []).join(", ")],
@@ -163,10 +228,13 @@
     const subs = m.subdomains || {};
     const crtSrc = subs.crt_sh || {};
     const htSrc = subs.hackertarget || {};
+    const stSrc = subs.securitytrails || {};
+    const stPart = stSrc.error != null || stSrc.count
+      ? `, SecurityTrails: ${stSrc.count || 0}${stSrc.error ? ` (${esc(stSrc.error)})` : ""}` : "";
     const subsHtml = (subs.names || []).length
       ? `<p class="faint mb">${subs.count} unique name(s) — crt.sh: ${crtSrc.count || 0}${crtSrc.error ? ` (${esc(crtSrc.error)})` : ""}, `
-        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}</p>${list(subs.names)}`
-      : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}</p>`;
+        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${list(subs.names)}`
+      : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}${stPart}</p>`;
 
     const us = m.urlscan || {};
     let urlscanHtml;
@@ -201,21 +269,39 @@
       ["Error", h.error],
     ]);
 
+    const hunterEmails = (k.hunter && k.hunter.emails || []).map(e =>
+      `${e.value || "?"}${e.type ? ` (${e.type})` : ""}${e.confidence != null ? ` — ${e.confidence}%` : ""}`).join(", ");
+
     return [
-      card("DNS", dnsHtml),
+      card("DNS", dnsHtml + renderUnlock(m.unlock)),
       card("WHOIS (RDAP)", whoisHtml),
+      keyedCard("WhoisXML WHOIS", k.whoisxml, [
+        ["Registrar", k.whoisxml && k.whoisxml.registrar], ["Created", k.whoisxml && k.whoisxml.created],
+        ["Updated", k.whoisxml && k.whoisxml.updated], ["Expires", k.whoisxml && k.whoisxml.expires],
+        ["Registrant org", k.whoisxml && k.whoisxml.registrant_org],
+      ]),
       card("Email posture (SPF / DMARC)", postureHtml),
       card("HTTP + security headers", httpHtml),
       card("Hosting chain", hostingHtml),
-      card("Subdomains (crt.sh + hackertarget)", subsHtml),
+      card("Subdomains (crt.sh + hackertarget + SecurityTrails)", subsHtml),
       card("urlscan.io recent scans", urlscanHtml),
       card("AlienVault OTX reputation", otxHtml),
       card("Wayback Machine", wbHtml),
+      keyedCard("VirusTotal (domain reputation)", k.virustotal, [
+        ["Malicious", k.virustotal && k.virustotal.malicious], ["Suspicious", k.virustotal && k.virustotal.suspicious],
+        ["Harmless", k.virustotal && k.virustotal.harmless], ["Reputation", k.virustotal && k.virustotal.reputation],
+        ["Categories", k.virustotal && (k.virustotal.categories || []).join(", ")],
+      ]),
+      keyedCard("Hunter.io (corporate emails)", k.hunter, [
+        ["Organization", k.hunter && k.hunter.organization], ["Pattern", k.hunter && k.hunter.pattern],
+        ["Emails found", k.hunter && k.hunter.email_count], ["Emails", hunterEmails],
+      ]),
     ].join("");
   }
 
   function renderIp(m) {
     if (m.error) return card("IP", `<p class="bad">${esc(m.error)}</p>`);
+    const k = m.keyed || {};
     const idb = m.internetdb || {};
     const idbHtml = idb.ok
       ? kv([
@@ -223,8 +309,8 @@
           ["CVEs", (idb.cves || []).join(", ") || "none"],
           ["Hostnames", (idb.hostnames || []).join(", ")],
           ["Tags", (idb.tags || []).join(", ")],
-        ])
-      : `<p class="faint">${esc(idb.error || "unavailable")}</p>`;
+        ]) + renderUnlock(m.unlock)
+      : `<p class="faint">${esc(idb.error || "unavailable")}</p>` + renderUnlock(m.unlock);
 
     const geo = m.geo;
     const geoHtml = geo
@@ -261,11 +347,46 @@
       card("RDAP netblock", rdapHtml),
       card("Tor (Onionoo)", torHtml),
       card("AlienVault OTX reputation", otxHtml),
+      keyedCard("IPinfo", k.ipinfo, [
+        ["Org / ASN", k.ipinfo && k.ipinfo.org], ["City", k.ipinfo && k.ipinfo.city],
+        ["Region", k.ipinfo && k.ipinfo.region], ["Country", k.ipinfo && k.ipinfo.country],
+        ["VPN", k.ipinfo && boolStr(k.ipinfo.vpn)], ["Proxy", k.ipinfo && boolStr(k.ipinfo.proxy)],
+        ["Tor", k.ipinfo && boolStr(k.ipinfo.tor)], ["Hosting", k.ipinfo && boolStr(k.ipinfo.hosting)],
+        ["Abuse contact", k.ipinfo && k.ipinfo.abuse_contact],
+      ]),
+      keyedCard("VirusTotal (IP reputation)", k.virustotal, [
+        ["Malicious", k.virustotal && k.virustotal.malicious], ["Suspicious", k.virustotal && k.virustotal.suspicious],
+        ["Harmless", k.virustotal && k.virustotal.harmless], ["AS owner", k.virustotal && k.virustotal.as_owner],
+        ["Country", k.virustotal && k.virustotal.country], ["Reputation", k.virustotal && k.virustotal.reputation],
+      ]),
+      keyedCard("AbuseIPDB", k.abuseipdb, [
+        ["Abuse confidence", k.abuseipdb && `${k.abuseipdb.abuse_confidence_score}%`],
+        ["Total reports", k.abuseipdb && k.abuseipdb.total_reports],
+        ["Usage type", k.abuseipdb && k.abuseipdb.usage_type], ["ISP", k.abuseipdb && k.abuseipdb.isp],
+        ["Domain", k.abuseipdb && k.abuseipdb.domain],
+      ]),
+      keyedCard("GreyNoise", k.greynoise, [
+        ["Noise", k.greynoise && boolStr(k.greynoise.noise)], ["RIOT (known service)", k.greynoise && boolStr(k.greynoise.riot)],
+        ["Classification", k.greynoise && k.greynoise.classification], ["Name", k.greynoise && k.greynoise.name],
+        ["Last seen", k.greynoise && k.greynoise.last_seen],
+      ]),
+      keyedCard("Shodan (full host)", k.shodan, [
+        ["Org", k.shodan && k.shodan.org], ["OS", k.shodan && k.shodan.os],
+        ["Hostnames", k.shodan && (k.shodan.hostnames || []).join(", ")],
+        ["Open ports", k.shodan && (k.shodan.ports || []).join(", ")],
+        ["Vulns (CVEs)", k.shodan && (k.shodan.vulns || []).join(", ")],
+      ]),
+      keyedCard("IPQualityScore", k.ipqs, [
+        ["Fraud score", k.ipqs && k.ipqs.fraud_score], ["Proxy", k.ipqs && boolStr(k.ipqs.proxy)],
+        ["VPN", k.ipqs && boolStr(k.ipqs.vpn)], ["Tor", k.ipqs && boolStr(k.ipqs.tor)],
+        ["Recent abuse", k.ipqs && boolStr(k.ipqs.recent_abuse)],
+      ]),
     ].join("");
   }
 
   function renderPhone(m) {
     const l = m.lookup || {};
+    const k = m.keyed || {};
     const top = kv([["Country (guess)", m.country_guess || "unknown"], ["Digits", m.digit_count]]);
     let lookupHtml;
     if (!l.configured) {
@@ -279,11 +400,17 @@
     } else {
       lookupHtml = `<p class="bad">${esc(l.error || "lookup failed")}</p>`;
     }
-    return card("Phone", top + lookupHtml);
+    return card("Phone", top + lookupHtml + renderUnlock(m.unlock))
+      + keyedCard("IPQualityScore", k.ipqs, [
+          ["Valid", k.ipqs && boolStr(k.ipqs.valid)], ["Active", k.ipqs && boolStr(k.ipqs.active)],
+          ["Carrier", k.ipqs && k.ipqs.carrier], ["Line type", k.ipqs && k.ipqs.line_type],
+          ["Fraud score", k.ipqs && k.ipqs.fraud_score], ["Risky", k.ipqs && boolStr(k.ipqs.risky)],
+        ]);
   }
 
   function renderHash(m) {
     if (m.known === null && m.error) return card("Hash lookup", `<p class="bad">${esc(m.error)}</p>`);
+    const k = m.keyed || {};
     const body = m.known
       ? kv([
           ["Algorithm", (m.algo || "").toUpperCase()],
@@ -298,7 +425,14 @@
           ["Known file", "no"],
           ["Note", m.note || "not found in CIRCL hashlookup"],
         ]);
-    return card("Hash lookup (CIRCL hashlookup)", body);
+    return card("Hash lookup (CIRCL hashlookup)", body + renderUnlock(m.unlock))
+      + keyedCard("VirusTotal (file reputation)", k.virustotal, [
+          ["Detections", k.virustotal && k.virustotal.malicious != null
+            ? `${k.virustotal.malicious} / ${k.virustotal.total}` : ""],
+          ["Name", k.virustotal && k.virustotal.meaningful_name],
+          ["Type", k.virustotal && k.virustotal.type_description],
+          ["Threat label", k.virustotal && k.virustotal.threat_label],
+        ]);
   }
 
   function renderCrypto(m) {

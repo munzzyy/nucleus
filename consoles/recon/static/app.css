@@ -56,3 +56,11 @@
 .resource-link { display: block; padding: 11px 13px; }
 .resource-link .r-name { font-weight: 650; font-size: 13.5px; }
 .resource-link .r-note { color: var(--txt-dim); font-size: 12px; margin-top: 3px; }
+
+.unlock-hints { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.unlock-line {
+  color: var(--txt-faint); font-size: 12px; line-height: 1.6;
+}
+.unlock-line a { color: var(--txt-dim); }
+.unlock-line a:hover { color: var(--txt); }
+.unlock-line::before { content: "+ "; }

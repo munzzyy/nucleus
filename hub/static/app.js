@@ -68,33 +68,47 @@
     if (!wrap) return;
     let s;
     try { s = await N.get("/api/settings"); } catch (_) { return; }
+    const keys = s.keys || [];
+    const setCount = keys.filter(k => k.set).length;
+    const note = document.getElementById("settings-note");
+    if (note) note.textContent = `${setCount} of ${keys.length} keys set. All optional — Recon works keyless, but each key you add unlocks more data. Keys stay local (var/.env).`;
     wrap.innerHTML = "";
-    (s.keys || []).forEach(k => {
-      const card = N.el("div", { class: "card" });
+    keys.forEach(k => {
+      const card = N.el("div", { class: "card keycard" });
       const head = N.el("div", { class: "row-top" });
-      head.appendChild(N.el("h2", { text: k.label }));
+      const lt = N.el("div", {});
+      lt.appendChild(N.el("h2", { text: k.label }));
+      lt.appendChild(N.el("span", { class: "faint small", text: k.provider + " · " + k.free }));
+      head.appendChild(lt);
       head.appendChild(N.el("span", { class: "pill " + (k.set ? "ok" : "warn"),
-        html: '<span class="dot"></span>' + (k.set ? "configured" : "not set") }));
+        html: '<span class="dot"></span>' + (k.set ? "set" : "not set") }));
       card.appendChild(head);
-      const input = N.el("input", { type: "text", placeholder: k.set ? "•••••••• (saved) — paste a new key to replace" : "paste your key" });
-      const field = N.el("div", { class: "field" }); field.appendChild(input);
+      card.appendChild(N.el("p", { class: "sub", text: k.unlocks }));
+      const field = N.el("div", { class: "field" });
+      const input = N.el("input", { type: "text",
+        placeholder: k.set ? "•••••••• saved — paste a new key to replace" : "paste your key" });
+      field.appendChild(input);
       card.appendChild(field);
-      const row = N.el("div", { class: "row" });
+      const row = N.el("div", { class: "row keyrow" });
       const save = N.el("button", { text: "Save" });
       save.addEventListener("click", async () => {
         save.disabled = true;
         try {
           const r = await N.post("/api/settings", { name: k.name, value: input.value.trim() });
-          N.toast(r.set ? "Saved — Recon phone lookups are live" : "Cleared", "ok");
+          N.toast(r.set ? k.label + " key saved — live now" : k.label + " cleared", "ok");
           loadSettings();
         } catch (e) { N.toast(e.message || "save failed", "bad"); save.disabled = false; }
       });
-      const clear = N.el("button", { class: "ghost", text: "Clear" });
-      clear.addEventListener("click", async () => {
-        try { await N.post("/api/settings", { name: k.name, value: "" }); N.toast("Cleared", "ok"); loadSettings(); }
-        catch (e) { N.toast(e.message || "failed", "bad"); }
-      });
-      row.appendChild(save); if (k.set) row.appendChild(clear);
+      row.appendChild(save);
+      if (k.set) {
+        const clear = N.el("button", { class: "ghost", text: "Clear" });
+        clear.addEventListener("click", async () => {
+          try { await N.post("/api/settings", { name: k.name, value: "" }); N.toast(k.label + " cleared", "ok"); loadSettings(); }
+          catch (e) { N.toast(e.message || "failed", "bad"); }
+        });
+        row.appendChild(clear);
+      }
+      row.appendChild(N.el("a", { class: "btn ghost", href: k.get_url, target: "_blank", rel: "noreferrer", text: "Get a free key ↗" }));
       card.appendChild(row);
       wrap.appendChild(card);
     });

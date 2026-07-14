@@ -24,9 +24,10 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from shared import common
+from shared import apikeys, common
 
 FETCH_TIMEOUT = 5.0
+KEYED_TIMEOUT = 6.0
 DNS_TIMEOUT = 5.0
 USERNAME_SITE_TIMEOUT = 6.0
 USERNAME_CONCURRENCY = 8
@@ -78,6 +79,21 @@ def _json_or_none(body: bytes):
         return json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None
+
+
+def _keyed_note(status, err) -> str:
+    """Human-readable failure note for a keyed source -- a bad/expired key or a
+    rate limit must degrade to this, never a crash, never sink the rest of the
+    module's scan."""
+    if status is None:
+        return err or "unreachable or timed out"
+    if status in (401, 403):
+        return "key invalid or rejected"
+    if status == 429:
+        return "rate-limited -- try again later"
+    if status >= 500:
+        return "provider error"
+    return err or f"HTTP {status}"
 
 
 def _geo_lookup(ip: str) -> dict | None:
@@ -553,8 +569,54 @@ def username_scan(u: str) -> dict:
 
 
 # ==========================================================================
-# 2. Email
+# 2. Email -- keyed source helpers
 # ==========================================================================
+def _hunter_email_verify(email: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://api.hunter.io/v2/email-verifier?email={quote(email, safe='')}&api_key={quote(key, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=100_000)
+    if status == 200:
+        data = (_json_or_none(body) or {}).get("data") or {}
+        return {
+            "ok": True, "result": data.get("result"), "score": data.get("score"),
+            "disposable": data.get("disposable"), "webmail": data.get("webmail"),
+            "mx_records": data.get("mx_records"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _ipqs_email_lookup(email: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://ipqualityscore.com/api/json/email/{quote(key, safe='')}/{quote(email, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=100_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data.get("success") is False:
+            return {"ok": False, "error": data.get("message") or "lookup failed"}
+        return {
+            "ok": True, "valid": data.get("valid"), "disposable": data.get("disposable"),
+            "recent_abuse": data.get("recent_abuse"), "fraud_score": data.get("fraud_score"),
+            "leaked": data.get("leaked"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _hibp_lookup(email: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email, safe='')}?truncateResponse=false",
+        timeout=KEYED_TIMEOUT, max_bytes=200_000,
+        headers={"hibp-api-key": key, "User-Agent": "nucleus-recon"})
+    if status == 200:
+        data = _json_or_none(body)
+        breaches = [{
+            "name": b.get("Name"), "date": b.get("BreachDate"), "data_classes": b.get("DataClasses") or [],
+        } for b in (data if isinstance(data, list) else [])]
+        return {"ok": True, "breach_count": len(breaches), "breaches": breaches, "error": None}
+    if status == 404:
+        return {"ok": True, "breach_count": 0, "breaches": [], "note": "no breaches on file", "error": None}
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
 def email_scan(email: str) -> dict:
     domain = email.split("@", 1)[1] if "@" in email else ""
     result: dict = {"input": email, "domain": domain}
@@ -621,6 +683,29 @@ def email_scan(email: str) -> dict:
     result["mx"] = [r.get("data") for r in mx if r.get("data")]
     result["has_mx"] = bool(result["mx"])
 
+    keyed: dict = {}
+    unlock: list[str] = []
+
+    key = apikeys.get_key("HUNTER_API_KEY")
+    if key:
+        keyed["hunter"] = _hunter_email_verify(email, key)
+    else:
+        unlock.append("Add a Hunter.io key in Settings to verify deliverability and flag disposable/webmail addresses.")
+
+    key = apikeys.get_key("IPQS_API_KEY")
+    if key:
+        keyed["ipqs"] = _ipqs_email_lookup(email, key)
+    else:
+        unlock.append("Add an IPQualityScore key in Settings for fraud score and leak detection on this email.")
+
+    key = apikeys.get_key("HIBP_API_KEY")
+    if key:
+        keyed["hibp"] = _hibp_lookup(email, key)
+    else:
+        unlock.append("Add a Have I Been Pwned key in Settings for the authoritative breach list (the gold standard).")
+
+    result["keyed"] = keyed
+    result["unlock"] = unlock
     return result
 
 
@@ -634,6 +719,78 @@ _SECURITY_HEADERS = [
     ("X-Content-Type-Options", "x_content_type_options"),
     ("Referrer-Policy", "referrer_policy"),
 ]
+
+
+# ==========================================================================
+# 3. Domain -- keyed source helpers
+# ==========================================================================
+def _securitytrails_subdomains(d: str, key: str) -> tuple[set[str], str | None]:
+    status, body, _, err = _safe_fetch(
+        f"https://api.securitytrails.com/v1/domain/{quote(d, safe='')}/subdomains",
+        timeout=KEYED_TIMEOUT, max_bytes=200_000, headers={"APIKEY": key})
+    if status == 200:
+        data = _json_or_none(body) or {}
+        names = set()
+        for sub in data.get("subdomains") or []:
+            sub = (sub or "").strip().lower()
+            if sub:
+                names.add(f"{sub}.{d}")
+        return names, None
+    return set(), _keyed_note(status, err)
+
+
+def _vt_domain_lookup(d: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://www.virustotal.com/api/v3/domains/{quote(d, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=300_000, headers={"x-apikey": key})
+    if status == 200:
+        data = _json_or_none(body) or {}
+        attrs = (data.get("data") or {}).get("attributes") or {}
+        stats = attrs.get("last_analysis_stats") or {}
+        cats = attrs.get("categories") or {}
+        return {
+            "ok": True, "malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0), "reputation": attrs.get("reputation"),
+            "categories": list(cats.values())[:10], "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _hunter_domain_search(d: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://api.hunter.io/v2/domain-search?domain={quote(d, safe='')}&api_key={quote(key, safe='')}&limit=10",
+        timeout=KEYED_TIMEOUT, max_bytes=200_000)
+    if status == 200:
+        data = (_json_or_none(body) or {}).get("data") or {}
+        emails = data.get("emails") or []
+        return {
+            "ok": True, "organization": data.get("organization"), "pattern": data.get("pattern"),
+            "email_count": len(emails),
+            "emails": [{"value": e.get("value"), "type": e.get("type"), "confidence": e.get("confidence")}
+                       for e in emails[:10]],
+            "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _whoisxml_lookup(d: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://www.whoisxmlapi.com/whoisserver/WhoisService"
+        f"?apiKey={quote(key, safe='')}&domainName={quote(d, safe='')}&outputFormat=JSON",
+        timeout=KEYED_TIMEOUT, max_bytes=200_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        rec = data.get("WhoisRecord") or {}
+        err_msg = (rec.get("errorMessage") or {}).get("msg") or (data.get("ErrorMessage") or {}).get("msg")
+        if err_msg:
+            return {"ok": False, "error": err_msg}
+        registrant = rec.get("registrant") or {}
+        return {
+            "ok": True, "registrar": rec.get("registrarName"), "created": rec.get("createdDate"),
+            "updated": rec.get("updatedDate"), "expires": rec.get("expiresDate"),
+            "registrant_org": registrant.get("organization"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
 
 
 def domain_scan(domain: str) -> dict:
@@ -708,19 +865,32 @@ def domain_scan(domain: str) -> dict:
     else:
         ht_error = err or f"HTTP {status}"
 
-    merged_names = crt_names | {h["host"] for h in ht_hosts}
+    # SecurityTrails full subdomain list (keyed) -- merges into the same set.
+    securitytrails_key = apikeys.get_key("SECURITYTRAILS_API_KEY")
+    st_names: set[str] = set()
+    st_error: str | None = None
+    if securitytrails_key:
+        st_names, st_error = _securitytrails_subdomains(d, securitytrails_key)
+
+    merged_names = crt_names | {h["host"] for h in ht_hosts} | st_names
     result["subdomains"] = {
         "ok": bool(merged_names) or (crt_error is None and ht_error is None),
         "count": len(merged_names), "names": sorted(merged_names)[:300],
         "crt_sh": {"ok": crt_error is None, "count": len(crt_names), "error": crt_error},
         "hackertarget": {"ok": ht_error is None, "count": len(ht_hosts),
                           "hosts": ht_hosts[:150], "error": ht_error},
+        "securitytrails": {"ok": bool(securitytrails_key) and st_error is None,
+                            "count": len(st_names),
+                            "error": st_error if securitytrails_key else None},
     }
 
-    # urlscan.io recent public scans
+    # urlscan.io recent public scans -- a key (if set) only raises submit/search
+    # limits, the keyless search already works, so this stays best-effort.
+    urlscan_key = apikeys.get_key("URLSCAN_API_KEY")
     status, body, _, err = _safe_fetch(
         f"https://urlscan.io/api/v1/search/?q=domain:{quote(d, safe='')}&size=5",
-        timeout=FETCH_TIMEOUT, max_bytes=300_000)
+        timeout=FETCH_TIMEOUT, max_bytes=300_000,
+        headers={"API-Key": urlscan_key} if urlscan_key else None)
     if status == 200:
         data = _json_or_none(body) or {}
         scans = []
@@ -811,12 +981,147 @@ def domain_scan(domain: str) -> dict:
         hosting["error"] = "no A record to resolve"
     result["hosting"] = hosting
 
+    keyed: dict = {}
+    unlock: list[str] = []
+
+    if not urlscan_key:
+        unlock.append("Add a urlscan.io key in Settings for higher submit/search limits (keyless search already works).")
+
+    if securitytrails_key:
+        keyed["securitytrails"] = {"ok": st_error is None, "count": len(st_names), "error": st_error}
+    else:
+        unlock.append("Add a SecurityTrails key in Settings for a deeper subdomain list + DNS history.")
+
+    key = apikeys.get_key("VT_API_KEY")
+    if key:
+        keyed["virustotal"] = _vt_domain_lookup(d, key)
+    else:
+        unlock.append("Add a VirusTotal key in Settings for domain reputation and AV categorization.")
+
+    key = apikeys.get_key("HUNTER_API_KEY")
+    if key:
+        keyed["hunter"] = _hunter_domain_search(d, key)
+    else:
+        unlock.append("Add a Hunter.io key in Settings to find corporate email addresses for this domain.")
+
+    key = apikeys.get_key("WHOISXML_API_KEY")
+    if key:
+        keyed["whoisxml"] = _whoisxml_lookup(d, key)
+    else:
+        unlock.append("Add a WhoisXML key in Settings for clean structured WHOIS data.")
+
+    result["keyed"] = keyed
+    result["unlock"] = unlock
     return result
 
 
 # ==========================================================================
-# 4. IP
+# 4. IP -- keyed source helpers (each only ever called when its key is set)
 # ==========================================================================
+def _ipinfo_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://ipinfo.io/{quote(ip, safe='')}/json?token={quote(key, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=50_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        privacy = data.get("privacy") or {}
+        org = data.get("org") or ""
+        return {
+            "ok": True, "org": org or None,
+            "asn": org.split(" ", 1)[0] if org.startswith("AS") else None,
+            "city": data.get("city"), "region": data.get("region"), "country": data.get("country"),
+            "vpn": privacy.get("vpn"), "proxy": privacy.get("proxy"), "tor": privacy.get("tor"),
+            "hosting": privacy.get("hosting"),
+            "abuse_contact": (data.get("abuse") or {}).get("address"),
+            "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _vt_ip_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://www.virustotal.com/api/v3/ip_addresses/{quote(ip, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=300_000, headers={"x-apikey": key})
+    if status == 200:
+        data = _json_or_none(body) or {}
+        attrs = (data.get("data") or {}).get("attributes") or {}
+        stats = attrs.get("last_analysis_stats") or {}
+        return {
+            "ok": True, "malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0), "as_owner": attrs.get("as_owner"),
+            "country": attrs.get("country"), "reputation": attrs.get("reputation"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _abuseipdb_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://api.abuseipdb.com/api/v2/check?ipAddress={quote(ip, safe='')}&maxAgeInDays=90",
+        timeout=KEYED_TIMEOUT, max_bytes=100_000,
+        headers={"Key": key, "Accept": "application/json"})
+    if status == 200:
+        data = (_json_or_none(body) or {}).get("data") or {}
+        return {
+            "ok": True, "abuse_confidence_score": data.get("abuseConfidenceScore"),
+            "total_reports": data.get("totalReports"), "usage_type": data.get("usageType"),
+            "isp": data.get("isp"), "domain": data.get("domain"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _greynoise_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://api.greynoise.io/v3/community/{quote(ip, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=50_000, headers={"key": key})
+    if status == 200:
+        data = _json_or_none(body) or {}
+        return {
+            "ok": True, "noise": data.get("noise"), "riot": data.get("riot"),
+            "classification": data.get("classification"), "name": data.get("name"),
+            "last_seen": data.get("last_seen"), "note": None, "error": None,
+        }
+    if status == 404:
+        return {"ok": True, "noise": False, "riot": False, "classification": None, "name": None,
+                "last_seen": None, "note": "not seen scanning the internet (clean)", "error": None}
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _shodan_host_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://api.shodan.io/shodan/host/{quote(ip, safe='')}?key={quote(key, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=700_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data is None:
+            return {"ok": False, "error": "response too large to parse -- try again"}
+        ports = sorted(set(data.get("ports") or []))
+        vulns = sorted(set(data.get("vulns") or []))[:30]
+        return {
+            "ok": True, "org": data.get("org"), "os": data.get("os"),
+            "hostnames": data.get("hostnames") or [], "ports": ports, "vulns": vulns, "error": None,
+        }
+    if status == 404:
+        return {"ok": True, "org": None, "os": None, "hostnames": [], "ports": [], "vulns": [],
+                "note": "no data on file for this IP", "error": None}
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
+def _ipqs_ip_lookup(ip: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://ipqualityscore.com/api/json/ip/{quote(key, safe='')}/{quote(ip, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=100_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data.get("success") is False:
+            return {"ok": False, "error": data.get("message") or "lookup failed"}
+        return {
+            "ok": True, "fraud_score": data.get("fraud_score"), "proxy": data.get("proxy"),
+            "vpn": data.get("vpn"), "tor": data.get("tor"), "recent_abuse": data.get("recent_abuse"),
+            "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
 def ip_scan(ip: str) -> dict:
     try:
         ipobj = ipaddress.ip_address(ip)
@@ -884,6 +1189,50 @@ def ip_scan(ip: str) -> dict:
     else:
         result["otx"] = {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
 
+    # Keyed sources -- each only runs when its free API key is present in
+    # Settings; otherwise it's skipped and surfaced as an "unlock" hint so
+    # Cole knows exactly which key would turn it on.
+    keyed: dict = {}
+    unlock: list[str] = []
+
+    key = apikeys.get_key("IPINFO_TOKEN")
+    if key:
+        keyed["ipinfo"] = _ipinfo_lookup(ip, key)
+    else:
+        unlock.append("Add an IPinfo key in Settings for precise geo, ASN/org, and VPN/proxy/Tor detection.")
+
+    key = apikeys.get_key("VT_API_KEY")
+    if key:
+        keyed["virustotal"] = _vt_ip_lookup(ip, key)
+    else:
+        unlock.append("Add a VirusTotal key in Settings for IP reputation and AV detections.")
+
+    key = apikeys.get_key("ABUSEIPDB_API_KEY")
+    if key:
+        keyed["abuseipdb"] = _abuseipdb_lookup(ip, key)
+    else:
+        unlock.append("Add an AbuseIPDB key in Settings for abuse confidence score and report count.")
+
+    key = apikeys.get_key("GREYNOISE_API_KEY")
+    if key:
+        keyed["greynoise"] = _greynoise_lookup(ip, key)
+    else:
+        unlock.append("Add a GreyNoise key in Settings to see if this IP is known internet background noise.")
+
+    key = apikeys.get_key("SHODAN_API_KEY")
+    if key:
+        keyed["shodan"] = _shodan_host_lookup(ip, key)
+    else:
+        unlock.append("Add a Shodan key in Settings for full host data (banners, org, OS, vulns) beyond InternetDB.")
+
+    key = apikeys.get_key("IPQS_API_KEY")
+    if key:
+        keyed["ipqs"] = _ipqs_ip_lookup(ip, key)
+    else:
+        unlock.append("Add an IPQualityScore key in Settings for fraud score and proxy/VPN/Tor detection.")
+
+    result["keyed"] = keyed
+    result["unlock"] = unlock
     return result
 
 
@@ -917,6 +1266,23 @@ def _guess_country(digits_with_plus: str) -> str | None:
     return None
 
 
+def _ipqs_phone_lookup(digits: str, key: str) -> dict:
+    phone = digits.lstrip("+")
+    status, body, _, err = _safe_fetch(
+        f"https://ipqualityscore.com/api/json/phone/{quote(key, safe='')}/{quote(phone, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=100_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data.get("success") is False:
+            return {"ok": False, "error": data.get("message") or "lookup failed"}
+        return {
+            "ok": True, "valid": data.get("valid"), "active": data.get("active"),
+            "carrier": data.get("carrier"), "line_type": data.get("line_type"),
+            "fraud_score": data.get("fraud_score"), "risky": data.get("risky"), "error": None,
+        }
+    return {"ok": False, "error": _keyed_note(status, err)}
+
+
 def phone_scan(number: str) -> dict:
     digits = re.sub(r"[^\d+]", "", number)
     result: dict = {
@@ -932,28 +1298,37 @@ def phone_scan(number: str) -> dict:
             "note": "NUMLOOKUP_API_KEY not set (env var or var/.env) -- "
                     "live carrier/line-type lookup skipped, showing parsed data only",
         }
-        return result
+    else:
+        if digits.startswith("+"):
+            url = f"https://api.numlookupapi.com/v1/validate/{quote(digits, safe='+')}"
+        else:
+            url = f"https://api.numlookupapi.com/v1/validate/{quote(digits, safe='')}?country_code=US"
+        status, body, _, err = _safe_fetch(url, timeout=FETCH_TIMEOUT, headers={"apikey": api_key})
+        if status == 200:
+            data = _json_or_none(body) or {}
+            result["lookup"] = {
+                "ok": True, "configured": True, "valid": data.get("valid"),
+                "carrier": data.get("carrier"), "line_type": data.get("line_type"),
+                "location": data.get("location"), "country_name": data.get("country_name"),
+                "international_format": data.get("international_format"),
+                "local_format": data.get("local_format"),
+            }
+        elif status == 401:
+            data = _json_or_none(body) or {}
+            result["lookup"] = {"ok": False, "configured": True,
+                                 "error": data.get("message") or "unauthorized"}
+        else:
+            result["lookup"] = {"ok": False, "configured": True, "error": err or f"HTTP {status}"}
 
-    if digits.startswith("+"):
-        url = f"https://api.numlookupapi.com/v1/validate/{quote(digits, safe='+')}"
+    keyed: dict = {}
+    unlock: list[str] = []
+    key = apikeys.get_key("IPQS_API_KEY")
+    if key:
+        keyed["ipqs"] = _ipqs_phone_lookup(digits, key)
     else:
-        url = f"https://api.numlookupapi.com/v1/validate/{quote(digits, safe='')}?country_code=US"
-    status, body, _, err = _safe_fetch(url, timeout=FETCH_TIMEOUT, headers={"apikey": api_key})
-    if status == 200:
-        data = _json_or_none(body) or {}
-        result["lookup"] = {
-            "ok": True, "configured": True, "valid": data.get("valid"),
-            "carrier": data.get("carrier"), "line_type": data.get("line_type"),
-            "location": data.get("location"), "country_name": data.get("country_name"),
-            "international_format": data.get("international_format"),
-            "local_format": data.get("local_format"),
-        }
-    elif status == 401:
-        data = _json_or_none(body) or {}
-        result["lookup"] = {"ok": False, "configured": True,
-                             "error": data.get("message") or "unauthorized"}
-    else:
-        result["lookup"] = {"ok": False, "configured": True, "error": err or f"HTTP {status}"}
+        unlock.append("Add an IPQualityScore key in Settings for carrier, line type, and fraud score.")
+    result["keyed"] = keyed
+    result["unlock"] = unlock
     return result
 
 
@@ -961,6 +1336,27 @@ def phone_scan(number: str) -> dict:
 # 6. Hash -- known-file lookup against CIRCL hashlookup (NSRL + malware sets)
 # ==========================================================================
 _HASH_ALGO_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def _vt_hash_lookup(h: str, key: str) -> dict:
+    status, body, _, err = _safe_fetch(
+        f"https://www.virustotal.com/api/v3/files/{quote(h, safe='')}",
+        timeout=KEYED_TIMEOUT, max_bytes=300_000, headers={"x-apikey": key})
+    if status == 200:
+        data = _json_or_none(body) or {}
+        attrs = (data.get("data") or {}).get("attributes") or {}
+        stats = attrs.get("last_analysis_stats") or {}
+        ptc = attrs.get("popular_threat_classification") or {}
+        return {
+            "ok": True, "malicious": stats.get("malicious", 0),
+            "total": sum(stats.values()) if stats else 0,
+            "meaningful_name": attrs.get("meaningful_name"),
+            "type_description": attrs.get("type_description"),
+            "threat_label": ptc.get("suggested_threat_label"), "error": None,
+        }
+    if status == 404:
+        return {"ok": True, "malicious": 0, "total": 0, "note": "not found in VirusTotal", "error": None}
+    return {"ok": False, "error": _keyed_note(status, err)}
 
 
 def hash_scan(h: str) -> dict:
@@ -974,7 +1370,7 @@ def hash_scan(h: str) -> dict:
         timeout=FETCH_TIMEOUT, max_bytes=50_000)
     if status == 200:
         data = _json_or_none(body) or {}
-        return {
+        result = {
             "input": h, "algo": algo, "known": True,
             "filename": data.get("FileName") or data.get("hashlookup:parent-name"),
             "size": data.get("FileSize"),
@@ -983,10 +1379,22 @@ def hash_scan(h: str) -> dict:
             "md5": data.get("MD5"), "sha1": data.get("SHA-1"), "sha256": data.get("SHA-256"),
             "error": None,
         }
-    if status == 404:
-        return {"input": h, "algo": algo, "known": False, "error": None,
-                "note": "not present in CIRCL hashlookup (NSRL known-file + malware corpora)"}
-    return {"input": h, "algo": algo, "known": None, "error": err or f"HTTP {status}"}
+    elif status == 404:
+        result = {"input": h, "algo": algo, "known": False, "error": None,
+                   "note": "not present in CIRCL hashlookup (NSRL known-file + malware corpora)"}
+    else:
+        result = {"input": h, "algo": algo, "known": None, "error": err or f"HTTP {status}"}
+
+    keyed: dict = {}
+    unlock: list[str] = []
+    key = apikeys.get_key("VT_API_KEY")
+    if key:
+        keyed["virustotal"] = _vt_hash_lookup(h, key)
+    else:
+        unlock.append("Add a VirusTotal key in Settings for AV detection ratio and threat classification.")
+    result["keyed"] = keyed
+    result["unlock"] = unlock
+    return result
 
 
 def _balanced_json_value(text: str, start: int) -> str | None:
