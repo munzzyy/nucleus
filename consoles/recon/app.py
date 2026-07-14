@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import common
-from consoles.recon import detect, lookups
+from consoles.recon import detect, lookups, resources
 
 MAX_QUERY_LEN = 512
 
@@ -50,8 +50,16 @@ def _scan(req):
             modules["ip"] = lookups.ip_scan(normalized)
         elif kind == "phone":
             modules["phone"] = lookups.phone_scan(normalized)
-        # name / company / crypto / image / geo have no live module --
-        # pivots + dorks below are the whole answer for those.
+        elif kind == "hash":
+            modules["hash"] = lookups.hash_scan(normalized)
+        elif kind == "crypto":
+            modules["crypto"] = lookups.crypto_scan(normalized)
+        elif kind == "mac":
+            modules["mac"] = lookups.mac_scan(normalized)
+        elif kind in ("name", "company"):
+            modules[kind] = lookups.wikipedia_scan(normalized)
+        # image / geo have no live module -- pivots + dorks below are the
+        # whole answer for those.
     except Exception as e:  # a module bug degrades to an error field, not a 500
         errors[kind] = f"{type(e).__name__}: {e}"
 
@@ -71,9 +79,17 @@ def _arsenal(req):
     return common.Response.json(lookups.arsenal_status())
 
 
+def _resources(req):
+    return common.Response.json({
+        "categories": [{"name": cat, "items": items} for cat, items in resources.RESOURCES.items()],
+        "count": sum(len(items) for items in resources.RESOURCES.values()),
+    })
+
+
 ROUTES = {
     "POST /api/scan": _scan,
     "GET /api/arsenal": _arsenal,
+    "GET /api/resources": _resources,
 }
 
 

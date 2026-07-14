@@ -17,6 +17,7 @@ from urllib.parse import quote, quote_plus
 VALID_TYPES = (
     "username", "email", "domain", "ip", "phone",
     "name", "company", "crypto", "image", "geo",
+    "hash", "mac",
 )
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -26,6 +27,12 @@ _DOMAIN_RE = re.compile(
 _BTC_RE = re.compile(r"^(bc1[a-z0-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$")
 _ETH_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 _GEO_RE = re.compile(r"^-?\d{1,3}(?:\.\d+)?\s*,\s*-?\d{1,3}(?:\.\d+)?$")
+# MD5 / SHA1 / SHA256 hex digest, either case.
+_HASH_RE = re.compile(r"^(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$")
+# Colon- or dash-separated MAC, one separator style per match (no mixing).
+_MAC_RE = re.compile(
+    r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$|^(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$"
+)
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,39}$")
 _IMAGE_EXT_RE = re.compile(r"\.(jpe?g|png|gif|webp|bmp|svg|tiff?)(?:[?#].*)?$", re.I)
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){1,4}$")
@@ -58,6 +65,19 @@ def classify(raw: str) -> tuple[str, str]:
 
     if _EMAIL_RE.match(s):
         return "email", s.lower()
+
+    # MAC before hash/username: colon form isn't a valid username character
+    # set anyway, but the dash form (xx-xx-xx-xx-xx-xx) IS a legal username
+    # string, so it must be claimed here or it'll misclassify downstream.
+    if _MAC_RE.match(s):
+        return "mac", s.lower()
+
+    # Hash before crypto/username: a bare hex digest is also alnum (a legal
+    # username), so it has to be claimed before the username fallback. It
+    # can't collide with BTC (base58, excludes several hex letters) or ETH
+    # (requires a literal "0x" prefix, which isn't a hex digit itself).
+    if _HASH_RE.match(s):
+        return "hash", s.lower()
 
     if _BTC_RE.match(s) or _ETH_RE.match(s):
         return "crypto", s
@@ -115,6 +135,8 @@ def normalize_for(kind: str, raw: str) -> str:
         return re.sub(r"[^\d+]", "", s)
     if kind == "geo":
         return re.sub(r"\s+", "", s)
+    if kind in ("hash", "mac"):
+        return s.lower()
     return s
 
 
@@ -124,6 +146,8 @@ _FORMAT_RE = {
     "username": _USERNAME_RE,
     "geo": _GEO_RE,
     "name": _NAME_RE,
+    "hash": _HASH_RE,
+    "mac": _MAC_RE,
 }
 
 
@@ -266,6 +290,21 @@ def pivots_for(kind: str, value: str) -> list[dict]:
             {"title": "Bing visual search", "url": f"https://www.bing.com/images/search?q=imgurl:{qv}&view=detailv2"},
         ]
 
+    if kind == "hash":
+        return [
+            {"title": "VirusTotal", "url": f"https://www.virustotal.com/gui/file/{qv}"},
+            {"title": "CIRCL hashlookup", "url": "https://hashlookup.circl.lu/"},
+            {"title": "MalwareBazaar", "url": f"https://bazaar.abuse.ch/browse.php?search=hash%3A{qv}"},
+            {"title": "Hybrid Analysis", "url": f"https://www.hybrid-analysis.com/search?query={qv}"},
+        ]
+
+    if kind == "mac":
+        return [
+            {"title": "macvendors.com", "url": "https://macvendors.com/"},
+            {"title": "Wireshark OUI lookup", "url": "https://www.wireshark.org/tools/oui-lookup.html"},
+            {"title": "IEEE OUI registry search", "url": "https://standards-oui.ieee.org/"},
+        ]
+
     if kind == "geo":
         try:
             lat, lng = v.split(",", 1)
@@ -347,6 +386,17 @@ def dorks_for(kind: str, value: str) -> list[dict]:
         return [
             _dork("Exact address", f'"{v}"'),
             _dork("Pastes / forums", f'"{v}" site:pastebin.com OR site:reddit.com OR site:bitcointalk.org'),
+        ]
+
+    if kind == "hash":
+        return [
+            _dork("Exact hash", f'"{v}"'),
+            _dork("Malware writeups", f'"{v}" (malware OR sample OR analysis OR IOC)'),
+        ]
+
+    if kind == "mac":
+        return [
+            _dork("Exact mention", f'"{v}"'),
         ]
 
     return []

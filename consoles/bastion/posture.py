@@ -335,6 +335,9 @@ _SCRIPTS = [
     {"file": "6-blackarch-repo.sh", "run": "./6-blackarch-repo.sh",
      "desc": "Adds the BlackArch repo (signature-checked) so any of its ~2900 tools is one pacman -S away.",
      "applied": lambda: "blackarch" in _pacman_conf_text()},
+    {"file": "7-osint-tools.sh", "run": "./7-osint-tools.sh",
+     "desc": "Curated OSINT toolkit via pipx/go (maigret, holehe, recon-ng, spiderfoot, dnsrecon, shodan...). Pairs with the Recon console.",
+     "applied": lambda: any(common.which(b) for b in ("maigret", "holehe", "recon-ng", "spiderfoot"))},
 ]
 
 

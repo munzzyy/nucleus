@@ -12,9 +12,10 @@
 <div class="wrap">
   <div class="page-head">
     <h1>Recon <span class="tag">OSINT</span></h1>
-    <p>Paste a username, email, domain, IP, or phone number. Recon auto-detects the type and
-      runs live passive lookups. Everything else (names, companies, crypto addresses, images,
-      coordinates) gets curated pivot links and dork queries instead. Passive, public sources only.</p>
+    <p>Paste a username, email, domain, IP, phone number, file hash, crypto address, or MAC address.
+      Recon auto-detects the type and runs live passive lookups. Names/companies get a Wikipedia
+      summary; everything else (images, coordinates) gets curated pivot links and dork queries
+      instead. Passive, public sources only.</p>
   </div>
 
   <div class="card">
@@ -39,6 +40,8 @@
             <option value="crypto">Crypto address</option>
             <option value="image">Image URL</option>
             <option value="geo">Geo coordinates</option>
+            <option value="hash">File hash</option>
+            <option value="mac">MAC address</option>
           </select>
         </div>
         <div class="field fit">
@@ -55,6 +58,16 @@
 
   <div class="section-title">Local Arsenal</div>
   <div id="arsenal" class="grid cols-3"></div>
+
+  <div class="section-title">OSINT Resources</div>
+  <div class="card">
+    <div class="field grow">
+      <label for="res-search">Filter resources</label>
+      <input type="search" id="res-search" autocomplete="off" spellcheck="false"
+             placeholder="filter by name, category, or note…">
+    </div>
+  </div>
+  <div id="resources" class="mt"></div>
 </div>
 
 <script src="/shared/nucleus.js"></script>

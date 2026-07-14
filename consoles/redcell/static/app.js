@@ -1,18 +1,59 @@
 (function () {
   "use strict";
   const N = window.Nucleus;
+  const TABS = ["run", "arsenal", "build", "tools", "history"];
   let INV = null;          // last /api/inventory payload
   let ACTIVE_CAT = "";
+  let INV_SEARCH = "";
+  let EXPANDED = new Set(); // categories the user has manually opened in the arsenal accordion
 
   document.addEventListener("DOMContentLoaded", init);
 
   async function init() {
+    wireTabs();
     wireAuthGate();
     wireRunner();
     wireBuilder();
-    document.getElementById("inv-refresh").addEventListener("click", () => loadInventory(true));
+    wireArsenal();
+    document.getElementById("hist-refresh").addEventListener("click", loadHistory);
     await loadInventory(false);
     await loadHistory();
+  }
+
+  // ------------------------------------------------------------------
+  // Tabs
+  // ------------------------------------------------------------------
+  function wireTabs() {
+    TABS.forEach(tab => {
+      document.getElementById("tabbtn-" + tab).addEventListener("click", () => switchTab(tab));
+    });
+    document.getElementById("tabbar").addEventListener("keydown", onTabKeydown);
+    const initial = TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "run";
+    switchTab(initial);
+  }
+
+  function onTabKeydown(e) {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const idx = TABS.indexOf(document.activeElement.dataset.tab);
+    if (idx === -1) return;
+    e.preventDefault();
+    const next = TABS[(idx + (e.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length];
+    switchTab(next);
+    document.getElementById("tabbtn-" + next).focus();
+  }
+
+  function switchTab(tab) {
+    if (!TABS.includes(tab)) tab = "run";
+    TABS.forEach(t => {
+      const active = t === tab;
+      const btn = document.getElementById("tabbtn-" + t);
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+      btn.tabIndex = active ? 0 : -1;
+      document.getElementById("tab-" + t).classList.toggle("hidden", !active);
+    });
+    if (history.replaceState) history.replaceState(null, "", "#" + tab);
+    if (tab === "history") loadHistory();
   }
 
   // ------------------------------------------------------------------
@@ -28,28 +69,27 @@
   // Inventory
   // ------------------------------------------------------------------
   async function loadInventory(refresh) {
-    const summary = document.getElementById("inv-summary");
-    summary.textContent = "Scanning...";
+    const stat = document.getElementById("inv-stat-num");
+    stat.textContent = "…";
     try {
       INV = await N.get("/api/inventory" + (refresh ? "?refresh=1" : ""));
     } catch (e) {
-      summary.textContent = "Failed to load inventory: " + e.message;
-      N.toast("inventory load failed", "bad");
+      stat.textContent = "error";
+      N.toast("inventory load failed: " + e.message, "bad");
       return;
     }
     renderCategorySelect();
-    renderCategoryChips();
-    renderInvTable();
     renderSummary();
+    renderAccordion();
     renderRunnerSelect();
     renderBuilderSelect();
     renderLocalTools();
+    document.getElementById("tabcount-arsenal").textContent = "· " + INV.summary.total;
   }
 
   function renderSummary() {
     const s = INV.summary;
-    document.getElementById("inv-summary").textContent =
-      `${s.installed} / ${s.total} tools installed on this box`;
+    document.getElementById("inv-stat-num").textContent = `${s.installed} / ${s.total}`;
   }
 
   function renderCategorySelect() {
@@ -61,46 +101,84 @@
       sel.appendChild(N.el("option", { value: c.key, text: `${c.label} (${c.installed}/${c.total})` }));
     });
     sel.value = prev || "";
-    sel.onchange = () => { ACTIVE_CAT = sel.value; renderInvTable(); renderCategoryChips(); };
-    document.getElementById("inv-installed-only").onchange = renderInvTable;
+    sel.onchange = () => { ACTIVE_CAT = sel.value; renderAccordion(); };
   }
 
-  function renderCategoryChips() {
-    const wrap = document.getElementById("inv-cats");
-    wrap.innerHTML = "";
-    INV.categories.forEach(c => {
-      const active = ACTIVE_CAT === c.key;
-      const card = N.el("div", {
-        class: "card cat-chip stat" + (active ? " active" : ""),
-        onclick: () => {
-          ACTIVE_CAT = active ? "" : c.key;
-          document.getElementById("inv-cat").value = ACTIVE_CAT;
-          renderInvTable();
-          renderCategoryChips();
-        },
-      });
-      card.appendChild(N.el("div", { class: "num", text: String(c.installed) }));
-      card.appendChild(N.el("div", { class: "lbl", text: c.label }));
-      card.appendChild(N.el("div", { class: "frac", text: `${c.installed} of ${c.total}` }));
-      wrap.appendChild(card);
+  function wireArsenal() {
+    document.getElementById("inv-search").addEventListener("input", e => {
+      INV_SEARCH = e.target.value;
+      renderAccordion();
     });
+    document.getElementById("inv-installed-only").addEventListener("change", renderAccordion);
+    document.getElementById("inv-refresh").addEventListener("click", () => loadInventory(true));
   }
 
-  function renderInvTable() {
-    const tbody = document.querySelector("#inv-table tbody");
-    tbody.innerHTML = "";
+  // Collapsible per-category accordion — replaces one flat 81-row table.
+  // Sections are collapsed by default; a text search or the category filter
+  // forces the matching section(s) open so results are never hidden.
+  function renderAccordion() {
+    const wrap = document.getElementById("inv-accordion");
+    wrap.innerHTML = "";
+    if (!INV) return;
     const installedOnly = document.getElementById("inv-installed-only").checked;
-    const rows = INV.tools.filter(t =>
-      (!ACTIVE_CAT || t.category === ACTIVE_CAT) && (!installedOnly || t.installed));
-    if (!rows.length) {
-      tbody.appendChild(N.el("tr", {}, [N.el("td", { colspan: "6", class: "muted", text: "No tools match this filter." })]));
-      return;
+    const q = INV_SEARCH.trim().toLowerCase();
+    const cats = ACTIVE_CAT ? INV.categories.filter(c => c.key === ACTIVE_CAT) : INV.categories;
+    let shown = 0;
+    cats.forEach(c => {
+      const rows = INV.tools.filter(t => t.category === c.key
+        && (!installedOnly || t.installed)
+        && (!q || t.name.toLowerCase().includes(q) || (t.purpose || "").toLowerCase().includes(q)));
+      if (!rows.length) return;
+      shown++;
+      wrap.appendChild(renderAccordionSection(c, rows, !!q));
+    });
+    if (!shown) {
+      wrap.appendChild(N.el("div", { class: "card muted", text: "No tools match this filter." }));
     }
+  }
+
+  function categoryOpen(key, forced) {
+    return ACTIVE_CAT === key || forced || EXPANDED.has(key);
+  }
+
+  function toggleCategory(key) {
+    if (EXPANDED.has(key)) EXPANDED.delete(key); else EXPANDED.add(key);
+    renderAccordion();
+  }
+
+  function renderAccordionSection(c, rows, forcedOpen) {
+    const open = categoryOpen(c.key, forcedOpen);
+    const item = N.el("div", { class: "acc-item" + (open ? " open" : "") });
+    const bodyId = "acc-body-" + c.key;
+    const btn = N.el("button", {
+      type: "button", class: "acc-head", id: "acc-btn-" + c.key,
+      "aria-expanded": String(open), "aria-controls": bodyId,
+      onclick: () => toggleCategory(c.key),
+    });
+    btn.appendChild(N.el("span", { class: "acc-chev", "aria-hidden": "true", text: "›" }));
+    btn.appendChild(N.el("span", { class: "acc-title", text: c.label }));
+    btn.appendChild(N.el("span", { class: "acc-count", text: `${rows.length} shown` }));
+    btn.appendChild(N.el("span", { class: "pill " + (c.installed === c.total ? "ok" : "warn") }, [
+      N.el("span", { class: "dot" }), document.createTextNode(`${c.installed} / ${c.total} installed`),
+    ]));
+    item.appendChild(btn);
+    const body = N.el("div", { class: "acc-body" + (open ? "" : " hidden"), id: bodyId, role: "region", "aria-labelledby": "acc-btn-" + c.key });
+    body.appendChild(buildToolsTable(rows));
+    item.appendChild(body);
+    return item;
+  }
+
+  function buildToolsTable(rows) {
+    const table = N.el("table");
+    table.appendChild(N.el("thead", {}, [N.el("tr", {}, [
+      N.el("th", { text: "Tool" }), N.el("th", { text: "Purpose" }), N.el("th", { text: "Status" }),
+      N.el("th", { text: "Version" }), N.el("th", { text: "Install" }),
+    ])]));
+    const tbody = N.el("tbody");
     rows.forEach(t => {
       const tr = N.el("tr");
       tr.appendChild(N.el("td", {}, [N.el("strong", { text: t.name }),
         document.createTextNode(" "), N.el("span", { class: "src-badge", text: t.source })]));
-      tr.appendChild(N.el("td", { class: "muted", text: t.category_label }));
       tr.appendChild(N.el("td", { class: "muted", text: t.purpose }));
       const statusTd = N.el("td");
       statusTd.appendChild(N.el("span", { class: "pill " + (t.installed ? "ok" : "bad") }, [
@@ -111,6 +189,8 @@
       tr.appendChild(N.el("td", { class: "mono small muted", text: t.installed ? (t.path || "") : t.install }));
       tbody.appendChild(tr);
     });
+    table.appendChild(tbody);
+    return table;
   }
 
   // ------------------------------------------------------------------

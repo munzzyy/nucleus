@@ -46,3 +46,13 @@
 
 .subdomain-list { columns: 2; column-gap: 20px; font-family: var(--mono); font-size: 12.5px; }
 @media (max-width: 700px) { .subdomain-list { columns: 1; } }
+
+.resource-cat { margin-top: 20px; }
+.resource-cat:first-child { margin-top: 0; }
+.resource-cat h3 {
+  font-size: 13px; margin: 0 0 10px; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--txt-faint);
+}
+.resource-link { display: block; padding: 11px 13px; }
+.resource-link .r-name { font-weight: 650; font-size: 13.5px; }
+.resource-link .r-note { color: var(--txt-dim); font-size: 12px; margin-top: 3px; }

@@ -120,11 +120,19 @@ _DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9-]{1,63}$")
 
 def _c_github(u):
     url = f"https://api.github.com/users/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT,
-                                     headers={"Accept": "application/vnd.github+json"})
+    status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT,
+                                        headers={"Accept": "application/vnd.github+json"},
+                                        max_bytes=50_000)
     profile = f"https://github.com/{u}"
     if status == 200:
-        return {"found": True, "url": profile, "note": "HTTP 200"}
+        data = _json_or_none(body) or {}
+        enrich = {
+            "name": data.get("name"), "bio": data.get("bio"),
+            "public_repos": data.get("public_repos"), "followers": data.get("followers"),
+            "created_at": data.get("created_at"), "blog": data.get("blog"),
+            "location": data.get("location"),
+        }
+        return {"found": True, "url": profile, "note": "HTTP 200", "enrich": enrich}
     if status == 404:
         return {"found": False, "url": profile, "note": "HTTP 404"}
     return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
@@ -507,6 +515,7 @@ def username_scan(u: str) -> dict:
     t0 = time.monotonic()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=USERNAME_CONCURRENCY)
     results = []
+    github_enrich = None
     try:
         futures = {ex.submit(fn, u): name for name, fn in SITES}
         done, not_done = concurrent.futures.wait(futures, timeout=USERNAME_BUDGET)
@@ -516,8 +525,11 @@ def username_scan(u: str) -> dict:
                 r = fut.result()
             except Exception as e:  # a single site bug must not sink the scan
                 r = {"found": None, "url": "", "note": f"error: {type(e).__name__}: {e}"}
-            results.append({"site": name, "url": r.get("url", ""), "found": r.get("found"),
-                             "note": r.get("note", "")})
+            entry = {"site": name, "url": r.get("url", ""), "found": r.get("found"),
+                      "note": r.get("note", "")}
+            results.append(entry)
+            if name == "GitHub" and r.get("enrich"):
+                github_enrich = r["enrich"]
         for fut in not_done:
             results.append({"site": futures[fut], "url": "", "found": None, "note": "timed out"})
     finally:
@@ -531,6 +543,7 @@ def username_scan(u: str) -> dict:
     return {
         "input": u,
         "sites": results,
+        "github": github_enrich,
         "found_count": sum(1 for r in results if r["found"] is True),
         "not_found_count": sum(1 for r in results if r["found"] is False),
         "unknown_count": sum(1 for r in results if r["found"] is None),
@@ -629,7 +642,7 @@ def domain_scan(domain: str) -> dict:
 
     # DNS
     dns: dict = {}
-    for rtype in ("A", "AAAA", "MX", "TXT", "NS", "CNAME"):
+    for rtype in ("A", "AAAA", "MX", "TXT", "NS", "CNAME", "CAA", "SOA", "SRV", "DNSKEY"):
         try:
             ans = common.dns_query(d, rtype, timeout=DNS_TIMEOUT)
         except Exception:
@@ -661,20 +674,80 @@ def domain_scan(domain: str) -> dict:
 
     # crt.sh certificate-transparency subdomains (notoriously flaky/rate-limited)
     status, body, _, err = _safe_fetch(
-        f"https://crt.sh/?q=%25.{quote(d, safe='')}&output=json", timeout=10.0)
+        f"https://crt.sh/?q=%25.{quote(d, safe='')}&output=json", timeout=10.0, max_bytes=800_000)
+    crt_names: set[str] = set()
     if status == 200:
         data = _json_or_none(body)
-        names: set[str] = set()
         if isinstance(data, list):
             for row in data:
                 for n in (row.get("name_value") or "").split("\n"):
                     n = n.strip().lstrip("*.").lower()
                     if n and n.endswith(d):
-                        names.add(n)
-        result["subdomains"] = {"ok": True, "count": len(names), "names": sorted(names)[:200], "error": None}
+                        crt_names.add(n)
+        crt_error = None
     else:
-        result["subdomains"] = {"ok": False, "count": 0, "names": [],
-                                 "error": err or f"HTTP {status} (crt.sh is often overloaded -- retry later)"}
+        crt_error = err or f"HTTP {status} (crt.sh is often overloaded -- retry later)"
+
+    # hackertarget hostsearch -- CSV `host,ip`. Free tier rate-limits with a
+    # plain-text error body on a 200, so detect that instead of trusting status.
+    status, body, _, err = _safe_fetch(
+        f"https://api.hackertarget.com/hostsearch/?q={quote(d, safe='')}",
+        timeout=FETCH_TIMEOUT, max_bytes=100_000)
+    ht_hosts: list[dict] = []
+    if status == 200:
+        text = body.decode("utf-8", "replace").strip()
+        if not text or "error" in text.lower() or "exceeded" in text.lower():
+            ht_error = text[:200] or "empty response"
+        else:
+            ht_error = None
+            for line in text.splitlines():
+                host, _, ip = line.partition(",")
+                host = host.strip().lower()
+                if host and host.endswith(d):
+                    ht_hosts.append({"host": host, "ip": ip.strip()})
+    else:
+        ht_error = err or f"HTTP {status}"
+
+    merged_names = crt_names | {h["host"] for h in ht_hosts}
+    result["subdomains"] = {
+        "ok": bool(merged_names) or (crt_error is None and ht_error is None),
+        "count": len(merged_names), "names": sorted(merged_names)[:300],
+        "crt_sh": {"ok": crt_error is None, "count": len(crt_names), "error": crt_error},
+        "hackertarget": {"ok": ht_error is None, "count": len(ht_hosts),
+                          "hosts": ht_hosts[:150], "error": ht_error},
+    }
+
+    # urlscan.io recent public scans
+    status, body, _, err = _safe_fetch(
+        f"https://urlscan.io/api/v1/search/?q=domain:{quote(d, safe='')}&size=5",
+        timeout=FETCH_TIMEOUT, max_bytes=300_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        scans = []
+        for r in (data.get("results") or [])[:5]:
+            page = r.get("page") or {}
+            task = r.get("task") or {}
+            scans.append({
+                "url": page.get("url"), "ip": page.get("ip"),
+                "time": task.get("time"), "screenshot": r.get("screenshot"),
+            })
+        result["urlscan"] = {"ok": True, "count": len(scans), "scans": scans, "error": None}
+    else:
+        result["urlscan"] = {"ok": False, "count": 0, "scans": [], "error": err or f"HTTP {status}"}
+
+    # AlienVault OTX reputation (community threat-intel pulses mentioning this domain)
+    status, body, _, err = _safe_fetch(
+        f"https://otx.alienvault.com/api/v1/indicators/domain/{quote(d, safe='')}/general",
+        timeout=FETCH_TIMEOUT, max_bytes=300_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        pulse_info = data.get("pulse_info") or {}
+        pulses = pulse_info.get("pulses") or []
+        result["otx"] = {"ok": True, "pulse_count": pulse_info.get("count", 0),
+                          "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
+                          "error": None}
+    else:
+        result["otx"] = {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
 
     # Wayback availability
     status, body, _, err = _safe_fetch(
@@ -797,6 +870,20 @@ def ip_scan(ip: str) -> dict:
     else:
         result["tor"] = {"ok": False, "error": err or f"HTTP {status}"}
 
+    otx_type = "IPv4" if ipobj.version == 4 else "IPv6"
+    status, body, _, err = _safe_fetch(
+        f"https://otx.alienvault.com/api/v1/indicators/{otx_type}/{quote(ip, safe='')}/general",
+        timeout=FETCH_TIMEOUT, max_bytes=300_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        pulse_info = data.get("pulse_info") or {}
+        pulses = pulse_info.get("pulses") or []
+        result["otx"] = {"ok": True, "pulse_count": pulse_info.get("count", 0),
+                          "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
+                          "error": None}
+    else:
+        result["otx"] = {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
+
     return result
 
 
@@ -868,6 +955,218 @@ def phone_scan(number: str) -> dict:
     else:
         result["lookup"] = {"ok": False, "configured": True, "error": err or f"HTTP {status}"}
     return result
+
+
+# ==========================================================================
+# 6. Hash -- known-file lookup against CIRCL hashlookup (NSRL + malware sets)
+# ==========================================================================
+_HASH_ALGO_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def hash_scan(h: str) -> dict:
+    h = h.strip().lower()
+    algo = _HASH_ALGO_BY_LEN.get(len(h))
+    if not algo:
+        return {"input": h, "algo": None, "known": None, "error": "unrecognized hash length"}
+
+    status, body, _, err = _safe_fetch(
+        f"https://hashlookup.circl.lu/lookup/{algo}/{quote(h, safe='')}",
+        timeout=FETCH_TIMEOUT, max_bytes=50_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        return {
+            "input": h, "algo": algo, "known": True,
+            "filename": data.get("FileName") or data.get("hashlookup:parent-name"),
+            "size": data.get("FileSize"),
+            "source": data.get("source") or data.get("hashlookup:source"),
+            "trust": data.get("hashlookup:trust"),
+            "md5": data.get("MD5"), "sha1": data.get("SHA-1"), "sha256": data.get("SHA-256"),
+            "error": None,
+        }
+    if status == 404:
+        return {"input": h, "algo": algo, "known": False, "error": None,
+                "note": "not present in CIRCL hashlookup (NSRL known-file + malware corpora)"}
+    return {"input": h, "algo": algo, "known": None, "error": err or f"HTTP {status}"}
+
+
+def _balanced_json_value(text: str, start: int) -> str | None:
+    """From `text[start]` (a '{' or '['), return the balanced substring up to
+    its matching close, or None if it's cut off (i.e. a truncated body)."""
+    if start >= len(text) or text[start] not in "{[":
+        return None
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _partial_ethplorer_parse(text: str) -> tuple[dict, list[dict], bool]:
+    """Best-effort recovery when a huge Ethplorer response got cut off by our
+    byte cap. `"ETH"` sits near the top of the document so it almost always
+    survives intact even when the (potentially enormous) `"tokens"` array
+    doesn't; a naive whole-document json.loads would lose both. Walk the
+    tokens array element-by-element so a truncated tail just stops early
+    instead of poisoning the whole parse. Returns (eth, tokens[:15], any_cut).
+    """
+    eth: dict = {}
+    idx = text.find('"ETH"')
+    if idx != -1:
+        brace = text.find("{", idx)
+        chunk = _balanced_json_value(text, brace) if brace != -1 else None
+        if chunk:
+            eth = _json_or_none(chunk.encode("utf-8")) or {}
+
+    tokens: list[dict] = []
+    cut = True
+    idx = text.find('"tokens"')
+    if idx != -1:
+        bracket = text.find("[", idx)
+        if bracket != -1:
+            i, n = bracket + 1, len(text)
+            while i < n and len(tokens) < 15:
+                while i < n and text[i] in " \t\r\n,":
+                    i += 1
+                if i < n and text[i] == "]":
+                    cut = False
+                    break
+                if i >= n or text[i] != "{":
+                    break
+                chunk = _balanced_json_value(text, i)
+                if chunk is None:
+                    break  # element itself got truncated -- stop, don't guess
+                tok = _json_or_none(chunk.encode("utf-8"))
+                if tok is not None:
+                    tokens.append(tok)
+                i += len(chunk)
+    return eth, tokens, cut
+
+
+# ==========================================================================
+# 7. Crypto address -- BTC via blockchain.info, ETH via Ethplorer
+# ==========================================================================
+def crypto_scan(addr: str) -> dict:
+    if addr.lower().startswith("0x"):
+        status, body, _, err = _safe_fetch(
+            f"https://api.ethplorer.io/getAddressInfo/{quote(addr, safe='')}?apiKey=freekey",
+            timeout=FETCH_TIMEOUT, max_bytes=200_000)
+        if status == 200:
+            data = _json_or_none(body)
+            truncated = False
+            if data is not None:
+                eth = data.get("ETH") or {}
+                tokens = data.get("tokens") or []
+                token_count = len(tokens)
+            else:
+                # Ethplorer can return 400KB+ for busy wallets and our cap
+                # can land mid-token-array -- recover balance + a few token
+                # names from what we did get instead of losing everything.
+                text = body.decode("utf-8", "replace")
+                eth, tokens, truncated = _partial_ethplorer_parse(text)
+                token_count = len(tokens) if not truncated else None
+            token_list = [{
+                "name": (t.get("tokenInfo") or {}).get("name"),
+                "symbol": (t.get("tokenInfo") or {}).get("symbol"),
+                "balance": t.get("balance"),
+            } for t in tokens[:15]]
+            return {
+                "input": addr, "chain": "ETH", "ok": True,
+                "balance_eth": eth.get("balance"),
+                "total_in_eth": eth.get("totalIn"), "total_out_eth": eth.get("totalOut"),
+                "token_count": token_count, "tokens": token_list,
+                "note": ("response was larger than our size cap -- showing balance + "
+                         f"first {len(token_list)} token(s), count may be incomplete") if truncated else None,
+                "error": None,
+            }
+        if status == 404:
+            return {"input": addr, "chain": "ETH", "ok": True, "balance_eth": 0,
+                    "total_in_eth": None, "total_out_eth": None, "token_count": 0, "tokens": [],
+                    "note": "no on-chain activity on file", "error": None}
+        return {"input": addr, "chain": "ETH", "ok": False, "error": err or f"HTTP {status}"}
+
+    status, body, _, err = _safe_fetch(
+        f"https://blockchain.info/rawaddr/{quote(addr, safe='')}?limit=0",
+        timeout=FETCH_TIMEOUT, max_bytes=300_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        sat = 100_000_000
+        return {
+            "input": addr, "chain": "BTC", "ok": True,
+            "balance_btc": round((data.get("final_balance") or 0) / sat, 8),
+            "total_received_btc": round((data.get("total_received") or 0) / sat, 8),
+            "total_sent_btc": round((data.get("total_sent") or 0) / sat, 8),
+            "n_tx": data.get("n_tx"), "note": None, "error": None,
+        }
+    if status == 404:
+        return {"input": addr, "chain": "BTC", "ok": True, "balance_btc": 0, "n_tx": 0,
+                "total_received_btc": 0, "total_sent_btc": 0,
+                "note": "address not found / no activity", "error": None}
+    return {"input": addr, "chain": "BTC", "ok": False, "error": err or f"HTTP {status}"}
+
+
+# ==========================================================================
+# 8. MAC address -- OUI vendor lookup via macvendors.com
+# ==========================================================================
+def mac_scan(mac: str) -> dict:
+    m = mac.strip()
+    status, body, _, err = _safe_fetch(
+        f"https://api.macvendors.com/{quote(m, safe='')}", timeout=FETCH_TIMEOUT, max_bytes=5_000)
+    text = body.decode("utf-8", "replace").strip() if body else ""
+    if status == 200:
+        return {"input": m, "vendor": text, "known": True, "note": None, "error": None}
+    if status == 404:
+        return {"input": m, "vendor": None, "known": False, "error": None,
+                "note": "OUI not found (unassigned or a locally-administered address)"}
+    if status == 429:
+        return {"input": m, "vendor": None, "known": None, "error": None,
+                "note": "rate-limited by macvendors.com -- try again shortly"}
+    return {"input": m, "vendor": None, "known": None, "error": err or f"HTTP {status}"}
+
+
+# ==========================================================================
+# 9. Wikipedia summary -- for name/company/topic selectors
+# ==========================================================================
+def wikipedia_scan(term: str) -> dict:
+    title = term.strip().replace(" ", "_")
+    status, body, _, err = _safe_fetch(
+        f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title, safe='')}",
+        timeout=FETCH_TIMEOUT, max_bytes=200_000)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data.get("type") == "disambiguation":
+            return {"input": term, "found": False,
+                    "note": f"“{term}” is ambiguous on Wikipedia (disambiguation page)",
+                    "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"), "error": None}
+        return {
+            "input": term, "found": True,
+            "title": data.get("title"), "description": data.get("description"),
+            "extract": data.get("extract"),
+            "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
+            "thumbnail": (data.get("thumbnail") or {}).get("source"),
+            "error": None,
+        }
+    if status == 404:
+        return {"input": term, "found": False, "note": "no Wikipedia page found", "error": None}
+    return {"input": term, "found": False, "note": None, "error": err or f"HTTP {status}"}
 
 
 # ==========================================================================

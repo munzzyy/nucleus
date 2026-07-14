@@ -10,11 +10,13 @@
   const statusLine = document.getElementById("status-line");
   const results = document.getElementById("results");
   const arsenalEl = document.getElementById("arsenal");
+  const resourcesEl = document.getElementById("resources");
+  const resSearch = document.getElementById("res-search");
 
   const TYPE_LABEL = {
     username: "Username", email: "Email", domain: "Domain", ip: "IP address",
     phone: "Phone", name: "Name", company: "Company", crypto: "Crypto address",
-    image: "Image URL", geo: "Geo coordinates",
+    image: "Image URL", geo: "Geo coordinates", hash: "File hash", mac: "MAC address",
   };
 
   function pill(kind, text) {
@@ -80,7 +82,15 @@
         ${pill("warn", `${m.unknown_count} unknown`)}
         <span class="faint">checked ${m.checked} sites in ${m.took_ms}ms</span>
       </div>`;
-    return card("Username", summary + `<div class="site-grid">${sites}</div>`);
+    let githubCard = "";
+    if (m.github) {
+      githubCard = card("GitHub profile", kv([
+        ["Name", m.github.name], ["Bio", m.github.bio],
+        ["Public repos", m.github.public_repos], ["Followers", m.github.followers],
+        ["Created", m.github.created_at], ["Blog", m.github.blog], ["Location", m.github.location],
+      ]));
+    }
+    return card("Username", summary + `<div class="site-grid">${sites}</div>`) + githubCard;
   }
 
   function renderEmail(m) {
@@ -116,6 +126,10 @@
       ["NS", (dns.NS || []).join(", ")],
       ["CNAME", (dns.CNAME || []).join(", ")],
       ["TXT", raw((dns.TXT || []).map(esc).join("<br>"))],
+      ["CAA", (dns.CAA || []).join(", ")],
+      ["SOA", raw((dns.SOA || []).map(esc).join("<br>"))],
+      ["SRV", (dns.SRV || []).join(", ")],
+      ["DNSKEY", raw((dns.DNSKEY || []).map(esc).join("<br>"))],
     ]);
 
     const w = m.whois || {};
@@ -147,9 +161,30 @@
     }
 
     const subs = m.subdomains || {};
-    const subsHtml = subs.ok
-      ? `<p class="faint mb">${subs.count} unique name(s) via crt.sh</p>${list(subs.names)}`
-      : `<p class="faint">${esc(subs.error || "unavailable")}</p>`;
+    const crtSrc = subs.crt_sh || {};
+    const htSrc = subs.hackertarget || {};
+    const subsHtml = (subs.names || []).length
+      ? `<p class="faint mb">${subs.count} unique name(s) — crt.sh: ${crtSrc.count || 0}${crtSrc.error ? ` (${esc(crtSrc.error)})` : ""}, `
+        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}</p>${list(subs.names)}`
+      : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}</p>`;
+
+    const us = m.urlscan || {};
+    let urlscanHtml;
+    if (us.ok && us.scans && us.scans.length) {
+      urlscanHtml = us.scans.map(s => `
+        <div class="breach-row">
+          <div class="name">${esc(s.url || "")}</div>
+          <div class="meta">${esc(s.time || "")}${s.ip ? " · " + esc(s.ip) : ""}</div>
+          ${s.screenshot ? `<a class="btn ghost mt" href="${esc(s.screenshot)}" target="_blank" rel="noopener noreferrer">Screenshot</a>` : ""}
+        </div>`).join("");
+    } else {
+      urlscanHtml = `<p class="faint">${esc(us.error || "no recent scans")}</p>`;
+    }
+
+    const otx = m.otx || {};
+    const otxHtml = otx.ok
+      ? kv([["Pulse count", otx.pulse_count], ["Pulse names", (otx.pulse_names || []).join(", ") || "none"]])
+      : `<p class="faint">${esc(otx.error || "unavailable")}</p>`;
 
     const wb = m.wayback || {};
     const wbHtml = wb.ok
@@ -172,7 +207,9 @@
       card("Email posture (SPF / DMARC)", postureHtml),
       card("HTTP + security headers", httpHtml),
       card("Hosting chain", hostingHtml),
-      card("Subdomains (crt.sh)", subsHtml),
+      card("Subdomains (crt.sh + hackertarget)", subsHtml),
+      card("urlscan.io recent scans", urlscanHtml),
+      card("AlienVault OTX reputation", otxHtml),
       card("Wayback Machine", wbHtml),
     ].join("");
   }
@@ -212,12 +249,18 @@
         </div>` + list((tor.relays || []).map(r => r.nickname || "(unnamed)"));
     }
 
+    const otx = m.otx || {};
+    const otxHtml = otx.ok
+      ? kv([["Pulse count", otx.pulse_count], ["Pulse names", (otx.pulse_names || []).join(", ") || "none"]])
+      : `<p class="faint">${esc(otx.error || "unavailable")}</p>`;
+
     return [
       card("InternetDB (Shodan)", idbHtml),
       card("Geolocation", geoHtml),
       card("Reverse DNS", rdnsHtml),
       card("RDAP netblock", rdapHtml),
       card("Tor (Onionoo)", torHtml),
+      card("AlienVault OTX reputation", otxHtml),
     ].join("");
   }
 
@@ -239,9 +282,69 @@
     return card("Phone", top + lookupHtml);
   }
 
+  function renderHash(m) {
+    if (m.known === null && m.error) return card("Hash lookup", `<p class="bad">${esc(m.error)}</p>`);
+    const body = m.known
+      ? kv([
+          ["Algorithm", (m.algo || "").toUpperCase()],
+          ["Known file", "yes"],
+          ["Filename", m.filename],
+          ["Size", m.size],
+          ["Source", m.source],
+          ["Trust", m.trust],
+        ])
+      : kv([
+          ["Algorithm", (m.algo || "").toUpperCase()],
+          ["Known file", "no"],
+          ["Note", m.note || "not found in CIRCL hashlookup"],
+        ]);
+    return card("Hash lookup (CIRCL hashlookup)", body);
+  }
+
+  function renderCrypto(m) {
+    if (!m.ok) return card("Crypto address", `<p class="bad">${esc(m.error || "lookup failed")}</p>`);
+    if (m.chain === "BTC") {
+      return card("Crypto address (Bitcoin)", kv([
+        ["Balance", `${m.balance_btc} BTC`],
+        ["Total received", `${m.total_received_btc} BTC`],
+        ["Total sent", `${m.total_sent_btc} BTC`],
+        ["Transaction count", m.n_tx],
+        ["Note", m.note],
+      ]));
+    }
+    const tokens = (m.tokens || []).map(t => `${t.name || "?"} (${t.symbol || "?"})`).join(", ");
+    return card("Crypto address (Ethereum)", kv([
+      ["Balance", `${m.balance_eth} ETH`],
+      ["Total in", m.total_in_eth != null ? `${m.total_in_eth} ETH` : ""],
+      ["Total out", m.total_out_eth != null ? `${m.total_out_eth} ETH` : ""],
+      ["Token count", m.token_count],
+      ["Tokens", tokens],
+      ["Note", m.note],
+    ]));
+  }
+
+  function renderMac(m) {
+    if (m.error) return card("MAC vendor lookup", `<p class="bad">${esc(m.error)}</p>`);
+    return card("MAC vendor lookup (macvendors.com)", kv([
+      ["Vendor", m.known ? m.vendor : "unknown"],
+      ["Note", m.note],
+    ]));
+  }
+
+  function renderWikipedia(m) {
+    if (!m.found) return card("Wikipedia", `<p class="faint">${esc(m.note || m.error || "no page found")}</p>`);
+    return card("Wikipedia", kv([
+      ["Title", m.title],
+      ["Description", m.description],
+      ["Extract", m.extract],
+      ["URL", m.url ? raw(`<a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">${esc(m.url)}</a>`) : ""],
+    ]));
+  }
+
   const RENDERERS = {
     username: renderUsername, email: renderEmail, domain: renderDomain,
-    ip: renderIp, phone: renderPhone,
+    ip: renderIp, phone: renderPhone, hash: renderHash, crypto: renderCrypto,
+    mac: renderMac, name: renderWikipedia, company: renderWikipedia,
   };
 
   async function runScan(q, type) {
@@ -308,4 +411,46 @@
   }
 
   loadArsenal();
+
+  // -- OSINT resources directory --------------------------------------------
+  let RESOURCE_CATEGORIES = [];
+
+  function renderResourceDirectory(filterText) {
+    const q = (filterText || "").trim().toLowerCase();
+    let html = "";
+    let shown = 0;
+    for (const cat of RESOURCE_CATEGORIES) {
+      const items = q
+        ? cat.items.filter(it =>
+            (it.name || "").toLowerCase().includes(q) ||
+            (it.note || "").toLowerCase().includes(q) ||
+            cat.name.toLowerCase().includes(q))
+        : cat.items;
+      if (!items.length) continue;
+      shown += items.length;
+      const links = items.map(it => `
+        <a class="card link resource-link" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">
+          <div class="r-name">${esc(it.name)}</div>
+          <div class="r-note">${esc(it.note || "")}</div>
+        </a>`).join("");
+      html += `<div class="resource-cat">
+          <h3>${esc(cat.name)} <span class="faint">(${items.length})</span></h3>
+          <div class="pivot-grid">${links}</div>
+        </div>`;
+    }
+    resourcesEl.innerHTML = shown ? html : '<p class="faint">no resources match your search</p>';
+  }
+
+  async function loadResources() {
+    try {
+      const data = await N.get("/api/resources");
+      RESOURCE_CATEGORIES = data.categories || [];
+      renderResourceDirectory("");
+      resSearch.addEventListener("input", () => renderResourceDirectory(resSearch.value));
+    } catch (e) {
+      resourcesEl.innerHTML = '<p class="faint">resources directory unavailable</p>';
+    }
+  }
+
+  loadResources();
 })();
