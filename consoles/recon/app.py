@@ -63,7 +63,7 @@ def _scan(req):
     except Exception as e:  # a module bug degrades to an error field, not a 500
         errors[kind] = f"{type(e).__name__}: {e}"
 
-    return common.Response.json({
+    result = {
         "input": raw,
         "detected_type": kind,
         "normalized": normalized,
@@ -72,11 +72,30 @@ def _scan(req):
         "dorks": detect.dorks_for(kind, normalized),
         "errors": errors,
         "took_ms": round((time.monotonic() - t0) * 1000),
-    })
+    }
+    lookups.log_scan(kind, raw, result)  # best-effort case history; never fails the response
+    return common.Response.json(result)
 
 
 def _arsenal(req):
     return common.Response.json(lookups.arsenal_status())
+
+
+def _recon_history(req):
+    try:
+        limit = int(req.q("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 500))
+    return common.Response.json({"scans": lookups.history_list(limit)})
+
+
+def _recon_scan_get(req):
+    scan_id = req.q("id", "").strip()
+    scan = lookups.history_get(scan_id) if scan_id else None
+    if scan is None:
+        return common.Response.error(404, "scan not found")
+    return common.Response.json(scan)
 
 
 def _resources(req):
@@ -90,6 +109,8 @@ ROUTES = {
     "POST /api/scan": _scan,
     "GET /api/arsenal": _arsenal,
     "GET /api/resources": _resources,
+    "GET /api/recon-history": _recon_history,
+    "GET /api/recon-scan": _recon_scan_get,
 }
 
 

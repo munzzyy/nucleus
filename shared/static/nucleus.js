@@ -56,6 +56,15 @@
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   };
 
+  // Defense-in-depth for every href built from server/remote data (scan
+  // results, pivot links, etc). Every such value is a fixed https template
+  // server-side today — this just makes it impossible to regress into a
+  // javascript:/data: URI later. Always pair with N.esc() on the attribute.
+  N.safeUrl = function (url) {
+    const s = String(url == null ? "" : url).trim();
+    return /^(https?:|mailto:)/i.test(s) ? s : "#";
+  };
+
   // --- topbar + switcher ---------------------------------------------------
   // Each page sets <body data-app="recon">. We render the switcher and poll
   // /api/siblings (server-side health, so no cross-origin calls) to light dots.
@@ -74,17 +83,23 @@
 
     const sw = N.el("div", { class: "switcher", id: "nuc-switcher" });
     bar.appendChild(sw);
-    document.body.insertBefore(bar, document.body.firstChild);
 
-    // OpSec banner sits directly under the top bar on every console.
+    // Topbar + opsec bar share one sticky wrapper, stacked in normal flow
+    // relative to each other, so the opsec bar never needs a hardcoded pixel
+    // offset that breaks when the switcher wraps to two rows on a narrow
+    // viewport — it just sits right below however tall the topbar rendered.
+    const shellWrap = N.el("div", { class: "topbar-wrap" });
+    shellWrap.appendChild(bar);
     const opsec = N.el("div", { class: "opsec-bar", id: "nuc-opsec" });
-    document.body.insertBefore(opsec, bar.nextSibling);
+    shellWrap.appendChild(opsec);
+    document.body.insertBefore(shellWrap, document.body.firstChild);
 
     renderSwitcher([], self);
     pollSiblings(self);
     setInterval(() => pollSiblings(self), 8000);
     pollOpsec();
     setInterval(pollOpsec, 15000);
+    mountShortcuts();
   };
 
   async function pollOpsec() {
@@ -142,6 +157,106 @@
       N._siblings = j.consoles || [];
       document.dispatchEvent(new CustomEvent("nucleus:siblings", { detail: j.consoles || [] }));
     } catch (_) { /* stay quiet; dots just won't light */ }
+  }
+
+  // --- global keyboard shortcuts + help overlay -----------------------------
+  // g then h/r/d/b (or plain 1/2/3/4) jumps consoles; / focuses the page's
+  // primary input; ? toggles this help. Never fires while a field is
+  // focused, except Escape (blurs it) — matching every console's own
+  // keydown handlers (Enter-to-run etc), which still work normally since we
+  // bail out before touching typed keys.
+  const SHORTCUT_PORTS = { h: 8890, r: 8900, d: 8910, b: 8920, "1": 8890, "2": 8900, "3": 8910, "4": 8920 };
+  let helpOverlayEl = null;
+  let helpOpen = false;
+  let gPending = false;
+  let gPendingTimer = null;
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+  }
+
+  function primaryInput() {
+    return document.querySelector("#q, #run-target, #report-domain");
+  }
+
+  function buildHelpOverlay() {
+    if (helpOverlayEl) return helpOverlayEl;
+    const overlay = N.el("div", { class: "shortcuts-overlay hidden", id: "nuc-shortcuts",
+      role: "dialog", "aria-modal": "true", "aria-label": "Keyboard shortcuts" });
+    const panel = N.el("div", { class: "shortcuts-panel" });
+    panel.appendChild(N.el("h2", { text: "Keyboard shortcuts" }));
+    const rows = [
+      ["/", "focus the main input"],
+      ["g h", "go to Hub"],
+      ["g r", "go to Recon"],
+      ["g d", "go to Redcell"],
+      ["g b", "go to Bastion"],
+      ["1 2 3 4", "same, one key"],
+      ["?", "toggle this help"],
+      ["Esc", "close this / blur a field"],
+    ];
+    const dl = N.el("dl", { class: "shortcuts-list" });
+    rows.forEach(([keys, desc]) => {
+      dl.appendChild(N.el("dt", {}, [N.el("span", { class: "kbd", text: keys })]));
+      dl.appendChild(N.el("dd", { text: desc }));
+    });
+    panel.appendChild(dl);
+    const close = N.el("button", { class: "ghost mt", type: "button", text: "Close" });
+    close.addEventListener("click", closeHelp);
+    panel.appendChild(close);
+    overlay.appendChild(panel);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) closeHelp(); });
+    document.body.appendChild(overlay);
+    helpOverlayEl = overlay;
+    return overlay;
+  }
+
+  function openHelp() { buildHelpOverlay().classList.remove("hidden"); helpOpen = true; }
+  function closeHelp() { if (helpOverlayEl) helpOverlayEl.classList.add("hidden"); helpOpen = false; }
+  function toggleHelp() { helpOpen ? closeHelp() : openHelp(); }
+
+  function mountShortcuts() {
+    if (N._shortcutsWired) return;
+    N._shortcutsWired = true;
+    document.addEventListener("keydown", (e) => {
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      const typing = isTypingTarget(document.activeElement);
+
+      if (e.key === "Escape") {
+        if (helpOpen) { closeHelp(); return; }
+        if (typing && document.activeElement.blur) document.activeElement.blur();
+        return;
+      }
+      if (typing) return; // never hijack keys while the user is typing
+
+      if (e.key === "?") { e.preventDefault(); toggleHelp(); return; }
+
+      if (gPending) {
+        gPending = false;
+        clearTimeout(gPendingTimer);
+        const port = SHORTCUT_PORTS[e.key.toLowerCase()];
+        if (port) { e.preventDefault(); location.href = portUrl(port) + "/"; }
+        return;
+      }
+      if (e.key === "g") {
+        gPending = true;
+        clearTimeout(gPendingTimer);
+        gPendingTimer = setTimeout(() => { gPending = false; }, 1200);
+        return;
+      }
+      if (/^[1-4]$/.test(e.key)) {
+        e.preventDefault();
+        location.href = portUrl(SHORTCUT_PORTS[e.key]) + "/";
+        return;
+      }
+      if (e.key === "/") {
+        const el = primaryInput();
+        if (el) { e.preventDefault(); el.focus(); }
+        return;
+      }
+    });
   }
 
   // Auto-mount if the page opted in.

@@ -54,7 +54,18 @@
 
   <div id="status-line" class="mt faint hidden"></div>
 
+  <div id="results-toolbar" class="toolbar-row mt hidden">
+    <button class="ghost" id="res-copy-json" type="button">Copy JSON</button>
+    <button class="ghost" id="res-copy-md" type="button">Copy Markdown</button>
+    <button class="ghost" id="res-download" type="button">Download .json</button>
+  </div>
+
   <div id="results" class="mt"></div>
+
+  <div id="recon-history-wrap" class="hidden">
+    <div class="section-title">Scan history</div>
+    <div id="recon-history" class="grid cols-3 mt"></div>
+  </div>
 
   <div class="section-title">Local Arsenal</div>
   <div id="arsenal" class="grid cols-3"></div>

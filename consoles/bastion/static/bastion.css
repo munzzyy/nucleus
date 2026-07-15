@@ -32,6 +32,14 @@
 .grade-hero .sub { color: var(--txt-dim); font-size: 13px; }
 .grade-hero .links a { margin-right: 10px; }
 
+/* ---- grade change vs the previous report for this domain (if the backend
+   sent previous/delta) ---- */
+.grade-delta { margin-top: 8px; font-size: 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.grade-delta .arrow { font-weight: 700; }
+.grade-delta.ok { color: var(--ok); }
+.grade-delta.bad { color: var(--bad); }
+.grade-delta .pct { font-family: var(--mono); }
+
 .finding-row { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .finding-row:last-child { border-bottom: none; }
 .finding-row .sev { flex: none; width: 62px; font-size: 10.5px; font-weight: 700; letter-spacing: .04em; padding-top: 2px; }
@@ -56,3 +64,19 @@
 .rec-list { margin: 6px 0 0; padding-left: 18px; }
 .rec-list li { color: var(--txt-dim); font-size: 13px; margin: 5px 0; line-height: 1.5; }
 .rec-list li code, .anon-verdict .mono { font-family: var(--mono); }
+
+/* ---- print (Save as PDF via window.print(), from the report result) ----
+   nucleus.css already hides the topbar/switcher/opsec bar. Everything on
+   this page besides the report result is noise for a PDF export, so hide
+   every other direct child of .wrap and let the browser's print dialog
+   do the PDF part for free. ---- */
+@media print {
+  .wrap > *:not(#report-result) { display: none !important; }
+  .wrap { max-width: none; padding: 0; }
+  #report-print { display: none !important; }
+  body { background: #fff; color: #111; }
+  #report-result .card { background: #fff; border-color: #ccc; box-shadow: none; color: #111; }
+  #report-result .sub, #report-result .ftitle, #report-result .frec { color: #111; }
+  #report-result .grade-hero .letter { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #report-result .finding-row { border-color: #ddd; }
+}

@@ -15,13 +15,51 @@ Order every run passes through, and every one of these can refuse the run:
   6. a runner that needs a wordlist gets one ONLY via a registry id
      (see wordlists.py) — never a raw path
   7. the binary must actually be installed
+  8. immediately before spawn, the target's public-ness is re-resolved and
+     re-checked a SECOND time (see "DNS-rebind, honestly" below) — either
+     pinned to the address that check validated, or re-verified in place
 
-Only after all seven does a subprocess get spawned. The user-supplied target
+Only after all eight does a subprocess get spawned. The user-supplied target
 is inserted as exactly one argv element by the runner's `build` callback.
 Every other argv element is either a fixed literal baked into this file, or
 a value looked up from a server-side dict keyed by a validated enum/id — the
 client's raw enum key or wordlist id is NEVER itself placed in argv, only
 the looked-up fixed value is.
+
+DNS-rebind, honestly. Step 4's scope_check and step 8's re-check both call
+common.resolve_public_ips()/common.host_is_public() — real DNS lookups. Left
+alone, that's TWO independent resolutions of the same hostname with nothing
+forcing them to agree: an attacker who controls authoritative DNS for a
+domain Cole is scanning (TTL=0, alternating A records — routine DNS-rebinding,
+not a theoretical race) can answer "public" to step 4 and "127.0.0.1" to
+whatever the external tool resolves moments later, turning any runner into a
+probe of Cole's own loopback/LAN. Two mitigations, sized to what's actually
+achievable in a no-root stdlib app:
+  - nmap / sslscan / testssl / enum4linux connect straight to an address and
+    don't need the hostname for anything else the tool does, so the address
+    step 8 validates is PINNED directly into argv — the tool never resolves
+    again, so there's no second lookup left for an attacker to answer
+    differently. This closes the gap completely for these four. (dig/host/
+    whois are host-kind too but deliberately NOT pinned — they never connect
+    to the resolved address, they query a DNS resolver / WHOIS registry ABOUT
+    the name, so pinning would just silently change what they report — PTR
+    lookup instead of forward lookup, IP WHOIS instead of domain WHOIS —
+    without closing any real "connects to a private address" risk. They get
+    the re-verify treatment below instead, as cheap defense in depth.)
+  - Every other runner needs the real hostname (SNI, vhost routing, or
+    subdomain/name enumeration IS the point) — for those, step 8 re-resolves
+    and re-confirms "still public" a second time, as late as possible,
+    immediately before the subprocess spawns. This SHRINKS the window from
+    "the whole scope_check-to-spawn request lifetime" down to the gap between
+    that one extra DNS round-trip and the external tool's own lookup — it
+    does NOT close it. Nothing in Python can bind a third-party subprocess's
+    own resolver to the address we just validated. The only structurally
+    complete fix is kernel-level egress filtering (a network namespace or an
+    nftables rule scoped to the run_tool subprocess tree, blocking outbound
+    to loopback/RFC1918/link-local regardless of what DNS said at any point)
+    — out of scope for this app today (no root, no namespace tooling), but
+    it's the real hardening path if this ever needs to be airtight instead
+    of "much harder to hit."
 """
 
 from __future__ import annotations
@@ -117,13 +155,53 @@ def scope_check(host: str, lab: bool) -> tuple[bool, str]:
     """Block private/loopback/link-local/reserved/unresolvable targets unless
     lab=True. Reuses common.host_is_public (the same SSRF-grade check recon
     uses) so redcell never has a laxer notion of 'public' than the rest of
-    Nucleus."""
+    Nucleus.
+
+    This is the FIRST of two checks, not the only one — see "DNS-rebind,
+    honestly" in the module docstring. This result can be stale by the time
+    the tool actually runs; handle_run re-resolves a second time immediately
+    before spawn (pin or re-verify, depending on the runner) to shrink that
+    window as much as a Python-level check can.
+    """
     if common.host_is_public(host):
         return True, ""
     if lab:
         return True, "lab-scope override"
     return False, ("target resolves to a private/loopback/link-local/reserved address "
                     "(or doesn't resolve) — set lab:true only to test your own lab or localhost")
+
+
+def _resolve_public_ips_safe(host: str) -> list[str]:
+    """Wrapper around common.resolve_public_ips() tolerant of either a
+    raise-on-blocked or return-empty-on-blocked contract (this codebase has
+    both styles — host_is_public() swallows and returns a bool,
+    _resolve_public() raises ValueError) so a detail of that helper can't
+    turn into an unhandled 500 here. Always returns a list; empty means
+    "don't trust this host right now"."""
+    try:
+        ips = common.resolve_public_ips(host)
+    except (ValueError, OSError):
+        return []
+    return list(ips) if ips else []
+
+
+# Host-kind runners whose tool CONNECTS DIRECTLY to the target address (no
+# hostname-dependent behavior — no SNI, no vhost routing) get the validated
+# address pinned into argv instead of the hostname, closing the DNS-rebind
+# gap completely for them. See "DNS-rebind, honestly" above for why dig/host/
+# whois are host-kind but NOT in this set.
+_REBIND_IP_PIN = {"nmap", "sslscan", "testssl", "enum4linux"}
+
+# Every other runner needs the real hostname (SNI / vhost / subdomain-enum is
+# the point) — these get re-resolved and re-verified "still public" a second
+# time immediately before spawn instead of being pinned. dig/host/whois are
+# here rather than in the pin set above (see the docstring note).
+_REBIND_RECHECK = {
+    "nuclei", "gobuster-dns", "gobuster-dir", "wpscan", "nikto", "sqlmap",
+    "subfinder", "theharvester", "dnsenum", "dnsrecon", "sublist3r", "ffuf",
+    "feroxbuster", "wfuzz", "whatweb", "httpx", "wafw00f",
+    "dig", "host", "whois",
+}
 
 
 # --------------------------------------------------------------------------
@@ -162,6 +240,10 @@ class BuildCtx:
     wordlist: Optional[str] = None                 # resolved absolute path
     out_path: Optional[str] = None                 # server-picked output path
     apikey: Optional[str] = None                   # resolved secret value, if any
+    resolved_ip: Optional[str] = None               # DNS-rebind pin, IP-pin-tier runners only
+                                                     # (see _REBIND_IP_PIN) — `target` stays the
+                                                     # original hostname so build() can still use
+                                                     # it for SNI/display even when pinning argv
 
 
 @dataclass
@@ -183,6 +265,10 @@ class RunnerSpec:
     needs_wordlist: bool = False
     needs_output: Optional[str] = None               # file extension, or None
     uses_apikey: Optional[str] = None                # env-var name, or None
+    known_broken: bool = False                        # installed but confirmed non-functional
+                                                       # on this box (see desc for why) — surfaced
+                                                       # in /api/inventory so the UI can badge it
+                                                       # instead of the state living only in prose
 
 
 # ---- nmap: fixed scan-profile enum, -Pn -T3 always, persisted -oN copy ----
@@ -199,6 +285,40 @@ def _build_nmap(ctx: BuildCtx) -> list:
     argv = ["nmap"] + ctx.options["profile"]
     if ctx.out_path:
         argv += ["-oN", ctx.out_path]
+    # DNS-rebind pin (see _REBIND_IP_PIN): nmap doesn't need the hostname for
+    # anything at these scan profiles, so prefer the address we just
+    # re-validated over letting nmap resolve the name itself.
+    argv.append(ctx.resolved_ip or ctx.target)
+    return argv
+
+
+def _build_enum4linux(ctx: BuildCtx) -> list:
+    # DNS-rebind pin: enum4linux's own usage text calls its positional arg
+    # "ip" — SMB null-session enum has no SNI/name-routing dependency.
+    return ["enum4linux", "-a", ctx.resolved_ip or ctx.target]
+
+
+def _build_sslscan(ctx: BuildCtx) -> list:
+    # DNS-rebind pin, SNI-preserving: connect to the validated IP but tell
+    # sslscan the real hostname via --sni-name so a name-based-vhosted TLS
+    # server still presents the right certificate.
+    argv = ["sslscan", "--no-colour"]
+    if ctx.resolved_ip and ctx.resolved_ip != ctx.target:
+        argv += [f"--sni-name={ctx.target}"]
+        argv.append(ctx.resolved_ip)
+    else:
+        argv.append(ctx.target)
+    return argv
+
+
+def _build_testssl(ctx: BuildCtx) -> list:
+    # DNS-rebind pin via --ip: keeps the hostname as the URI (correct SNI /
+    # cert-name matching, same as sslscan above) while forcing the actual TCP
+    # connection to the address we already validated — testssl's own --help:
+    # "tests the supplied <ip> ... instead of resolving host(s) in URI".
+    argv = ["testssl", "--fast", "--quiet", "--color", "0"]
+    if ctx.resolved_ip and ctx.resolved_ip != ctx.target:
+        argv += ["--ip", ctx.resolved_ip]
     argv.append(ctx.target)
     return argv
 
@@ -278,13 +398,13 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
         bin="sslscan", kind="host", timeout=90,
         install="sudo pacman -S sslscan",
         desc="Read-only TLS/cipher posture check.",
-        build=lambda ctx: ["sslscan", "--no-colour", ctx.target],
+        build=_build_sslscan,
     ),
     "testssl": RunnerSpec(
         bin="testssl", kind="host", timeout=120,
         install="sudo pacman -S testssl.sh",
         desc="Read-only TLS/SSL posture check (fast mode).",
-        build=lambda ctx: ["testssl", "--fast", "--quiet", "--color", "0", ctx.target],
+        build=_build_testssl,
     ),
     "wafw00f": RunnerSpec(
         bin="wafw00f", kind="url", timeout=30,
@@ -296,7 +416,7 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
         bin="enum4linux", kind="host", timeout=120,
         install="yay -S enum4linux",
         desc="SMB/Samba null-session enumeration (users, shares, groups, policy, OS info).",
-        build=lambda ctx: ["enum4linux", "-a", ctx.target],
+        build=_build_enum4linux,
     ),
     "httpx": RunnerSpec(
         bin="httpx", kind="host", timeout=30,
@@ -334,6 +454,7 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
              "load time — every invocation errors before it can run. Not patched here "
              "(third-party site-packages); wired anyway so it fails loud with a real "
              "traceback in stderr instead of silently.",
+        known_broken=True,
         build=lambda ctx: ["dnsrecon", "-d", ctx.target, "-t", "std"],
     ),
 
@@ -374,6 +495,7 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
              "in its interpreter — not patched here (system package); wired anyway so it "
              "fails loud instead of silently.",
         needs_wordlist=True,
+        known_broken=True,
         build=_build_wfuzz,
     ),
 
@@ -415,9 +537,9 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
         bin="sqlmap", kind="url", timeout=180,
         install="sudo pacman -S sqlmap",
         desc="SQLi DETECTION only — --batch --crawl=0 --level=1 --risk=1. Never dumps, never "
-             "opens a shell. (Query-string URLs are rejected by the target validator; see the "
-             "note on validate_url. For anything beyond detection, or a URL with parameters, "
-             "use the Build tab.)",
+             "opens a shell. GET-parameter URLs (e.g. http://site/page?id=1) work fine here — "
+             "the target validator allows query strings. For anything beyond detection "
+             "(higher level/risk, --dump, --os-shell), use the Build tab instead.",
         build=lambda ctx: ["sqlmap", "-u", ctx.target, "--batch", "--crawl=0", "--level=1", "--risk=1"],
     ),
 
@@ -563,12 +685,36 @@ def handle_run(req) -> "common.Response":
         return common.Response.error(409,
             f"{spec.bin} is not installed — install it with: {spec.install}")
 
+    # DNS-rebind mitigation, step 8 — as late as possible, right before
+    # spawn. See "DNS-rebind, honestly" in the module docstring for why this
+    # is two different treatments and what it does and doesn't close.
+    resolved_ip = None
+    if tool in _REBIND_IP_PIN:
+        ips = _resolve_public_ips_safe(scope_host)
+        if not ips:
+            if not lab:
+                return common.Response.error(403,
+                    "target no longer resolves to a public address (re-checked "
+                    "immediately before running) — refusing")
+            # lab mode: proceed unpinned — a private lab target won't resolve
+            # via resolve_public_ips at all, and lab mode intentionally opts
+            # out of the public-only requirement (same as scope_check above).
+        else:
+            resolved_ip = ips[0]
+    elif tool in _REBIND_RECHECK and not lab:
+        if not _resolve_public_ips_safe(scope_host):
+            return common.Response.error(403,
+                "target no longer resolves to a public address (re-checked "
+                "immediately before running) — refusing; set lab:true only "
+                "for your own lab or localhost")
+
     out_path = _out_path(tool, spec.needs_output) if spec.needs_output else None
     apikey = apikeys.get_key(spec.uses_apikey) if spec.uses_apikey else None
     apikey = apikey or None  # "" -> None, so build() can just check truthiness
 
     ctx = BuildCtx(target=argv_target, options=resolved_options,
-                   wordlist=wordlist_path, out_path=out_path, apikey=apikey)
+                   wordlist=wordlist_path, out_path=out_path, apikey=apikey,
+                   resolved_ip=resolved_ip)
     argv = spec.build(ctx)
     result = common.run_tool(argv, timeout=spec.timeout)
 
@@ -608,9 +754,88 @@ def handle_run(req) -> "common.Response":
 # General-purpose / privesc binaries that happen to be in the kit but must NOT
 # be reachable as an arbitrary-arg runner (docker is root-equivalent; the rest
 # are code-exec shells/interpreters).
-_EXPERT_DENY = {"docker", "python", "python3", "python2", "ruby", "perl", "sh",
-                "bash", "zsh", "fish", "tmux", "jq", "pip", "pipx", "go", "gcc",
-                "msfconsole", "msfvenom"}
+#
+# Everything below that isn't in the original hand-picked set was added after
+# auditing the FULL Expert allowlist (every installed, kind=="bin" entry in
+# inventory.REGISTRY not already denied) for tools whose OWN documented
+# feature set can spawn an arbitrary process or load arbitrary code,
+# independent of run_tool's shell=False guarantee — "no shell ever" is a
+# property of THIS file's subprocess call, not of every binary it's allowed
+# to invoke. None of this is reachable today (auth + expert_ack gate holds,
+# confirmed live in the prior audit); the point is that a FUTURE bug reaching
+# /api/expert should cost "ran an allowlisted tool," not "got a shell."
+# Two tiers, both denied, documented separately so the reasoning survives:
+_EXPERT_DENY = {
+    "docker", "python", "python3", "python2", "ruby", "perl", "sh",
+    "bash", "zsh", "fish", "tmux", "jq", "pip", "pipx", "go", "gcc",
+    "msfconsole", "msfvenom",
+
+    # ---- Tier 1: direct, single-argv arbitrary command/binary execution.
+    # Zero extra primitives needed beyond what Expert mode already grants
+    # (argv control) — the CLI argument text itself IS the shell command or
+    # the binary to exec. Confirmed via man page / --help / the tool's own
+    # usage banner this session (not executed live — see the audit note). ----
+    "socat",            # EXEC:<cmd> / SYSTEM:<shell-cmd> / SHELL:<cmd>
+                         # address types — man socat, ADDRESS TYPES section
+    "tcpdump",           # -z postrotate-command forks/execs an arbitrary
+                         # command after each -C/-G file rotation — man tcpdump
+    "radare2", "r2",     # `-c 'cmd'` / interactive `!` shells out — r2 -h
+                         # confirms `-c 'cmd..' execute radare command`; `!`
+                         # is one of r2's most basic documented commands
+    "gdb", "gdb-multiarch", "pwndbg",  # built-in `shell`/`!` — live-confirmed:
+                         # `gdb -batch -ex "help shell"` -> "Execute the rest
+                         # of the line as a shell command." pwndbg is a gdb
+                         # plugin wrapper, inherits the same command
+    "bettercap",         # `-eval '! id'` runs the session's `!` shell-out
+                         # straight from ONE CLI flag, no caplet file needed —
+                         # confirmed via `bettercap --help` (-eval exists) +
+                         # documented `!` session command
+    "proxychains", "proxychains4",  # usage is literally `proxychains4 ...
+                         # program_name [args]` — it execs whatever you name
+                         # as its own argv, unconditionally. `proxychains4 sh`
+                         # is a full shell. Confirmed via its own usage banner.
+    "aflplusplus", "afl-fuzz",  # usage is `afl-fuzz [opts] -- /path/to/target
+                         # [args]` — execs whatever binary follows `--` as the
+                         # fuzz target. Confirmed via `afl-fuzz --help`.
+    "honggfuzz",         # same shape: `honggfuzz [opts] -- path_to_command
+                         # [args]` execs the trailing command. Confirmed via
+                         # `honggfuzz --help`.
+
+    # ---- Tier 2: loads an arbitrary LOCAL script/template/plugin FILE that
+    # then execs. Needs a second primitive (something to plant that file)
+    # that doesn't exist anywhere in this app today — a materially smaller
+    # blast radius than Tier 1 above. Denied anyway per the conservative
+    # standard here ("can load a script that execs" = deny); each of these
+    # loses ONLY its ad-hoc Expert-mode flag access, not its normal use. ----
+    "nmap",              # --script <path> loads NSE Lua with an UNSANDBOXED
+                         # os.execute() — nmap's own manual states scripts
+                         # "are not run in a sandbox... can use os.execute()
+                         # to run arbitrary system commands." The fixed-
+                         # profile nmap runner in SAFE_RUNNERS is untouched.
+    "tshark", "wireshark",  # -X lua_script:<path> loads arbitrary Lua; the
+                         # shared Wireshark/tshark Lua engine exposes
+                         # io.popen (tshark.dev's own scripting docs show an
+                         # io.popen(...) call from a loaded script).
+    "ettercap",          # -F <compiled-filter> runs an etterfilter script,
+                         # which has a built-in exec(command) function — man
+                         # etterfilter: "this function executes a shell
+                         # command."
+    "mitmproxy",         # -s/--scripts <path> loads an arbitrary Python
+                         # addon, executed inside the mitmproxy process —
+                         # confirmed via `mitmproxy --help` (--scripts, -s).
+    "nuclei",            # -code enables "code protocol" templates, which run
+                         # local commands as part of the check — confirmed
+                         # via `nuclei -h` (-code flag, off by default for
+                         # exactly this reason). SAFE_RUNNERS' nuclei profile
+                         # never sets -code, so normal scanning is unaffected.
+    "volatility3", "vol",  # -p/--plugin-dirs loads arbitrary Python plugin
+                         # modules from a given directory, executed on import
+                         # — confirmed via `vol -h`.
+    "exiftool",          # -config <file> loads a ExifTool config, which is a
+                         # Perl file eval'd on load (man exiftool: config files
+                         # are Perl) — arbitrary code once a file can be planted.
+                         # Same Tier-2 shape as the loaders above.
+}
 
 
 def _expert_binaries() -> set:
@@ -705,6 +930,78 @@ def handle_wordlists(req) -> "common.Response":
         "results": wordlists.search(q, limit=limit),
         "total_registered": wordlists.registry_count(),
     })
+
+
+# --------------------------------------------------------------------------
+# Saved outputs — nmap -oN / nuclei -o copies under OUT_DIR. Read-only,
+# listing + fetch only; nothing here can write, delete, or escape OUT_DIR.
+# Mirrors bastion's report-file pattern (resolve() + relative_to() traversal
+# guard) but stricter: a subdirectory path is refused outright, not just a
+# path that escapes the sandbox, since OUT_DIR is only ever meant to be flat.
+# --------------------------------------------------------------------------
+# Matches filenames _out_path() actually produces: "<tool>-<ts>-<hex8>.<ext>".
+# `.+` (greedy) correctly recovers `tool` even if a future tool key contains a
+# hyphen (e.g. gobuster-dir), since it anchors from the fixed-shape suffix.
+_OUT_FNAME_RE = re.compile(
+    r"^(?P<tool>.+)-(?P<ts>\d{8}T\d{6}Z)-(?P<rand>[0-9a-f]{8})\.(?P<ext>[A-Za-z0-9]+)$"
+)
+
+
+def handle_outputs(req) -> "common.Response":
+    """List files directly under OUT_DIR, newest first. Never recurses —
+    OUT_DIR is only ever written to by _out_path() and never contains
+    subdirectories, so a browser has no reason to be able to walk into one."""
+    _ensure_out_dir()
+    files = []
+    try:
+        entries = list(OUT_DIR.iterdir())
+    except OSError:
+        entries = []
+    for p in entries:
+        if not p.is_file():
+            continue
+        m = _OUT_FNAME_RE.match(p.name)
+        tool = m.group("tool") if m else ""
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        files.append({
+            "name": p.name,
+            "tool": tool,
+            "size": st.st_size,
+            "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+                     .isoformat(timespec="seconds"),
+        })
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+    return common.Response.json({"files": files})
+
+
+def handle_output_file(req) -> "common.Response":
+    """Serve one saved output file as plain text. `name` must be a bare
+    filename — no path separators, no '.'/'..' — resolving to a file that
+    lives DIRECTLY inside OUT_DIR. The upfront separator check and the
+    resolve()+relative_to() guard are redundant with each other on purpose
+    (defense in depth): the separator check alone would miss the pathlib
+    absolute-path-override gotcha (`base / "/etc/passwd"` silently becomes
+    `/etc/passwd`), and relative_to() alone wouldn't stop a value containing
+    no '/' from still being interpreted as something other than a flat name."""
+    name = req.q("name")
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        return common.Response.error(400, "invalid or missing ?name=")
+    base = OUT_DIR.resolve()
+    try:
+        candidate = (base / name).resolve()
+        candidate.relative_to(base)  # raises ValueError if it escapes the sandbox
+    except (ValueError, OSError):
+        return common.Response.error(403, "path outside output sandbox")
+    if candidate.parent != base or not candidate.is_file():
+        return common.Response.error(404, "not found")
+    try:
+        data = candidate.read_bytes()
+    except OSError:
+        return common.Response.error(500, "read failed")
+    return common.Response.raw(data, "text/plain; charset=utf-8")
 
 
 # --------------------------------------------------------------------------

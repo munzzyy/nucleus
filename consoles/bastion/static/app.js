@@ -131,11 +131,27 @@
       </div>`;
   }
 
+  function renderGradeDelta(j) {
+    if (!j.previous || !j.delta) return "";
+    const dir = j.delta.grade_direction;
+    const dirClass = dir === "up" ? "ok" : dir === "down" ? "bad" : "";
+    const arrow = dir === "up" ? "▲" : dir === "down" ? "▼" : "•";
+    const pct = j.delta.score_pct;
+    const pctStr = pct == null ? "" : (pct > 0 ? `+${pct}` : `${pct}`);
+    return `
+      <div class="grade-delta ${dirClass}">
+        <span class="arrow">${arrow}</span>
+        <span>grade ${N.esc(j.previous.grade)} &rarr; ${N.esc(j.grade)}</span>
+        ${pctStr ? `<span class="pct">(${N.esc(pctStr)}%)</span>` : ""}
+        ${j.previous.date ? `<span class="faint">since ${N.esc(j.previous.date)}</span>` : ""}
+      </div>`;
+  }
+
   function renderReport(j) {
     const el = document.getElementById("report-result");
     const links = [];
-    if (j.files && j.files.html) links.push(`<a href="${j.files.html.url}" target="_blank" rel="noopener">open HTML report</a>`);
-    if (j.files && j.files.md) links.push(`<a href="${j.files.md.url}" target="_blank" rel="noopener">open Markdown</a>`);
+    if (j.files && j.files.html) links.push(`<a href="${N.esc(N.safeUrl(j.files.html.url))}" target="_blank" rel="noopener">open HTML report</a>`);
+    if (j.files && j.files.md) links.push(`<a href="${N.esc(N.safeUrl(j.files.md.url))}" target="_blank" rel="noopener">open Markdown</a>`);
 
     el.innerHTML = `
       <div class="card">
@@ -146,12 +162,16 @@
             <div class="sub">email ${j.score_breakdown.email.points}/${j.score_breakdown.email.max}
               &middot; web ${j.score_breakdown.web.points}/${j.score_breakdown.web.max}
               &middot; attack surface ${j.score_breakdown.attack_surface.points}/${j.score_breakdown.attack_surface.max}</div>
+            ${renderGradeDelta(j)}
             <div class="links mt">${links.join(" ")}</div>
           </div>
         </div>
-        <h2>Findings</h2>
+        <button class="ghost mt" id="report-print" type="button">Print / Save as PDF</button>
+        <h2 class="mt">Findings</h2>
         ${j.findings.length ? j.findings.map(findingRow).join("") : '<p class="muted">No findings — every checked signal came back clean.</p>'}
       </div>`;
+    const printBtn = document.getElementById("report-print");
+    if (printBtn) printBtn.addEventListener("click", () => window.print());
   }
 
   async function runReport() {

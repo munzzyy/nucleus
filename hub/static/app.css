@@ -19,3 +19,13 @@
 .keyrow { align-items: center; }
 .keyrow button, .keyrow .btn { flex: 0 0 auto; }
 .keyrow .btn.ghost { margin-left: auto; }
+
+/* ---- "N/M keys set" nudge near the top when nothing is unlocked yet ---- */
+.nudge {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 12px 16px; font-size: 13px; color: var(--txt-dim);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  box-shadow: none; margin: -10px 0 22px;
+}
+.nudge a { font-weight: 650; }

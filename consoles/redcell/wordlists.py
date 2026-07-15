@@ -1,13 +1,23 @@
 """Server-side wordlist registry — allowlist, never a path.
 
-Redcell never accepts a wordlist as a filesystem path from the client. At
-import time this module walks the two real wordlist roots on this box,
-records every `.txt` file it finds under an opaque id, and that's the whole
-universe of wordlists a runner will ever touch. A client picks an id; the id
-is a dict lookup, never a path join. An id that isn't in the registry is
-refused. Even a hit is re-validated against the allowed roots before use
-(defense in depth against the registry going stale between startup and a
-request — see `resolve()`).
+Redcell never accepts a wordlist as a filesystem path from the client. On
+first real use (not at import time — see "Lazy build" below) this module
+walks the two real wordlist roots on this box, records every `.txt` file it
+finds under an opaque id, and that's the whole universe of wordlists a
+runner will ever touch. A client picks an id; the id is a dict lookup, never
+a path join. An id that isn't in the registry is refused. Even a hit is
+re-validated against the allowed roots before use (defense in depth against
+the registry going stale between startup and a request — see `resolve()`).
+
+Lazy build: walking both roots is up to ~30k stat() calls, which used to run
+at IMPORT time (`_REGISTRY = _build_registry()` at module scope) and so
+blocked the first `import consoles.redcell.inventory` — and therefore
+redcell's first request of any kind, not just a wordlist one — for however
+long that scan took. `_ensure_registry()` now defers the scan to the first
+call into `common_list()` / `search()` / `resolve()` / `registry_count()`,
+guarded by a lock so concurrent first-callers don't double-scan. Everything
+downstream of the scan (allowlist semantics, ALLOWED_ROOTS re-validation,
+what a given id resolves to) is unchanged — only the timing moved.
 
 Two independent packages both happen to install a directory named
 `seclists` (`wordlists` package ships one under /usr/share/wordlists/seclists,
@@ -20,6 +30,7 @@ still resolves through the same allowlist check.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -109,10 +120,27 @@ def _build_registry() -> dict[str, WordlistEntry]:
     return out
 
 
-_REGISTRY = _build_registry()
+_registry_lock = threading.Lock()
+_registry_built = False
+
+
+def _ensure_registry() -> None:
+    """Build the registry on first real use instead of at import time (see
+    the module docstring). Double-checked locking so two threads racing to
+    be the "first" caller don't both walk both roots — the second just waits
+    for the first's result rather than duplicating ~30k stat() calls."""
+    global _REGISTRY, _registry_built
+    if _registry_built:
+        return
+    with _registry_lock:
+        if _registry_built:  # someone else finished while we waited for the lock
+            return
+        _REGISTRY = _build_registry()
+        _registry_built = True
 
 
 def common_list() -> list[dict]:
+    _ensure_registry()
     return sorted(
         ({"id": e.id, "label": e.label, "root": e.root, "size": e.size}
          for e in _REGISTRY.values() if e.common),
@@ -121,6 +149,7 @@ def common_list() -> list[dict]:
 
 
 def search(query: str, limit: int = 50) -> list[dict]:
+    _ensure_registry()
     q = (query or "").strip().lower()
     if not q:
         return common_list()[:limit]
@@ -143,6 +172,7 @@ def resolve(wordlist_id: str) -> Optional[str]:
     allowed root (registry staleness / tamper defense-in-depth)."""
     if not isinstance(wordlist_id, str) or not wordlist_id:
         return None
+    _ensure_registry()
     entry = _REGISTRY.get(wordlist_id)
     if entry is None:
         return None
@@ -162,4 +192,5 @@ def resolve(wordlist_id: str) -> Optional[str]:
 
 
 def registry_count() -> int:
+    _ensure_registry()
     return len(_REGISTRY)

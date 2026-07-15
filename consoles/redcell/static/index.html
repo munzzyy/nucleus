@@ -80,6 +80,7 @@
       <button id="run-btn" type="button" disabled>Run</button>
       <span id="run-status" class="sub ml-10"></span>
       <pre class="term mt hidden" id="run-output"></pre>
+      <button class="ghost mt hidden" id="run-copy" type="button">Copy output</button>
     </div>
   </div>
 
@@ -160,6 +161,18 @@
       </table>
       <p class="sub" id="hist-empty">No runs logged yet.</p>
     </div>
+
+    <div id="outputs-wrap" class="hidden">
+      <div class="card mt">
+        <div class="panel-head mb-14">
+          <h2 class="m0">Saved outputs</h2>
+          <button class="ghost" id="outputs-refresh" type="button">Refresh</button>
+        </div>
+        <div id="outputs-list"></div>
+        <p class="sub hidden" id="outputs-empty">No saved outputs yet.</p>
+        <pre class="term mt hidden" id="outputs-view"></pre>
+      </div>
+    </div>
   </div>
 
   <!-- ================= EXPERT ================= -->
@@ -194,7 +207,9 @@
         </div>
       </div>
       <p class="sub" id="x-preview"></p>
-      <pre class="term hidden" id="x-output"></pre>
+      <span id="x-status" class="sub"></span>
+      <pre class="term mt hidden" id="x-output"></pre>
+      <button class="ghost mt hidden" id="x-copy" type="button">Copy output</button>
     </div>
   </div>
 

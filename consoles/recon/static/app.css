@@ -57,6 +57,19 @@
 .resource-link .r-name { font-weight: 650; font-size: 13.5px; }
 .resource-link .r-note { color: var(--txt-dim); font-size: 12px; margin-top: 3px; }
 
+.toolbar-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* -- scan history cards (buttons styled as cards, click-to-reopen) -- */
+.hist-item {
+  display: block; width: 100%; text-align: left; cursor: pointer; font: inherit; font-weight: 400;
+  background: linear-gradient(180deg, var(--bg-1), var(--bg));
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; color: var(--txt);
+}
+.hist-item:hover { border-color: var(--accent); }
+.hist-item .hist-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.hist-item .hist-q { font-size: 13px; word-break: break-word; }
+
 .unlock-hints { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .unlock-line {
   color: var(--txt-faint); font-size: 12px; line-height: 1.6;

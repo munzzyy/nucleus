@@ -20,6 +20,7 @@ Handlers are plain functions `f(req) -> Response`. Keep them small.
 from __future__ import annotations
 
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -163,37 +164,6 @@ def _origin_ok(origin: str, port: int) -> bool:
             and (oport == port or (oport is None and u.scheme in ("http", "https"))))
 
 
-def host_is_public(hostname: str) -> bool:
-    """SSRF guard: True only if every resolved address is a normal public IP.
-
-    Blocks loopback, RFC1918, link-local, multicast, reserved, and CGNAT.
-    Used before recon ever fetches a user-supplied host.
-    """
-    hostname = (hostname or "").strip()
-    if not hostname:
-        return False
-    # A bare IP literal: check it directly.
-    try:
-        ip = ipaddress.ip_address(hostname)
-        return _ip_is_public(ip)
-    except ValueError:
-        pass
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except (socket.gaierror, UnicodeError, OSError):
-        return False
-    if not infos:
-        return False
-    for info in infos:
-        addr = info[4][0]
-        try:
-            if not _ip_is_public(ipaddress.ip_address(addr)):
-                return False
-        except ValueError:
-            return False
-    return True
-
-
 def _ip_is_public(ip) -> bool:
     if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
             or ip.is_reserved or ip.is_unspecified):
@@ -202,6 +172,79 @@ def _ip_is_public(ip) -> bool:
     if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
         return False
     return True
+
+
+def resolve_public_ips(host: str) -> list[str]:
+    """Resolve every A/AAAA address for `host` and confirm ALL of them are
+    public. Returns the validated public IPs (resolver order, de-duped), or
+    [] if `host` is empty/unresolvable. Raises ValueError the moment ANY
+    resolved address is private/loopback/link-local/reserved/unspecified — a
+    host with even one non-public answer is refused outright, since an
+    attacker only needs one rebinding-capable record.
+
+    This is the ONE place that resolves-and-validates a hostname. Both
+    `host_is_public()` (the bool convenience used for scope checks) and
+    `_resolve_public()` (fetch()'s connect-pinning, below) call this, so the
+    two SSRF guards share a single predicate and can never quietly drift
+    apart from each other.
+
+    Residual risk: this closes the DNS-rebinding TOCTOU for a caller that
+    immediately connects to one of the returned IPs — `fetch()` does exactly
+    that. It does NOT close it for a caller that takes the validated
+    hostname and hands it to something that re-resolves later (a second
+    lookup can return a different, private, answer if the attacker's DNS TTL
+    is short enough to flip between the two resolutions — classic DNS
+    rebinding). A caller passing a hostname to a third-party tool/subprocess
+    that does its own resolution should pin to one of these IPs directly
+    wherever the tool supports it; where it can't, only kernel-level egress
+    filtering (netns/nftables) fully closes that gap. That tool-side
+    mitigation belongs to redcell, not this guard.
+    """
+    host = (host or "").strip()
+    if not host:
+        return []
+    try:
+        ipobj = ipaddress.ip_address(host)
+    except ValueError:
+        ipobj = None
+    if ipobj is not None:
+        if not _ip_is_public(ipobj):
+            raise ValueError(f"non-public IP: {host}")
+        return [host]
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+    if not infos:
+        return []
+    ips: list[str] = []
+    seen: set[str] = set()
+    for info in infos:
+        addr = info[4][0]
+        try:
+            addr_ip = ipaddress.ip_address(addr)
+        except ValueError:
+            raise ValueError(f"host resolved to an unparseable address: {host} -> {addr}")
+        if not _ip_is_public(addr_ip):
+            raise ValueError(f"host resolves to non-public address: {host} -> {addr}")
+        if addr not in seen:
+            seen.add(addr)
+            ips.append(addr)
+    return ips
+
+
+def host_is_public(hostname: str) -> bool:
+    """SSRF guard: True only if every resolved address is a normal public IP.
+
+    Blocks loopback, RFC1918, link-local, multicast, reserved, and CGNAT.
+    Used before recon ever fetches a user-supplied host. Thin bool wrapper
+    around `resolve_public_ips()` — see its docstring for the residual
+    DNS-rebinding TOCTOU this does and doesn't cover.
+    """
+    try:
+        return bool(resolve_public_ips(hostname))
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -214,34 +257,99 @@ _MAX_REDIRECTS = 5
 def _resolve_public(host: str) -> tuple[str, int]:
     """Resolve `host` and confirm EVERY address is public. Returns (ip, family).
 
-    We resolve once here and connect to exactly this IP, so the address the
-    guard approved is the address we actually talk to — no second lookup for an
-    attacker to poison (defeats DNS-rebinding TOCTOU). A host that resolves to
-    any non-public address at all is refused.
+    We resolve once here (via the shared `resolve_public_ips`) and connect to
+    exactly this IP, so the address the guard approved is the address we
+    actually talk to — no second lookup for an attacker to poison (defeats
+    DNS-rebinding TOCTOU for this call). A host that resolves to any
+    non-public address at all is refused.
     """
-    try:
-        ipobj = ipaddress.ip_address(host)
-        if not _ip_is_public(ipobj):
-            raise ValueError(f"non-public IP: {host}")
-        return host, (socket.AF_INET6 if ipobj.version == 6 else socket.AF_INET)
-    except ValueError as e:
-        if "non-public" in str(e):
-            raise
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except (socket.gaierror, UnicodeError, OSError):
+    ips = resolve_public_ips(host)  # raises ValueError with the reason on any non-public hit
+    if not ips:
         raise ValueError(f"unresolvable host: {host}")
-    if not infos:
-        raise ValueError(f"unresolvable host: {host}")
-    for info in infos:
-        addr = info[4][0]
-        try:
-            if not _ip_is_public(ipaddress.ip_address(addr)):
-                raise ValueError(f"host resolves to non-public address: {host} -> {addr}")
-        except ValueError:
-            raise ValueError(f"host resolves to non-public address: {host} -> {addr}")
-    fam, _, _, _, sockaddr = infos[0]
-    return sockaddr[0], fam
+    ip = ips[0]
+    family = socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET
+    return ip, family
+
+
+def _arm_deadline(sock: socket.socket, deadline: float) -> None:
+    """Set `sock`'s timeout to whatever's left before `deadline`, or raise
+    TimeoutError if that's already <= 0. Call this right before every
+    blocking op on the socket (see `_bind_deadline`) so the timeout shrinks
+    toward the deadline instead of resetting to the full window every time.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("fetch() deadline exceeded")
+    sock.settimeout(remaining)
+
+
+class _DeadlineSocketIO(socket.SocketIO):
+    """The raw I/O http.client's buffered reader sits on top of, but with
+    every recv_into() re-arming a shared monotonic deadline first instead of
+    trusting whatever timeout was on the socket when the reader was built —
+    see `_DeadlineSock` for why that matters."""
+
+    def __init__(self, raw_sock, mode: str, deadline: float):
+        super().__init__(raw_sock, mode)
+        self._deadline = deadline
+
+    def readinto(self, b):
+        _arm_deadline(self._sock, self._deadline)
+        return super().readinto(b)
+
+
+class _DeadlineSock:
+    """Stand-in for `conn.sock` that bounds the whole conversation — send
+    through the final body byte — by one monotonic deadline, not a fixed
+    `socket.settimeout()` a slow server can ride well past its budget.
+
+    `socket.settimeout()` only bounds a single blocking call. http.client's
+    buffered reader issues many small recv()s under one
+    `resp.read(max_bytes)`, and each one gets whatever timeout was last set
+    unless something re-arms it — a server that trickles one byte just
+    under the timeout on every recv() can keep a single read() blocking for
+    many multiples of the configured timeout (measured ~28x against a real
+    slow-trickle server in testing). Sockets don't support monkeypatching
+    their bound methods (no per-instance __dict__ — confirmed by trying),
+    so instead of patching recv/send in place, this wraps `conn.sock`.
+
+    http.client only ever calls sendall()/makefile()/close() on conn.sock in
+    the path we use (we assign conn.sock directly and never call
+    HTTPConnection.connect() — verified against the stdlib source), so
+    that's all this needs to implement: re-arm the deadline before every
+    send, and swap in `_DeadlineSocketIO` so the reader built off
+    makefile() re-arms it before every read too.
+
+    The `_io_refs` increment in makefile() mirrors what a real
+    `socket.makefile()` does — http.client calls `close()` on `Connection:
+    close` responses right after reading headers, *before* the body is
+    read (`self.close()` inside `getresponse()`); a real socket defers its
+    actual fd close until every makefile()-derived reader is also closed
+    (`socket.socket.close()` checks `_io_refs`). Skipping this increment
+    would let that early close() kill the connection before the body is
+    ever read — confirmed against a real Connection:-close response in
+    testing before this was added.
+    """
+
+    def __init__(self, raw_sock, deadline: float):
+        self._sock = raw_sock
+        self._deadline = deadline
+
+    def send(self, data):
+        _arm_deadline(self._sock, self._deadline)
+        return self._sock.send(data)
+
+    def sendall(self, data):
+        _arm_deadline(self._sock, self._deadline)
+        return self._sock.sendall(data)
+
+    def makefile(self, mode: str = "rb", *a, **kw):
+        self._sock._io_refs += 1
+        raw = _DeadlineSocketIO(self._sock, mode, self._deadline)
+        return io.BufferedReader(raw)
+
+    def close(self):
+        self._sock.close()
 
 
 def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict] = None,
@@ -253,6 +361,10 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
     host, so a public URL can't 3xx-bounce into loopback/metadata. Each hop is
     connected to the exact IP the guard validated (hostname preserved for TLS
     SNI + cert check), which also closes the resolve-then-reconnect race.
+    Each hop gets its own fresh `timeout`-second deadline (connect through
+    the final read), enforced by a monotonic clock rather than a single
+    `socket.settimeout()` call that a slow-trickle server can ride well past
+    its budget — see `_DeadlineSock`.
     `allow_hosts` is accepted for call-site compatibility but never relaxes the
     public check. Raises ValueError on a blocked host or non-http scheme.
     """
@@ -282,15 +394,19 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
             for k, v in (headers or {}).items():
                 req_headers[k] = v
 
+        deadline = time.monotonic() + timeout  # fresh cumulative budget for this hop
         sock = socket.create_connection((ip, port), timeout=timeout)
+        wrapped = None  # set below for https — a DIFFERENT object holding the real fd
         try:
             if u.scheme == "https":
+                _arm_deadline(sock, deadline)  # handshake gets whatever's left, not a fresh window
                 ctx = ssl.create_default_context()
                 conn = http.client.HTTPSConnection(host, port, timeout=timeout)
-                conn.sock = ctx.wrap_socket(sock, server_hostname=host)
+                wrapped = ctx.wrap_socket(sock, server_hostname=host)
+                conn.sock = _DeadlineSock(wrapped, deadline)
             else:
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
-                conn.sock = sock
+                conn.sock = _DeadlineSock(sock, deadline)
             conn.request(method, path, body=body_data, headers=req_headers)
             resp = conn.getresponse()
             status = resp.status
@@ -307,10 +423,17 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
             conn.close()
             return status, payload, resp_headers
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            # wrap_socket() hands back a NEW object holding the real fd and
+            # detaches `sock` — on a mid-handshake/mid-read abort (which our
+            # own deadline enforcement now triggers deliberately, instead of
+            # the caller just hanging), closing only `sock` would leak that
+            # fd. Close both; closing an already-detached socket is a no-op.
+            for s in (wrapped, sock):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
     raise ValueError(f"too many redirects (> {_MAX_REDIRECTS})")
 
 
@@ -340,7 +463,7 @@ def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT) -> 
                 continue
             ans = json.loads(body.decode("utf-8")).get("Answer") or []
             return ans
-        except (ValueError, OSError, json.JSONDecodeError):
+        except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
             continue
     return []
 
@@ -409,7 +532,7 @@ def _ping(port: int) -> bool:
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/healthz", timeout=_HEALTH_TIMEOUT) as r:
             return r.status == 200
-    except (OSError, urllib.error.URLError):
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
         return False
 
 
@@ -437,7 +560,7 @@ def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]
             if r.status != 200:
                 return None
             return json.loads(r.read(4_000_000).decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, http.client.HTTPException):
         return None
 
 
@@ -466,13 +589,40 @@ def _vpn_iface_up() -> Optional[str]:
     return None
 
 
+_OPSEC_ORACLES = (
+    # (key, url) — each independently answers "what's my public IP", plus
+    # whatever extra signal it's authoritative for. All three are HTTPS-only
+    # and keyless: the anonymity check itself must never be the thing that
+    # leaks the query in the clear — the old ip-api.com fallback did exactly
+    # that (plain http://, sent over whatever exit was up).
+    ("mullvad", "https://am.i.mullvad.net/json"),
+    ("tor", "https://check.torproject.org/api/ip"),
+    ("geo", "https://ipapi.co/json/"),
+)
+
+
+def _oracle_fetch(url: str, timeout: float = 5.0) -> Optional[dict]:
+    try:
+        st, body, _ = fetch(url, timeout=timeout, max_bytes=8192)
+        if st == 200:
+            j = json.loads(body.decode("utf-8"))
+            return j if isinstance(j, dict) else None
+    except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
+        pass
+    return None
+
+
 def opsec_status(force: bool = False) -> dict:
     """What the internet sees right now + a plain exposed/protected verdict.
 
-    Uses Mullvad's own check endpoint (authoritative for 'am I behind Mullvad'),
-    falling back to a generic IP echo. Fail-safe: if it can't verify and there's
-    no VPN interface, it says EXPOSED rather than pretending you're covered.
-    Cached ~25s so console polling doesn't hammer the check service.
+    Cross-checks three independent, keyless, HTTPS-only oracles in parallel —
+    Mullvad's own check (authoritative for 'am I behind Mullvad'), the Tor
+    Project's check, and a plain IP-geolocation echo — instead of trusting
+    any single one. Their reported public IP must agree; if they disagree, or
+    none of them answer, that's reported as exposed rather than a false
+    'protected' (fail-safe). No oracle is ever queried over plaintext HTTP —
+    the check itself leaking the query would defeat the point of it.
+    Cached ~25s so console polling doesn't hammer the check services.
     """
     now = time.monotonic()
     with _opsec_lock:
@@ -480,34 +630,56 @@ def opsec_status(force: bool = False) -> dict:
         if not force and cached and (now - _opsec_cache["ts"] < OPSEC_TTL):
             return cached
 
-    pub: dict = {}
-    try:
-        st, body, _ = fetch("https://am.i.mullvad.net/json", timeout=5.0, max_bytes=8192)
-        if st == 200:
-            pub = json.loads(body.decode("utf-8"))
-    except (ValueError, OSError, json.JSONDecodeError):
-        pub = {}
-    if not pub:  # fallback echo (no mullvad flag, but gives the public IP/org)
-        try:
-            st, body, _ = fetch("http://ip-api.com/json/?fields=query,org,isp,city,country",
-                                timeout=5.0, max_bytes=8192)
-            if st == 200:
-                j = json.loads(body.decode("utf-8"))
-                pub = {"ip": j.get("query"), "organization": j.get("org") or j.get("isp"),
-                       "city": j.get("city"), "country": j.get("country")}
-        except (ValueError, OSError, json.JSONDecodeError):
-            pub = {}
+    results: dict[str, Optional[dict]] = {}
+    lock = threading.Lock()
+
+    def worker(key, url):
+        r = _oracle_fetch(url)
+        with lock:
+            results[key] = r
+
+    threads = [threading.Thread(target=worker, args=(k, u)) for k, u in _OPSEC_ORACLES]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=6.0)
+
+    mv, tor, geo = results.get("mullvad"), results.get("tor"), results.get("geo")
+
+    # Every oracle that actually answered contributes the public IP it saw.
+    seen_ips: list[tuple[str, str]] = []
+    if mv and mv.get("ip"):
+        seen_ips.append(("mullvad", str(mv["ip"])))
+    if tor and tor.get("IP"):
+        seen_ips.append(("tor", str(tor["IP"])))
+    if geo and geo.get("ip"):
+        seen_ips.append(("geo", str(geo["ip"])))
+
+    reachable = bool(seen_ips)
+    disagreement = len({ip for _, ip in seen_ips}) > 1
 
     iface = _vpn_iface_up()
-    mullvad = bool(pub.get("mullvad_exit_ip"))
-    reachable = bool(pub)
+    mullvad = bool(mv and mv.get("mullvad_exit_ip"))
+    tor_exit = bool(tor and tor.get("IsTor"))
 
-    if mullvad:
-        exposed, reason = False, f"Behind Mullvad ({pub.get('mullvad_exit_ip_hostname') or 'exit node'})"
+    # Prefer Mullvad's own fields (most detailed); fall back to the plain geo
+    # echo if Mullvad didn't answer.
+    pub_ip = (mv or {}).get("ip") or (geo or {}).get("ip") or (tor or {}).get("IP") or ""
+    org = (mv or {}).get("organization") or (geo or {}).get("org") or ""
+    city = (mv or {}).get("city") or (geo or {}).get("city") or ""
+    country = (mv or {}).get("country") or (geo or {}).get("country_name") or ""
+
+    if disagreement:
+        exposed, reason = True, (
+            "Anonymity oracles disagree on your public IP ("
+            + ", ".join(f"{src}={ip}" for src, ip in seen_ips)
+            + ") — treating you as exposed until that's resolved")
+    elif mullvad:
+        exposed, reason = False, f"Behind Mullvad ({mv.get('mullvad_exit_ip_hostname') or 'exit node'})"
     elif iface and reachable:
         exposed, reason = False, f"VPN interface {iface} is up"
     elif iface and not reachable:
-        exposed, reason = False, f"VPN interface {iface} is up (couldn't reach the check service to confirm the exit)"
+        exposed, reason = False, f"VPN interface {iface} is up (couldn't reach any check oracle to confirm the exit)"
     elif reachable:
         exposed, reason = True, "No VPN detected — your real IP and approximate location are visible to any target you scan"
     else:
@@ -515,9 +687,8 @@ def opsec_status(force: bool = False) -> dict:
 
     data = {
         "exposed": exposed, "reason": reason, "mullvad": mullvad, "vpn_iface": iface,
-        "reachable": reachable,
-        "public_ip": pub.get("ip", ""), "org": pub.get("organization", ""),
-        "city": pub.get("city", ""), "country": pub.get("country", ""),
+        "reachable": reachable, "tor_exit": tor_exit, "oracle_disagreement": disagreement,
+        "public_ip": pub_ip, "org": org, "city": city, "country": country,
     }
     with _opsec_lock:
         _opsec_cache.update(data=data, ts=now)

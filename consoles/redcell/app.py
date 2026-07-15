@@ -8,9 +8,12 @@ from consoles.redcell import runners, inventory, builder
 
 ROUTES = {
     "GET /api/inventory": inventory.handle_inventory,
+    "POST /api/inventory/refresh": inventory.handle_inventory_refresh,
     "POST /api/run": runners.handle_run,
     "GET /api/history": runners.handle_history,
     "GET /api/wordlists": runners.handle_wordlists,
+    "GET /api/outputs": runners.handle_outputs,
+    "GET /api/output-file": runners.handle_output_file,
     "POST /api/build": builder.handle_build,
     "POST /api/local-tool": runners.handle_local_tool,
     "GET /api/expert-tools": runners.handle_expert_tools,

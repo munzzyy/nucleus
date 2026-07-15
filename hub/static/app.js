@@ -56,7 +56,7 @@
     const pub = document.getElementById("published");
     pub.innerHTML = "";
     (data.published_tools || []).forEach(t => {
-      const a = N.el("a", { class: "card link pub", href: t.url, target: "_blank", rel: "noreferrer" });
+      const a = N.el("a", { class: "card link pub", href: N.safeUrl(t.url), target: "_blank", rel: "noreferrer" });
       a.appendChild(N.el("span", { class: "name", text: t.name }));
       a.appendChild(N.el("span", { class: "desc", text: t.desc }));
       pub.appendChild(a);
@@ -72,6 +72,17 @@
     const setCount = keys.filter(k => k.set).length;
     const note = document.getElementById("settings-note");
     if (note) note.textContent = `${setCount} of ${keys.length} keys set. All optional — Recon works keyless, but each key you add unlocks more data. Keys stay local (var/.env).`;
+    const nudge = document.getElementById("keys-nudge");
+    if (nudge) {
+      if (setCount === 0 && keys.length) {
+        nudge.innerHTML = "";
+        nudge.appendChild(N.el("span", { text: `0/${keys.length} keys set — add one to unlock more OSINT sources. ` }));
+        nudge.appendChild(N.el("a", { href: "#settings", text: "Add a key →" }));
+        nudge.classList.remove("hidden");
+      } else {
+        nudge.classList.add("hidden");
+      }
+    }
     wrap.innerHTML = "";
     keys.forEach(k => {
       const card = N.el("div", { class: "card keycard" });
@@ -108,7 +119,7 @@
         });
         row.appendChild(clear);
       }
-      row.appendChild(N.el("a", { class: "btn ghost", href: k.get_url, target: "_blank", rel: "noreferrer", text: "Get a free key ↗" }));
+      row.appendChild(N.el("a", { class: "btn ghost", href: N.safeUrl(k.get_url), target: "_blank", rel: "noreferrer", text: "Get a free key ↗" }));
       card.appendChild(row);
       wrap.appendChild(card);
     });

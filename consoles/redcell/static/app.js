@@ -7,6 +7,23 @@
   let INV_SEARCH = "";
   let EXPANDED = new Set(); // categories the user has manually opened in the arsenal accordion
   let WL_SEARCH_TIMER = null;
+  let WL_SEARCH_SEQ = 0;   // monotonic id — drops a stale wordlist response if a newer query already started
+  let runTickerId = null;
+  let expertTickerId = null;
+
+  // -- elapsed-seconds ticker (nmap "full" etc can run 600s — an honest
+  // clock beats a static spinner that looks hung) ---------------------------
+  function tickerStart(elId, label) {
+    const el = document.getElementById(elId);
+    const start = Date.now();
+    el.textContent = `${label} — 0.0s`;
+    return setInterval(() => {
+      el.textContent = `${label} — ${((Date.now() - start) / 1000).toFixed(1)}s`;
+    }, 200);
+  }
+  function tickerStop(id) {
+    if (id) clearInterval(id);
+  }
 
   document.addEventListener("DOMContentLoaded", init);
 
@@ -18,8 +35,10 @@
     wireArsenal();
     wireExpert();
     document.getElementById("hist-refresh").addEventListener("click", loadHistory);
+    document.getElementById("outputs-refresh").addEventListener("click", loadOutputs);
     await loadInventory(false);
     await loadHistory();
+    await loadOutputs();
   }
 
   // ------------------------------------------------------------------
@@ -55,7 +74,7 @@
       document.getElementById("tab-" + t).classList.toggle("hidden", !active);
     });
     if (history.replaceState) history.replaceState(null, "", "#" + tab);
-    if (tab === "history") loadHistory();
+    if (tab === "history") { loadHistory(); loadOutputs(); }
     if (tab === "expert") loadExpertTools();
   }
 
@@ -108,28 +127,39 @@
     args.addEventListener("input", updateExpertPreview);
     args.addEventListener("keydown", e => { if (e.key === "Enter" && !btn.disabled) runExpert(); });
     btn.addEventListener("click", runExpert);
+    document.getElementById("x-copy").addEventListener("click", () => {
+      const text = document.getElementById("x-output").textContent;
+      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
+    });
   }
 
   async function runExpert() {
     const btn = document.getElementById("x-run");
     const out = document.getElementById("x-output");
+    const status = document.getElementById("x-status");
     const tool = document.getElementById("x-tool").value;
     const args = document.getElementById("x-args").value;
     btn.disabled = true;
     out.classList.remove("hidden");
     out.textContent = "running " + tool + " …";
+    document.getElementById("x-copy").classList.remove("hidden");
+    expertTickerId = tickerStart("x-status", "running " + tool);
     try {
       const r = await N.post("/api/expert", {
         tool, args,
         authorized: document.getElementById("x-authorized").checked,
         expert_ack: document.getElementById("x-ack").checked,
       });
+      tickerStop(expertTickerId); expertTickerId = null;
+      status.textContent = `exit ${r.returncode} · ${r.duration}s` + (r.timed_out ? " · TIMED OUT" : "");
       const head = "$ " + (r.argv || []).join(" ") + "\n[exit " + r.returncode +
         " · " + r.duration + "s" + (r.timed_out ? " · TIMED OUT" : "") + "]\n\n";
       // raw tool output via textContent — never innerHTML — so it can't inject markup
       out.textContent = head + (r.stdout || "") + (r.stderr ? "\n" + r.stderr : "");
       loadHistory();
     } catch (e) {
+      tickerStop(expertTickerId); expertTickerId = null;
+      status.textContent = "error";
       out.textContent = "error: " + (e.message || "run failed");
       N.toast(e.message || "expert run failed", "bad");
     } finally {
@@ -144,7 +174,8 @@
     const stat = document.getElementById("inv-stat-num");
     stat.textContent = "…";
     try {
-      INV = await N.get("/api/inventory" + (refresh ? "?refresh=1" : ""));
+      if (refresh) await N.post("/api/inventory/refresh", {});
+      INV = await N.get("/api/inventory");
     } catch (e) {
       stat.textContent = "error";
       N.toast("inventory load failed: " + e.message, "bad");
@@ -272,7 +303,8 @@
     const sel = document.getElementById("run-tool");
     sel.innerHTML = "";
     INV.safe_runners.forEach(r => {
-      sel.appendChild(N.el("option", { value: r.key, text: r.key + (r.installed ? "" : "  (not installed)") }));
+      sel.appendChild(N.el("option", { value: r.key, text: r.key
+        + (r.installed ? "" : "  (not installed)") + (r.known_broken ? "  ⚠ known broken" : "") }));
     });
     sel.onchange = renderRunnerDetail;
     renderRunnerDetail();
@@ -290,8 +322,15 @@
     const wlRow = document.getElementById("run-wordlist-row");
     optRow.innerHTML = "";
     if (!spec) { descEl.textContent = ""; wlRow.classList.add("hidden"); return; }
-    descEl.textContent = spec.desc + (spec.installed ? "" : `  — not installed: ${spec.install}`)
-      + `  (timeout ${spec.timeout}s)`;
+    descEl.innerHTML = "";
+    descEl.appendChild(document.createTextNode(spec.desc + (spec.installed ? "" : `  — not installed: ${spec.install}`)
+      + `  (timeout ${spec.timeout}s)`));
+    if (spec.known_broken) {
+      descEl.appendChild(document.createTextNode(" "));
+      descEl.appendChild(N.el("span", { class: "pill bad" }, [
+        N.el("span", { class: "dot" }), document.createTextNode("known broken on this box"),
+      ]));
+    }
 
     (spec.options || []).forEach(opt => {
       const field = N.el("div", { class: "field w-220" });
@@ -325,13 +364,25 @@
   }
 
   function wireRunner() {
-    document.getElementById("run-btn").addEventListener("click", runSafeTool);
+    const runBtn = document.getElementById("run-btn");
+    runBtn.addEventListener("click", runSafeTool);
+    document.getElementById("run-copy").addEventListener("click", () => {
+      const text = document.getElementById("run-output").textContent;
+      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
+    });
+    // Enter-to-run on the target field, same pattern as Bastion's report-domain —
+    // respects the auth-gate disabled state so it can't fire before authorization.
+    document.getElementById("run-target").addEventListener("keydown", e => {
+      if (e.key === "Enter" && !runBtn.disabled) runSafeTool();
+    });
     document.getElementById("run-wordlist-search").addEventListener("input", e => {
       const q = e.target.value.trim();
       clearTimeout(WL_SEARCH_TIMER);
       WL_SEARCH_TIMER = setTimeout(async () => {
+        const seq = ++WL_SEARCH_SEQ;
         try {
           const r = await N.get("/api/wordlists?q=" + encodeURIComponent(q) + "&limit=50");
+          if (seq !== WL_SEARCH_SEQ) return; // a newer query started after this one — drop the stale reply
           populateWordlistSelect(r.results || []);
         } catch (err) { /* leave the previous list showing */ }
       }, 200);
@@ -361,12 +412,14 @@
       body.wordlist = wl;
     }
 
-    status.textContent = "running...";
     out.classList.remove("hidden");
     out.textContent = "";
+    document.getElementById("run-copy").classList.remove("hidden");
     document.getElementById("run-btn").disabled = true;
+    runTickerId = tickerStart("run-status", "running " + spec.key);
     try {
       const r = await N.post("/api/run", body);
+      tickerStop(runTickerId); runTickerId = null;
       status.textContent = `exit ${r.returncode} · ${r.duration}s` + (r.timed_out ? " · TIMED OUT" : "");
       let text = "$ " + r.argv.map(a => (/\s/.test(a) ? `'${a}'` : a)).join(" ") + "\n\n";
       text += (r.stdout || "").trim();
@@ -376,6 +429,7 @@
       out.textContent = text || "(no output)";
       loadHistory();
     } catch (e) {
+      tickerStop(runTickerId); runTickerId = null;
       status.textContent = "refused";
       out.textContent = "REFUSED: " + (e.body && e.body.error ? e.body.error : e.message);
       N.toast("run refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
@@ -500,7 +554,7 @@
         card.appendChild(row);
         card.appendChild(pre);
       } else {
-        const link = N.el("a", { href: t.github, target: "_blank", rel: "noopener", text: t.github });
+        const link = N.el("a", { href: N.safeUrl(t.github), target: "_blank", rel: "noopener", text: t.github });
         card.appendChild(link);
         card.appendChild(N.el("p", { class: "faint", text: `pipx install "git+${t.github}.git"` }));
       }
@@ -530,5 +584,67 @@
       tr.appendChild(N.el("td", { text: (r.duration != null ? r.duration + "s" : "") + (r.timed_out ? " (timeout)" : "") }));
       tbody.appendChild(tr);
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Saved outputs (feature-detected: hidden if /api/outputs isn't there yet)
+  // ------------------------------------------------------------------
+  function outputMtimeKey(m) {
+    if (typeof m === "number") return m;
+    const parsed = Date.parse(m);
+    return isNaN(parsed) ? 0 : parsed;
+  }
+
+  function outputMtimeLabel(m) {
+    if (m === undefined || m === null || m === "") return "";
+    if (typeof m === "number") {
+      const d = new Date(m < 2e10 ? m * 1000 : m); // heuristic: seconds vs ms epoch
+      return isNaN(d.getTime()) ? String(m) : d.toLocaleString();
+    }
+    const d = new Date(m);
+    return isNaN(d.getTime()) ? String(m) : d.toLocaleString();
+  }
+
+  async function loadOutputs() {
+    let j;
+    try { j = await N.get("/api/outputs"); } catch (e) { return; } // not implemented (yet) — stay quiet
+    document.getElementById("outputs-wrap").classList.remove("hidden");
+    const files = (j.files || []).slice().sort((a, b) => outputMtimeKey(b.mtime) - outputMtimeKey(a.mtime));
+    const list = document.getElementById("outputs-list");
+    const empty = document.getElementById("outputs-empty");
+    list.innerHTML = "";
+    if (!files.length) { empty.classList.remove("hidden"); return; }
+    empty.classList.add("hidden");
+    files.forEach(f => {
+      const row = N.el("div", { class: "output-row" });
+      row.appendChild(N.el("span", { class: "mono", text: f.name || "" }));
+      row.appendChild(N.el("span", { class: "src-badge", text: f.tool || "" }));
+      row.appendChild(N.el("span", { class: "faint small", text: f.size != null ? (f.size / 1024).toFixed(1) + "KB" : "" }));
+      row.appendChild(N.el("span", { class: "faint small", text: outputMtimeLabel(f.mtime) }));
+      const viewBtn = N.el("button", { class: "ghost", type: "button", text: "View" });
+      viewBtn.addEventListener("click", () => viewOutput(f.name));
+      row.appendChild(viewBtn);
+      list.appendChild(row);
+    });
+  }
+
+  async function fetchOutputFile(name) {
+    const r = await fetch("/api/output-file?name=" + encodeURIComponent(name), { headers: { "Accept": "text/plain" } });
+    const t = await r.text();
+    if (!r.ok) throw new Error(t || r.statusText);
+    return t;
+  }
+
+  async function viewOutput(name) {
+    const pre = document.getElementById("outputs-view");
+    pre.classList.remove("hidden");
+    pre.textContent = "loading…";
+    try {
+      // raw file contents via textContent — never innerHTML — so a saved
+      // output can't inject markup even if it were attacker-influenced
+      pre.textContent = (await fetchOutputFile(name)) || "(empty)";
+    } catch (e) {
+      pre.textContent = "error: " + (e.message || "load failed");
+    }
   }
 })();

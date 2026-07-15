@@ -45,8 +45,17 @@ body[data-accent="recon"]   { --accent: var(--recon); }
 body[data-accent="redcell"] { --accent: var(--redcell); }
 body[data-accent="bastion"] { --accent: var(--bastion); }
 
+/* ---- topbar + opsec bar wrapper ----
+   Both sit inside one sticky wrapper, stacked in normal document flow
+   relative to each other, instead of each being independently `sticky` with
+   a hardcoded pixel offset. That offset used to assume a one-row topbar; a
+   wrapped switcher on a narrow viewport made the topbar taller and the
+   opsec bar (fixed at top:55px) overlapped it. This way it just sits below
+   however tall the topbar actually rendered, at any width. ---- */
+.topbar-wrap { position: sticky; top: 0; z-index: 30; }
+
 /* ---- opsec banner (under the top bar, every console) ---- */
-.opsec-bar { position: sticky; top: 55px; z-index: 25; padding: 9px 20px; font-size: 13px;
+.opsec-bar { z-index: 25; padding: 9px 20px; font-size: 13px;
   display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }
 .opsec-bar .od { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .opsec-bar.exposed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: #ffd9de;
@@ -61,7 +70,6 @@ body[data-accent="bastion"] { --accent: var(--bastion); }
 
 /* ---- top bar / switcher ---- */
 .topbar {
-  position: sticky; top: 0; z-index: 30;
   display: flex; align-items: center; gap: 18px;
   padding: 10px 20px;
   background: rgba(10,14,20,.82);
@@ -202,3 +210,21 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 .m0 { margin: 0; }
 .small { font-size: 12px; }
 .pull-up { margin: -6px 0 14px; }
+
+/* ---- keyboard shortcuts help overlay (? key, any console) ---- */
+.shortcuts-overlay { position: fixed; inset: 0; z-index: 200;
+  background: rgba(4,7,12,.72); display: flex; align-items: center;
+  justify-content: center; padding: 20px; }
+.shortcuts-overlay.hidden { display: none; }
+.shortcuts-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
+  border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 22px 26px; max-width: 360px; width: 100%; }
+.shortcuts-panel h2 { margin: 0 0 14px; font-size: 15px; }
+.shortcuts-list { display: grid; grid-template-columns: max-content 1fr; gap: 9px 14px; margin: 0; }
+.shortcuts-list dt { margin: 0; }
+.shortcuts-list dd { margin: 0; color: var(--txt-dim); font-size: 13px; align-self: center; }
+
+/* ---- print (Bastion report -> Save as PDF via window.print()) ---- */
+@media print {
+  .topbar-wrap, #toast { display: none !important; }
+}

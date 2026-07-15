@@ -8,7 +8,6 @@ those consoles server-side on loopback. The browser only ever talks to the
 hub's own origin, so the strict CSP holds.
 """
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -16,49 +15,42 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shared import apikeys, common  # noqa: E402
 
-ENV_FILE = Path(__file__).resolve().parents[1] / "var" / ".env"
+# Reading/writing var/.env is apikeys' job (shared.apikeys.get_key/set_key) —
+# it does the atomic tmp+os.replace swap and 0600 perms in one place, so the
+# hub, recon, and any future console never race each other read-modify-writing
+# the same file. The hub used to hand-roll its own reader/writer here; that
+# was a non-atomic read-modify-write (a concurrent write could clobber the
+# other's line) and, separately, wrote whatever text the browser sent verbatim
+# — see _clean_key_value below for the quote bug that caused.
+_QUOTE_CHARS = frozenset("\"'")
 
 
-def _read_env() -> dict:
-    out = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            out[k.strip()] = v.strip()
-    return out
+def _clean_key_value(value: str) -> str:
+    """Strip whitespace and one layer of surrounding quotes. Provider dashboards
+    often display a key as "abc123" and it gets pasted quotes-and-all; stored
+    literally that extra 2 bytes makes every request using it 401."""
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in _QUOTE_CHARS:
+        v = v[1:-1].strip()
+    return v
 
 
-def _write_env_key(key: str, value: str):
-    """Upsert one key in var/.env, preserving everything else. 0600."""
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lines, found = [], False
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            if re.match(rf"\s*{re.escape(key)}\s*=", line):
-                lines.append(f"{key}={value}")
-                found = True
-            else:
-                lines.append(line)
-    if not found:
-        lines.append(f"{key}={value}")
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-    try:
-        os.chmod(ENV_FILE, 0o600)
-    except OSError:
-        pass
+def _valid_key_value(value: str) -> bool:
+    # API keys come in many shapes (hex, base64, colon-joined id:secret) so we
+    # stay permissive on the character set — but quotes and whitespace have no
+    # legitimate place in a token and previously slipped through
+    # [\x21-\x7e]{6,256} (0x22/0x27 are inside that printable-ASCII range),
+    # which is exactly how a quoted paste made it into var/.env unnoticed.
+    return bool(re.fullmatch(r"[\x21-\x7e]{6,256}", value)) and not (_QUOTE_CHARS & set(value))
 
 
 def _settings_get(req) -> common.Response:
-    env = _read_env()
     keys = []
     for spec in apikeys.CATALOG:
         keys.append({
             "name": spec["name"], "label": spec["label"], "provider": spec["provider"],
             "get_url": spec["get_url"], "free": spec["free"], "unlocks": spec["unlocks"],
-            "set": bool(env.get(spec["name"]) or os.environ.get(spec["name"])),
+            "set": apikeys.is_set(spec["name"]),
         })
     return common.Response.json({"keys": keys})
 
@@ -66,18 +58,12 @@ def _settings_get(req) -> common.Response:
 def _settings_post(req) -> common.Response:
     body = req.json()
     key = str(body.get("name", "")).strip()
-    value = str(body.get("value", "")).strip()
+    value = _clean_key_value(str(body.get("value", "")))
     if key not in apikeys.CATALOG_BY_NAME:
         return common.Response.error(400, "unknown setting")
-    # API keys come in many shapes (hex, base64, colon-joined id:secret). Accept
-    # any printable token, no whitespace/control chars, sane length.
-    if value and not re.fullmatch(r"[\x21-\x7e]{6,256}", value):
-        return common.Response.error(400, "that doesn't look like a valid key (no spaces; 6-256 chars)")
-    _write_env_key(key, value)
-    if value:
-        os.environ[key] = value           # live now, no restart
-    else:
-        os.environ.pop(key, None)
+    if value and not _valid_key_value(value):
+        return common.Response.error(400, "that doesn't look like a valid key (no spaces/quotes; 6-256 chars)")
+    apikeys.set_key(key, value)  # atomic write + live os.environ update; ""=remove
     return common.Response.json({"ok": True, "name": key, "set": bool(value)})
 
 

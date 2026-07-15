@@ -15,6 +15,8 @@ Two public entry points:
 from __future__ import annotations
 
 import socket
+import threading
+import time
 from pathlib import Path
 
 from shared import common
@@ -225,8 +227,21 @@ def check_privacy_tools() -> list[dict]:
     return out
 
 
-def check_audit_tools() -> list[dict]:
-    out = []
+_arch_audit_cache: dict = {"data": None, "ts": 0.0}
+_arch_audit_lock = threading.Lock()
+ARCH_AUDIT_TTL = 900.0  # 15 min — the scan itself takes ~20s of subprocess time,
+                         # no reason to pay that on every posture refresh
+
+
+def _arch_audit_check() -> dict:
+    """Cached separately (and much longer) than the rest of run_all(): this is
+    the one probe expensive enough to matter — everything else here is a sub-
+    100ms systemctl/sysctl call, arch-audit alone is ~20s."""
+    now = time.monotonic()
+    with _arch_audit_lock:
+        cached = _arch_audit_cache["data"]
+        if cached and (now - _arch_audit_cache["ts"] < ARCH_AUDIT_TTL):
+            return cached
 
     if common.which("arch-audit"):
         r = common.run_tool(["arch-audit"], timeout=20)
@@ -242,11 +257,19 @@ def check_audit_tools() -> list[dict]:
         detail = f"{count} installed package(s) flagged with known CVEs"
         if sample:
             detail += " — e.g. " + ", ".join(sample)
-        out.append(_check("arch-audit", "arch-audit (CVE scan)", "audit", status, detail,
-                          "arch-audit   # rerun anytime, no sudo needed"))
+        result = _check("arch-audit", "arch-audit (CVE scan)", "audit", status, detail,
+                        "arch-audit   # rerun anytime, no sudo needed")
     else:
-        out.append(_check("arch-audit", "arch-audit (CVE scan)", "audit", "unknown", "not installed",
-                          "sudo ~/security-setup/1-install.sh"))
+        result = _check("arch-audit", "arch-audit (CVE scan)", "audit", "unknown", "not installed",
+                        "sudo ~/security-setup/1-install.sh")
+
+    with _arch_audit_lock:
+        _arch_audit_cache.update(data=result, ts=now)
+    return result
+
+
+def check_audit_tools() -> list[dict]:
+    out = [_arch_audit_check()]
 
     lynis_report = Path("/var/log/lynis-report.dat")
     if lynis_report.is_file():
@@ -384,7 +407,7 @@ def anonymity_panel() -> dict:
     }
 
 
-def run_all() -> dict:
+def _run_all_uncached() -> dict:
     checks: list[dict] = []
     checks.append(check_sysctl())
     checks.append(check_auditd())
@@ -406,6 +429,34 @@ def run_all() -> dict:
     score = round(100 * (counts["ok"] + 0.5 * counts["warn"]) / total) if total else 0
 
     return {"checks": checks, "summary": {"total": total, "counts": counts, "score": score}}
+
+
+_posture_cache: dict = {"data": None, "ts": 0.0}
+_posture_lock = threading.Lock()
+POSTURE_TTL = 30.0  # seconds
+
+
+def run_all(force: bool = False) -> dict:
+    """Cached wrapper around the real probe sweep.
+
+    Every check here is a subprocess (systemctl/sysctl/wg/resolvectl/etc, ~15
+    of them) or a file read, and the hub's dashboard polls /api/overview -> our
+    /api/posture every 8s. Uncached that's a subprocess storm on a timer, and
+    the hub's own 3.5s budget for the call was shorter than a cold arch-audit
+    run, so the posture stat just showed "—" forever. A 30s TTL keeps the
+    number fresh to a human glance while cutting the subprocess count by ~4x;
+    arch-audit itself is cached separately and far longer (see
+    _arch_audit_check). `force=True` bypasses the cache for a manual refresh.
+    """
+    now = time.monotonic()
+    with _posture_lock:
+        cached = _posture_cache["data"]
+        if not force and cached and (now - _posture_cache["ts"] < POSTURE_TTL):
+            return cached
+    result = _run_all_uncached()
+    with _posture_lock:
+        _posture_cache.update(data=result, ts=now)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -466,3 +517,27 @@ def hardening_panel() -> dict:
             "applied": applied,
         })
     return {"setup_dir": str(SETUP_DIR), "scripts": scripts}
+
+
+# --------------------------------------------------------------------------
+# (A3) fix-everything checklist — every failing/warn check's fix_hint, ordered
+# --------------------------------------------------------------------------
+_PLAN_ORDER = {"bad": 0, "warn": 1}
+
+
+def hardening_plan() -> dict:
+    """One ordered, copy-pasteable checklist built straight from run_all()'s
+    per-check fix_hint — worst-first (bad before warn), skipping checks that
+    have nothing to run (ok/unknown, or a warn/bad with no fix_hint at all,
+    e.g. Tor's 'off by design'). Strictly read-only: this returns the commands
+    a human would run, it never executes anything itself — bastion never
+    changes system state."""
+    data = run_all()
+    candidates = [c for c in data["checks"]
+                  if c["status"] in _PLAN_ORDER and c.get("fix_hint")]
+    candidates.sort(key=lambda c: _PLAN_ORDER[c["status"]])
+    steps = [
+        {"label": c["label"], "command": c["fix_hint"], "why": c["detail"]}
+        for c in candidates
+    ]
+    return {"steps": steps}

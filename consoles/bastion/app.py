@@ -21,6 +21,10 @@ def h_hardening(req: common.Request) -> common.Response:
     return common.Response.json(posture.hardening_panel())
 
 
+def h_hardening_plan(req: common.Request) -> common.Response:
+    return common.Response.json(posture.hardening_plan())
+
+
 def h_anonymity(req: common.Request) -> common.Response:
     return common.Response.json(posture.anonymity_panel())
 
@@ -81,6 +85,7 @@ ROUTES = {
     "GET /api/posture": h_posture,
     "GET /api/anonymity": h_anonymity,
     "GET /api/hardening": h_hardening,
+    "GET /api/hardening-plan": h_hardening_plan,
     "POST /api/report": h_report,
     "GET /api/report-file": h_report_file,
 }

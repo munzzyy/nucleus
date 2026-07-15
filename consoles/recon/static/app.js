@@ -12,6 +12,16 @@
   const arsenalEl = document.getElementById("arsenal");
   const resourcesEl = document.getElementById("resources");
   const resSearch = document.getElementById("res-search");
+  const resultsToolbar = document.getElementById("results-toolbar");
+  const btnCopyJson = document.getElementById("res-copy-json");
+  const btnCopyMd = document.getElementById("res-copy-md");
+  const btnDownload = document.getElementById("res-download");
+  const historyWrap = document.getElementById("recon-history-wrap");
+  const historyList = document.getElementById("recon-history");
+
+  let lastScanData = null;
+  let lastScanQuery = "";
+  let scanTicker = null;
 
   const TYPE_LABEL = {
     username: "Username", email: "Email", domain: "Domain", ip: "IP address",
@@ -84,7 +94,7 @@
   function renderPivots(pivots) {
     if (!pivots || !pivots.length) return "";
     const links = pivots.map(p =>
-      `<a class="card link" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.title)}</a>`
+      `<a class="card link" href="${esc(N.safeUrl(p.url))}" target="_blank" rel="noopener noreferrer">${esc(p.title)}</a>`
     ).join("");
     return card("Pivot links", `<div class="pivot-grid">${links}</div>`);
   }
@@ -95,8 +105,8 @@
       <div class="dork-row">
         <div class="label">${esc(d.label)}</div>
         <div class="q">${esc(d.query)}</div>
-        <a class="btn ghost" href="${esc(d.google)}" target="_blank" rel="noopener noreferrer">Google</a>
-        <a class="btn ghost" href="${esc(d.bing)}" target="_blank" rel="noopener noreferrer">Bing</a>
+        <a class="btn ghost" href="${esc(N.safeUrl(d.google))}" target="_blank" rel="noopener noreferrer">Google</a>
+        <a class="btn ghost" href="${esc(N.safeUrl(d.bing))}" target="_blank" rel="noopener noreferrer">Bing</a>
       </div>`).join("");
     return card("Dork builder", rows);
   }
@@ -106,7 +116,7 @@
     const sites = (m.sites || []).map(s => {
       const kind = s.found === true ? "found" : s.found === false ? "notfound" : "unknown";
       const inner = s.url
-        ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" title="${esc(s.note)}">${esc(s.site)}</a>`
+        ? `<a href="${esc(N.safeUrl(s.url))}" target="_blank" rel="noopener noreferrer" title="${esc(s.note)}">${esc(s.site)}</a>`
         : `<span title="${esc(s.note)}">${esc(s.site)}</span>`;
       return `<div class="site-pill ${kind}"><span class="dot"></span>${inner}</div>`;
     }).join("");
@@ -243,7 +253,7 @@
         <div class="breach-row">
           <div class="name">${esc(s.url || "")}</div>
           <div class="meta">${esc(s.time || "")}${s.ip ? " · " + esc(s.ip) : ""}</div>
-          ${s.screenshot ? `<a class="btn ghost mt" href="${esc(s.screenshot)}" target="_blank" rel="noopener noreferrer">Screenshot</a>` : ""}
+          ${s.screenshot ? `<a class="btn ghost mt" href="${esc(N.safeUrl(s.screenshot))}" target="_blank" rel="noopener noreferrer">Screenshot</a>` : ""}
         </div>`).join("");
     } else {
       urlscanHtml = `<p class="faint">${esc(us.error || "no recent scans")}</p>`;
@@ -256,7 +266,7 @@
 
     const wb = m.wayback || {};
     const wbHtml = wb.ok
-      ? kv([["Archived", wb.archived ? "yes" : "no"], ["Latest snapshot", wb.url ? raw(`<a href="${esc(wb.url)}" target="_blank" rel="noopener noreferrer">${esc(wb.timestamp || "")}</a>`) : ""]])
+      ? kv([["Archived", wb.archived ? "yes" : "no"], ["Latest snapshot", wb.url ? raw(`<a href="${esc(N.safeUrl(wb.url))}" target="_blank" rel="noopener noreferrer">${esc(wb.timestamp || "")}</a>`) : ""]])
       : `<p class="faint">${esc(wb.error || "unavailable")}</p>`;
 
     const h = m.hosting || {};
@@ -471,7 +481,7 @@
       ["Title", m.title],
       ["Description", m.description],
       ["Extract", m.extract],
-      ["URL", m.url ? raw(`<a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">${esc(m.url)}</a>`) : ""],
+      ["URL", m.url ? raw(`<a href="${esc(N.safeUrl(m.url))}" target="_blank" rel="noopener noreferrer">${esc(m.url)}</a>`) : ""],
     ]));
   }
 
@@ -481,16 +491,133 @@
     mac: renderMac, name: renderWikipedia, company: renderWikipedia,
   };
 
+  // -- copy / export toolbar -------------------------------------------------
+  function copyText(text, okMsg) {
+    navigator.clipboard.writeText(text).then(
+      () => N.toast(okMsg || "copied", "ok"),
+      () => N.toast("copy failed — clipboard blocked", "bad"),
+    );
+  }
+
+  function downloadJson(obj, filename) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // Generic JSON -> markdown bullet digest — one function that reads any
+  // module's shape, so the export doesn't have to be hand-mirrored every
+  // time a renderer above changes.
+  function mdInline(v) {
+    if (Array.isArray(v)) return v.map(mdInline).join(", ");
+    return v === null || v === undefined ? "" : String(v);
+  }
+
+  function mdList(obj, depth) {
+    const pad = "  ".repeat(depth);
+    const lines = [];
+    Object.entries(obj || {}).forEach(([k, v]) => {
+      if (v === null || v === undefined || v === "") return;
+      if (Array.isArray(v)) {
+        if (!v.length) return;
+        const allPrimitive = v.every(x => x === null || typeof x !== "object");
+        if (allPrimitive) {
+          lines.push(`${pad}- **${k}**: ${mdInline(v)}`);
+        } else {
+          lines.push(`${pad}- **${k}**:`);
+          v.forEach((item) => {
+            if (item && typeof item === "object") lines.push(...mdList(item, depth + 1));
+            else if (item !== null && item !== undefined && item !== "") lines.push(`${pad}  - ${item}`);
+          });
+        }
+      } else if (typeof v === "object") {
+        const nested = mdList(v, depth + 1);
+        if (nested.length) { lines.push(`${pad}- **${k}**:`); lines.push(...nested); }
+      } else {
+        lines.push(`${pad}- **${k}**: ${v}`);
+      }
+    });
+    return lines;
+  }
+
+  function scanToMarkdown(data) {
+    const lines = [];
+    const label = TYPE_LABEL[data.detected_type] || data.detected_type || "unknown";
+    lines.push(`# Recon scan — ${label}`);
+    if (lastScanQuery) lines.push(`Query: \`${lastScanQuery}\``);
+    if (data.took_ms != null) lines.push(`Took: ${data.took_ms}ms`);
+    lines.push("");
+    const mod = data.modules && data.modules[data.detected_type];
+    if (mod) {
+      lines.push(`## ${label}`);
+      lines.push(...mdList(mod, 0));
+      lines.push("");
+    }
+    if (data.pivots && data.pivots.length) {
+      lines.push("## Pivot links");
+      data.pivots.forEach(p => lines.push(`- [${p.title}](${p.url})`));
+      lines.push("");
+    }
+    if (data.dorks && data.dorks.length) {
+      lines.push("## Dorks");
+      data.dorks.forEach(d => lines.push(`- **${d.label}**: \`${d.query}\``));
+      lines.push("");
+    }
+    return lines.join("\n").trim() + "\n";
+  }
+
+  if (btnCopyJson) btnCopyJson.addEventListener("click", () => {
+    if (!lastScanData) return;
+    copyText(JSON.stringify(lastScanData, null, 2));
+  });
+  if (btnCopyMd) btnCopyMd.addEventListener("click", () => {
+    if (!lastScanData) return;
+    copyText(scanToMarkdown(lastScanData), "copied as markdown");
+  });
+  if (btnDownload) btnDownload.addEventListener("click", () => {
+    if (!lastScanData) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadJson(lastScanData, `recon-${lastScanData.detected_type || "scan"}-${stamp}.json`);
+  });
+
+  // -- elapsed-time ticker (nmap "full" etc can run 600s — an honest clock
+  // beats a static spinner that looks hung) -----------------------------
+  function startTicker(label) {
+    stopTicker();
+    const start = Date.now();
+    statusLine.classList.remove("hidden");
+    const tick = () => {
+      statusLine.innerHTML = `<span class="spinner"></span> ${esc(label)} — ${((Date.now() - start) / 1000).toFixed(1)}s`;
+    };
+    tick();
+    scanTicker = setInterval(tick, 200);
+  }
+  function stopTicker() {
+    if (scanTicker) { clearInterval(scanTicker); scanTicker = null; }
+  }
+
   async function runScan(q, type) {
     scanBtn.disabled = true;
-    statusLine.classList.remove("hidden");
-    statusLine.innerHTML = '<span class="spinner"></span> scanning…';
     results.innerHTML = "";
+    startTicker("scanning");
     try {
       const data = await N.post("/api/scan", { type, q });
+      stopTicker();
+      lastScanData = data;
+      lastScanQuery = q;
       renderResults(data);
+      statusLine.classList.remove("hidden");
       statusLine.textContent = `detected: ${TYPE_LABEL[data.detected_type] || data.detected_type} · ${data.took_ms}ms`;
+      if (resultsToolbar) resultsToolbar.classList.remove("hidden");
+      loadReconHistory();
     } catch (e) {
+      stopTicker();
       statusLine.textContent = "";
       N.toast(e.message || "scan failed", "bad");
       results.innerHTML = `<div class="card"><p class="bad">${esc(e.message || "scan failed")}</p></div>`;
@@ -522,6 +649,34 @@
     runScan(q, typeSelect.value);
   });
 
+  // -- first-run empty state — before any scan, offer clickable examples ---
+  const EXAMPLES = [
+    { label: "torvalds", type: "username" },
+    { label: "example.com", type: "domain" },
+    { label: "8.8.8.8", type: "ip" },
+  ];
+
+  function renderEmptyState() {
+    const wrap = N.el("div", { class: "card" });
+    wrap.appendChild(N.el("h2", { text: "Try a scan" }));
+    wrap.appendChild(N.el("p", { class: "sub", text: "Pick an example below, or paste your own selector above and hit Scan." }));
+    const row = N.el("div", { class: "row mt" });
+    EXAMPLES.forEach(ex => {
+      const btn = N.el("button", { class: "ghost", type: "button", text: ex.label });
+      btn.addEventListener("click", () => {
+        qInput.value = ex.label;
+        typeSelect.value = ex.type;
+        runScan(ex.label, ex.type);
+      });
+      row.appendChild(btn);
+    });
+    wrap.appendChild(row);
+    results.innerHTML = "";
+    results.appendChild(wrap);
+  }
+
+  renderEmptyState();
+
   async function loadArsenal() {
     try {
       const data = await N.get("/api/arsenal");
@@ -537,7 +692,7 @@
         <div class="card">
           <div class="badge-row"><strong>Bastion</strong> ${pill("ok", "full report engine")}</div>
           <p class="sub">Run a full domain security report.</p>
-          <a class="btn" href="${esc(data.bastion_url)}" target="_blank" rel="noopener noreferrer">Open Bastion</a>
+          <a class="btn" href="${esc(N.safeUrl(data.bastion_url))}" target="_blank" rel="noopener noreferrer">Open Bastion</a>
         </div>`;
     } catch (e) {
       arsenalEl.innerHTML = `<p class="faint">arsenal status unavailable</p>`;
@@ -545,6 +700,62 @@
   }
 
   loadArsenal();
+
+  // -- scan history (feature-detected: hidden if the backend doesn't have
+  // /api/recon-history yet, or ever 404s) -----------------------------------
+  async function loadReconHistory() {
+    if (!historyWrap || !historyList) return;
+    let j;
+    try { j = await N.get("/api/recon-history?limit=50"); }
+    catch (e) { return; } // endpoint not there (yet) — stay quiet, leave it hidden
+    historyWrap.classList.remove("hidden");
+    renderReconHistory(j.scans || []);
+  }
+
+  function renderReconHistory(scans) {
+    if (!scans.length) {
+      historyList.innerHTML = '<p class="faint">No scans logged yet.</p>';
+      return;
+    }
+    historyList.innerHTML = "";
+    scans.forEach(s => {
+      const item = N.el("button", { class: "hist-item", type: "button" });
+      const top = N.el("div", { class: "hist-top" });
+      top.appendChild(N.el("span", { class: "pill", text: TYPE_LABEL[s.type] || s.type || "?" }));
+      top.appendChild(N.el("span", { class: "faint small", text: s.ts || "" }));
+      item.appendChild(top);
+      item.appendChild(N.el("div", { class: "hist-q mono", text: s.q || "" }));
+      if (s.summary) item.appendChild(N.el("div", { class: "sub", text: s.summary }));
+      item.addEventListener("click", () => reopenScan(s.id, s.q));
+      historyList.appendChild(item);
+    });
+  }
+
+  async function reopenScan(id, q) {
+    if (id === undefined || id === null) return;
+    startTicker("loading saved scan");
+    try {
+      const data = await N.get("/api/recon-scan?id=" + encodeURIComponent(String(id)));
+      stopTicker();
+      lastScanData = data;
+      // the full scan payload's own field is `input`, not `q` — prefer the
+      // query text the history list already gave us, then fall back through
+      // both possible response shapes before giving up on repopulating it.
+      lastScanQuery = q || data.input || data.q || qInput.value;
+      qInput.value = lastScanQuery;
+      renderResults(data);
+      statusLine.classList.remove("hidden");
+      statusLine.textContent = `reopened: ${TYPE_LABEL[data.detected_type] || data.detected_type}`
+        + (data.took_ms != null ? ` · ${data.took_ms}ms` : "");
+      if (resultsToolbar) resultsToolbar.classList.remove("hidden");
+      results.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      stopTicker();
+      N.toast(e.message || "couldn't load that scan", "bad");
+    }
+  }
+
+  loadReconHistory();
 
   // -- OSINT resources directory --------------------------------------------
   let RESOURCE_CATEGORIES = [];
@@ -563,7 +774,7 @@
       if (!items.length) continue;
       shown += items.length;
       const links = items.map(it => `
-        <a class="card link resource-link" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">
+        <a class="card link resource-link" href="${esc(N.safeUrl(it.url))}" target="_blank" rel="noopener noreferrer">
           <div class="r-name">${esc(it.name)}</div>
           <div class="r-note">${esc(it.note || "")}</div>
         </a>`).join("");

@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import socket
+import ssl
 import sys
 import urllib.parse
 from datetime import datetime, timezone
@@ -263,6 +265,146 @@ def _score_web(https_res: dict, http_res: dict) -> tuple[int, int, list, dict]:
 
 
 # --------------------------------------------------------------------------
+# TLS certificate — a direct handshake, not an HTTP fetch
+#
+# common.fetch speaks HTTP over a guarded socket; grabbing the leaf cert needs
+# a raw TLS ClientHello with nothing behind it, so we can't route this through
+# fetch(). It gets the same SSRF treatment by hand: host_is_public() gate
+# before the socket ever opens, hard timeout, and every failure mode (DNS,
+# refused, handshake, bad chain) caught so a dead/hostile target degrades the
+# report instead of crashing it.
+# --------------------------------------------------------------------------
+def _parse_cert_time(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _tls_cert(domain: str, timeout: float = 5.0) -> dict:
+    # Resolve once and connect to the validated IP literal, not the hostname —
+    # otherwise the tool re-resolves and a DNS rebind (short TTL, alternating
+    # records) could bounce this raw TLS connection at loopback/RFC1918 after
+    # the public check passed. Same pin-the-resolved-IP defense common.fetch()
+    # uses; SNI + cert validation still key off the hostname.
+    try:
+        ips = common.resolve_public_ips(domain)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not ips:
+        return {"ok": False, "error": "host did not resolve to a public address"}
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((ips[0], 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+    except Exception as e:  # noqa: BLE001 — any handshake/cert/timeout failure must not crash the report
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    issuer = dict(x[0] for x in cert.get("issuer", [])) if cert.get("issuer") else {}
+    subject = dict(x[0] for x in cert.get("subject", [])) if cert.get("subject") else {}
+    sans = sorted({v for k, v in cert.get("subjectAltName", []) if k == "DNS"})
+    not_after_raw = cert.get("notAfter", "")
+    not_after = _parse_cert_time(not_after_raw)
+    days_left = (not_after - datetime.now(timezone.utc)).days if not_after else None
+
+    return {
+        "ok": True,
+        "issuer": issuer.get("organizationName") or issuer.get("commonName") or "unknown",
+        "subject_cn": subject.get("commonName"),
+        "not_after": not_after_raw,
+        "days_left": days_left,
+        "sans": sans[:25],
+    }
+
+
+def _score_tls(tls: dict) -> tuple[int, int, list]:
+    max_pts, pts, findings = 8, 0, []
+    if not tls.get("ok"):
+        findings.append(finding("high", "Could not complete a TLS handshake on :443",
+                                 f"{tls.get('error', 'connection failed')} — confirm the cert chain is "
+                                 "complete and the host isn't blocking automated clients."))
+        return pts, max_pts, findings
+
+    days_left = tls.get("days_left")
+    if days_left is None:
+        pts += 4
+        findings.append(finding("info", "Could not parse the TLS certificate's expiry date", ""))
+    elif days_left < 0:
+        findings.append(finding("high", f"TLS certificate expired {-days_left} day(s) ago",
+                                 "Renew immediately — an expired cert breaks every browser connection "
+                                 "with a hard, unskippable warning."))
+    elif days_left < 14:
+        pts += 2
+        findings.append(finding("medium", f"TLS certificate expires in {days_left} day(s)",
+                                 "Renew now. If this is unexpected, check that ACME/auto-renewal is "
+                                 "actually running — it should renew well before this point."))
+    else:
+        pts += 8
+    return pts, max_pts, findings
+
+
+# --------------------------------------------------------------------------
+# CAA record — who's allowed to issue certs for this domain
+# --------------------------------------------------------------------------
+def _check_caa(domain: str) -> dict:
+    recs = _dns(domain, "CAA")
+    return {"present": bool(recs), "records": sorted({(r.get("data") or "").strip() for r in recs if r.get("data")})}
+
+
+def _score_caa(caa: dict) -> tuple[int, int, list]:
+    max_pts, pts, findings = 3, 0, []
+    if caa["present"]:
+        pts = 3
+    else:
+        findings.append(finding("low", "No CAA record found",
+                                 "Publish a CAA record (e.g. `example.com. CAA 0 issue \"letsencrypt.org\"`) "
+                                 "so only your chosen CA(s) can issue certificates for this domain — "
+                                 "without one, any public CA can."))
+    return pts, max_pts, findings
+
+
+# --------------------------------------------------------------------------
+# /.well-known/security.txt (RFC 9116) — is there an authorized report channel
+# --------------------------------------------------------------------------
+def _check_security_txt(domain: str) -> dict:
+    res = _fetch(f"https://{domain}/.well-known/security.txt", timeout=_SRC_TIMEOUT, max_bytes=20_000)
+    present = bool(res.get("ok") and res.get("status") == 200 and res.get("body"))
+    return {"present": present, "status": res.get("status") if res.get("ok") else None}
+
+
+def _score_security_txt(sec: dict) -> tuple[int, int, list]:
+    max_pts, pts, findings = 2, 0, []
+    if sec["present"]:
+        pts = 2
+    else:
+        findings.append(finding("info", "No /.well-known/security.txt found",
+                                 "Publish one per RFC 9116 so researchers have a clear, authorized "
+                                 "channel to report vulnerabilities instead of guessing who to email."))
+    return pts, max_pts, findings
+
+
+# --------------------------------------------------------------------------
+# DNSSEC — best-effort presence check (DNSKEY/DS), not full chain validation
+# --------------------------------------------------------------------------
+def _check_dnssec(domain: str) -> dict:
+    dnskey = _dns(domain, "DNSKEY")
+    ds = _dns(domain, "DS")
+    return {"present": bool(dnskey or ds)}
+
+
+def _score_dnssec(dnssec: dict) -> tuple[int, int, list]:
+    max_pts, pts, findings = 5, 0, []
+    if dnssec["present"]:
+        pts = 5
+    else:
+        findings.append(finding("info", "No DNSSEC (DNSKEY/DS) records found",
+                                 "Consider enabling DNSSEC at your registrar/DNS provider — it stops "
+                                 "off-path attackers from forging DNS answers for this domain."))
+    return pts, max_pts, findings
+
+
+# --------------------------------------------------------------------------
 # Attack surface — crt.sh + Shodan InternetDB
 # --------------------------------------------------------------------------
 def _crtsh_subdomains(domain: str) -> dict:
@@ -366,7 +508,70 @@ def _grade(total: int, max_total: int) -> tuple[str, float]:
 
 
 # --------------------------------------------------------------------------
+# grade-diff — compare against the most recent PRIOR dated report on disk
+#
+# Reports are written date-stamped (domain-YYYYMMDD.md/.html), one per domain
+# per day. diff() looks for the newest one strictly before `before` (default
+# today) and pulls grade+score back out of its Markdown — no separate JSON
+# index to keep in sync, the .md we already write is the source of truth.
+# --------------------------------------------------------------------------
+_REPORT_STAMP_RE = re.compile(r"^(?P<slug>.+)-(?P<date>\d{8})\.md$")
+_REPORT_GRADE_RE = re.compile(r"Grade \*\*([A-F])\*\* \(([\d.]+)%")
+
+
+def _prior_report_files(domain: str, out_dir: Path) -> list[tuple[str, Path]]:
+    """[(YYYYMMDD, path), ...] ascending, every previously-written .md report
+    for this domain (matched by slug, so foo.com and foo-com don't collide)."""
+    slug = _slug(domain)
+    out = []
+    if not out_dir.is_dir():
+        return out
+    for p in out_dir.glob(f"{slug}-*.md"):
+        m = _REPORT_STAMP_RE.match(p.name)
+        if m and m.group("slug") == slug:
+            out.append((m.group("date"), p))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def diff(domain: str, out_dir: Path = REPORTS_DIR, *, before: str | None = None) -> dict | None:
+    """Grade/score of the most recent report for `domain` dated strictly
+    before `before` (default: today, YYYYMMDD). None if there's no prior
+    report. Reusable standalone — this is what the dormant fulfillment-rescan
+    skill calls to see whether a tracked domain's grade moved since last time.
+    """
+    domain = _safe_domain(domain)
+    if not domain:
+        return None
+    cutoff = before or datetime.now(timezone.utc).strftime("%Y%m%d")
+    priors = [(d, p) for d, p in _prior_report_files(domain, out_dir) if d < cutoff]
+    if not priors:
+        return None
+    date, path = priors[-1]
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _REPORT_GRADE_RE.search(text)
+    if not m:
+        return None
+    return {"grade": m.group(1), "score_pct": float(m.group(2)),
+            "date": f"{date[0:4]}-{date[4:6]}-{date[6:8]}"}
+
+
+# --------------------------------------------------------------------------
 # main entry point
+#
+# Score weights (out of a 108-point total — up from 90 before the passive
+# signals below were added; kept deliberately small relative to the existing
+# categories so an already-good site's grade barely moves and a genuinely
+# absent control still shows up as a real, visible deduction):
+#   email (30): SPF 12, DMARC up to 18, DKIM hint informational only
+#   web (53 = 40 existing + 13 new): HSTS/CSP/X-Frame/nosniff/Referrer/
+#     Permissions-Policy/redirect (40) + TLS cert health (8) + CAA (3) +
+#     security.txt (2)
+#   attack_surface (25 = 20 existing + 5 new): crt.sh/Shodan (20) + DNSSEC
+#     presence (5)
 # --------------------------------------------------------------------------
 def assess(domain: str) -> dict:
     domain = _safe_domain(domain)
@@ -386,10 +591,26 @@ def assess(domain: str) -> dict:
     http_res = _fetch(f"http://{domain}")
     web_pts, web_max, web_findings, banner = _score_web(https_res, http_res)
 
+    tls = _tls_cert(domain)
+    tls_pts, tls_max, tls_findings = _score_tls(tls)
+    caa = _check_caa(domain)
+    caa_pts, caa_max, caa_findings = _score_caa(caa)
+    sec_txt = _check_security_txt(domain)
+    sec_pts, sec_max, sec_findings = _score_security_txt(sec_txt)
+    web_pts += tls_pts + caa_pts + sec_pts
+    web_max += tls_max + caa_max + sec_max
+    web_findings = web_findings + tls_findings + caa_findings + sec_findings
+
     apex_ip = _apex_ip(dns_section)
     subdomains = _crtsh_subdomains(domain)
     shodan = _shodan_internetdb(apex_ip)
     surf_pts, surf_max, surf_findings = _score_attack_surface(subdomains, shodan)
+
+    dnssec = _check_dnssec(domain)
+    dnssec_pts, dnssec_max, dnssec_findings = _score_dnssec(dnssec)
+    surf_pts += dnssec_pts
+    surf_max += dnssec_max
+    surf_findings = surf_findings + dnssec_findings
 
     total_pts = email_pts + web_pts + surf_pts
     max_pts = email_max + web_max + surf_max
@@ -398,7 +619,7 @@ def assess(domain: str) -> dict:
     all_findings = email_findings + web_findings + surf_findings
     all_findings.sort(key=lambda f: _SEV_ORDER.get(f["severity"], 9))
 
-    return {
+    report = {
         "domain": domain,
         "generated_at": started.isoformat(),
         "grade": grade,
@@ -419,13 +640,26 @@ def assess(domain: str) -> dict:
                      "error": http_res.get("error")},
             "redirects_to_https": _redirects_to_https(http_res, https_res),
             "banner": banner,
+            "tls": tls,
+            "caa": caa,
+            "security_txt": sec_txt,
         },
         "attack_surface": {
             "apex_ip": apex_ip,
             "subdomains": subdomains,
             "shodan_internetdb": shodan,
+            "dnssec": dnssec,
         },
     }
+
+    prev = diff(domain, before=started.strftime("%Y%m%d"))
+    if prev:
+        report["previous"] = prev
+        delta_pct = round(pct - prev["score_pct"], 1)
+        direction = "up" if delta_pct > 0 else "down" if delta_pct < 0 else "same"
+        report["delta"] = {"score_pct": delta_pct, "grade_direction": direction}
+
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -433,11 +667,20 @@ def assess(domain: str) -> dict:
 # --------------------------------------------------------------------------
 def _md_safe(value) -> str:
     """Neutralize external content before it enters the Markdown report — so a
-    hostile DNS/SPF/DMARC record or HTTP banner can't inject markup, break out of
-    a code span, or add lines (which also blocks prompt-injection if the .md is
-    later read by an agent that treats file text as instructions)."""
+    hostile DNS/SPF/DMARC record, HTTP banner, TLS issuer/SAN, or security.txt
+    value can't inject markup, form a `[text](url)` Markdown link/image, break
+    out of a code span, reopen raw HTML, or add lines (which also blocks
+    prompt-injection if the .md is later read by an agent that treats file
+    text as instructions). `&`/`[`/`]` matter as much as `<`/`>`/`|` here —
+    `[label](javascript:...)` is a working link in most Markdown renderers
+    even with angle brackets neutralized, so every bracket/entity character
+    that can build one has to go too."""
     s = "".join(ch if ch >= " " else " " for ch in str(value))
-    return s.replace("`", "'").replace("<", "(").replace(">", ")").replace("|", "/")
+    return (s.replace("`", "'").replace("<", "(").replace(">", ")").replace("|", "/")
+             .replace("&", "+").replace("[", "(").replace("]", ")"))
+
+
+_DIRECTION_ARROW = {"up": "▲", "down": "▼", "same": "▬"}
 
 
 def render_markdown(report: dict) -> str:
@@ -447,6 +690,13 @@ def render_markdown(report: dict) -> str:
         "",
         f"Generated {report['generated_at']} · Grade **{report['grade']}** "
         f"({report['score_pct']}%, passive sources only)",
+    ]
+    prev, delta = report.get("previous"), report.get("delta")
+    if prev and delta:
+        arrow = _DIRECTION_ARROW.get(delta["grade_direction"], "")
+        lines.append(f"Previous: grade **{prev['grade']}** ({prev['score_pct']}%) on {prev['date']} "
+                     f"— {arrow} {delta['score_pct']:+.1f}%")
+    lines += [
         "",
         "## Findings",
         "",
@@ -478,6 +728,9 @@ def render_markdown(report: dict) -> str:
         f"- HTTPS reachable: {report['web']['https']['ok']} (status {report['web']['https']['status']})",
         f"- HTTP -> HTTPS redirect (inferred): {report['web']['redirects_to_https']}",
         f"- Server banner: {_md_safe(report['web']['banner'].get('server')) if report['web']['banner'].get('server') else 'not disclosed'}",
+        f"- TLS certificate: {('issuer ' + _md_safe(report['web']['tls'].get('issuer')) + ', ' + str(report['web']['tls'].get('days_left')) + ' day(s) left') if report['web']['tls'].get('ok') else 'handshake failed — ' + _md_safe(report['web']['tls'].get('error'))}",
+        f"- CAA record: {'present' if report['web']['caa']['present'] else 'absent'}",
+        f"- security.txt: {'present' if report['web']['security_txt']['present'] else 'absent'}",
         "",
         "## Attack surface",
         "",
@@ -485,6 +738,7 @@ def render_markdown(report: dict) -> str:
         f"- Subdomains seen in CT logs: {report['attack_surface']['subdomains'].get('count', 'unknown')}",
         f"- Shodan InternetDB open ports: {report['attack_surface']['shodan_internetdb'].get('ports') or 'none/unavailable'}",
         f"- Shodan InternetDB CVEs: {report['attack_surface']['shodan_internetdb'].get('cves') or 'none'}",
+        f"- DNSSEC (DNSKEY/DS present): {report['attack_surface']['dnssec']['present']}",
         "",
         "---",
         "*Passive assessment only — no active scanning or exploitation was performed.*",
@@ -520,6 +774,14 @@ def render_html(report: dict) -> str:
     es = report["email_security"]
     web = report["web"]
     asurf = report["attack_surface"]
+    tls = web["tls"]
+
+    prev, delta = report.get("previous"), report.get("delta")
+    diff_html = ""
+    if prev and delta:
+        arrow = _DIRECTION_ARROW.get(delta["grade_direction"], "")
+        diff_html = (f'<div class="grade-pct">previous: {_esc(prev["grade"])} ({_esc(prev["score_pct"])}%) '
+                    f'on {_esc(prev["date"])} &mdash; {arrow} {delta["score_pct"]:+.1f}%</div>')
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -567,6 +829,7 @@ def render_html(report: dict) -> str:
       <div class="grade-pct">email {report['score_breakdown']['email']['points']}/{report['score_breakdown']['email']['max']}
         &middot; web {report['score_breakdown']['web']['points']}/{report['score_breakdown']['web']['max']}
         &middot; attack surface {report['score_breakdown']['attack_surface']['points']}/{report['score_breakdown']['attack_surface']['max']}</div>
+      {diff_html}
     </div>
   </div>
 
@@ -593,6 +856,9 @@ def render_html(report: dict) -> str:
     <tr><th>HTTPS reachable</th><td>{web['https']['ok']} (status {_esc(web['https']['status'])})</td></tr>
     <tr><th>HTTP&rarr;HTTPS redirect</th><td>{_esc(web['redirects_to_https'])} (inferred)</td></tr>
     <tr><th>Server banner</th><td>{_esc(web['banner'].get('server') or 'not disclosed')}</td></tr>
+    <tr><th>TLS certificate</th><td>{(f"issuer {_esc(tls.get('issuer'))}, {_esc(tls.get('days_left'))} day(s) left") if tls.get('ok') else f"handshake failed &mdash; {_esc(tls.get('error'))}"}</td></tr>
+    <tr><th>CAA record</th><td>{'present' if web['caa']['present'] else 'absent'}</td></tr>
+    <tr><th>security.txt</th><td>{'present' if web['security_txt']['present'] else 'absent'}</td></tr>
   </table>
 
   <h2>Attack surface</h2>
@@ -601,6 +867,7 @@ def render_html(report: dict) -> str:
     <tr><th>Subdomains (CT logs)</th><td>{_esc(asurf['subdomains'].get('count', 'unknown'))}</td></tr>
     <tr><th>Open ports (Shodan)</th><td>{_esc(asurf['shodan_internetdb'].get('ports') or 'none/unavailable')}</td></tr>
     <tr><th>CVEs (Shodan)</th><td>{_esc(asurf['shodan_internetdb'].get('cves') or 'none')}</td></tr>
+    <tr><th>DNSSEC (DNSKEY/DS)</th><td>{asurf['dnssec']['present']}</td></tr>
   </table>
 
   <footer>Passive assessment only &mdash; no active scanning or exploitation was performed.</footer>

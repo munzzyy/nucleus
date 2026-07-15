@@ -346,6 +346,7 @@ def build_inventory(force_refresh: bool = False) -> dict:
             "installed": common.which(spec.bin) is not None, "install": spec.install,
             "timeout": spec.timeout, "options": options,
             "needs_wordlist": spec.needs_wordlist,
+            "known_broken": spec.known_broken,
         })
 
     build_tools = [{"key": k, "desc": v["desc"], "fields": v["fields"], "note": v.get("note", "")}
@@ -374,5 +375,15 @@ def build_inventory(force_refresh: bool = False) -> dict:
 
 
 def handle_inventory(req) -> "common.Response":
-    force = req.q("refresh", "") in ("1", "true", "yes")
-    return common.Response.json(build_inventory(force_refresh=force))
+    # GET never forces a refresh — GET requests carry no Origin/Referer check
+    # anywhere in this app (only POST does, see shared/common.py), so a
+    # ?refresh=1 side effect here would let a blind cross-origin <img>/
+    # fetch(no-cors) from any page Cole has open repeat-trigger ~80 concurrent
+    # subprocess --version probes for free. Use POST /api/inventory/refresh
+    # (which DOES get the Origin check, like every other mutating endpoint)
+    # to force one; this endpoint stays cached-and-read-only, always.
+    return common.Response.json(build_inventory(force_refresh=False))
+
+
+def handle_inventory_refresh(req) -> "common.Response":
+    return common.Response.json(build_inventory(force_refresh=True))

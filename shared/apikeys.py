@@ -11,10 +11,13 @@ Ranked roughly by value-for-a-free-signup. `free` describes the free tier.
 """
 from __future__ import annotations
 
+import fcntl
 import os
+import tempfile
 from pathlib import Path
 
 _VAR_ENV = Path(__file__).resolve().parents[1] / "var" / ".env"
+_LOCK_PATH = _VAR_ENV.parent / ".env.lock"
 
 # name(env var) -> spec. `unlocks` is a human list of what turns on.
 CATALOG = [
@@ -71,28 +74,118 @@ CATALOG = [
 CATALOG_BY_NAME = {k["name"]: k for k in CATALOG}
 
 
-def _read_var_env() -> dict:
+def _clean_value(v: str) -> str:
+    """Trim whitespace and strip one layer of matching quotes."""
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1]
+    return v.strip()
+
+
+def _parse_env_text(text: str) -> dict:
     out = {}
-    try:
-        if _VAR_ENV.exists():
-            for line in _VAR_ENV.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                out[k.strip()] = v.strip()
-    except OSError:
-        pass
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k:
+            out[k] = _clean_value(v)
     return out
 
 
+def read_env() -> dict:
+    """Parse var/.env once: KEY=value, KEY="value", KEY='value', blank lines,
+    and '#' comments are all handled, and quotes are stripped so nobody
+    downstream ever sees them. Used internally by get_key(); public so the
+    hub Settings panel (and anything else that wants the whole file) reads
+    it here instead of growing its own parser — this is the one that stays
+    correct."""
+    try:
+        if _VAR_ENV.exists():
+            return _parse_env_text(_VAR_ENV.read_text())
+    except OSError:
+        pass
+    return {}
+
+
 def get_key(name: str) -> str:
-    """Env var first (set live by the Settings panel), then var/.env. '' if unset."""
+    """Env var first (set live by the Settings panel), then var/.env.
+    Surrounding single/double quotes are stripped either way — a quoted
+    value used to reach callers WITH the quote characters still attached,
+    which 401'd every keyed source that sent it on verbatim. '' if unset.
+    """
     v = os.environ.get(name)
     if v:
-        return v.strip()
-    return _read_var_env().get(name, "").strip()
+        return _clean_value(v)
+    return read_env().get(name, "")
 
 
 def is_set(name: str) -> bool:
     return bool(get_key(name))
+
+
+def set_key(name: str, value: str) -> None:
+    """Atomically upsert (or, if `value` is '', remove) one key in
+    var/.env, and mirror the change into os.environ so it's live
+    immediately with no restart.
+
+    The whole read-modify-write is held under an flock() on a sidecar
+    `.env.lock`, then written to a temp file in the SAME directory and
+    moved into place with os.replace() — a single atomic rename. A reader
+    never observes a half-written file, and two saves racing each other
+    (two request threads in the hub, or two consoles) serialize on the lock
+    instead of corrupting the file or silently dropping each other's key.
+    This replaces the hub's old '_write_env_key' (read lines, mutate,
+    write_text — no lock, no atomic rename), which had exactly that race.
+
+    The file is rewritten canonically (sorted KEY=value lines, unquoted) —
+    it's a machine-managed secrets store, not a hand-edited config, so this
+    intentionally doesn't try to preserve stray comments or ordering.
+    """
+    name = (name or "").strip()
+    # A name/value with '=' or an embedded newline would corrupt the
+    # KEY=value line format on write (and desync from what read_env() can
+    # parse back). The hub's own regex already keeps values to this shape
+    # before they get here; this is the belt-and-suspenders for any other
+    # caller of this now-shared API.
+    if not name or "=" in name or "\n" in name or "\r" in name:
+        return
+    value = _clean_value(value).replace("\n", "").replace("\r", "")
+
+    _VAR_ENV.parent.mkdir(parents=True, exist_ok=True)
+    _LOCK_PATH.touch(exist_ok=True)
+
+    with open(_LOCK_PATH, "r+") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            current = read_env()
+            if value:
+                current[name] = value
+            else:
+                current.pop(name, None)
+
+            lines = [f"{k}={v}" for k, v in sorted(current.items())]
+            text = ("\n".join(lines) + "\n") if lines else ""
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(_VAR_ENV.parent), prefix=".env.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(text)
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, _VAR_ENV)
+            except OSError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
+    if value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
