@@ -598,7 +598,8 @@ class ExpertDenyListTests(unittest.TestCase):
         # Tools whose CLI can load an arbitrary local script/config file that
         # then execs. exiftool -config is a Perl file eval'd on load -- the one
         # the adversarial verify pass caught still reachable.
-        for binary in ("exiftool", "nmap", "mitmproxy", "tshark", "nuclei"):
+        for binary in ("exiftool", "nmap", "mitmproxy", "tshark", "nuclei",
+                       "ghidra", "analyzeHeadless"):
             with self.subTest(binary=binary):
                 self.assertIn(binary, runners._EXPERT_DENY)
 

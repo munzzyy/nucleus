@@ -835,6 +835,11 @@ _EXPERT_DENY = {
                          # Perl file eval'd on load (man exiftool: config files
                          # are Perl) — arbitrary code once a file can be planted.
                          # Same Tier-2 shape as the loaders above.
+    "ghidra", "analyzeHeadless",  # Ghidra headless runs -preScript/-postScript/
+                         # -scriptPath GhidraScripts (Java/Jython) that exec
+                         # arbitrary code — same shape as nmap --script above.
+                         # Not wired into redcell today; denied pre-emptively so
+                         # it can never slip in as an Expert arbitrary-arg tool.
 }
 
 

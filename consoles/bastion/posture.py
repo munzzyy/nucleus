@@ -208,9 +208,49 @@ def check_firewall() -> dict:
                   "sudo systemctl enable --now firewalld")
 
 
+def check_egress_control() -> dict:
+    """Per-app OUTBOUND control. check_firewall covers inbound; nothing there
+    stops a running app from reaching out. opensnitch is the standard per-app
+    egress prompt/deny. Without it (or an explicit per-app nftables egress
+    rule), every app on the box — browser, RE tools, anything — can phone out
+    unnoticed. This is the systemic gap behind 'is tool X talking to someone'."""
+    active, _ = _svc_active("opensnitchd")
+    if active:
+        return _check("egress-control", "Per-app egress control", "hardening", "ok",
+                      "opensnitch active — outbound connections are gated per application", "")
+    return _check("egress-control", "Per-app egress control", "hardening", "warn",
+                  "no per-app egress control — the firewall only filters inbound, so any app "
+                  "can reach out unnoticed. This, not any one tool, is the real phone-home gap.",
+                  "sudo pacman -S opensnitch && sudo systemctl enable --now opensnitchd")
+
+
+_FIREJAIL_PROFILE_DIR = HOME / ".config" / "firejail"
+
+
+def check_ghidra_containment() -> "dict | None":
+    """Ghidra is NSA-authored but open-source with no default phone-home
+    ([[ghidra-opsec]]). Full opsec still means it should never be *able* to
+    reach out: this surfaces whether it's egress-contained — via a firejail
+    net-none profile or system-wide opensnitch — instead of running wide open.
+    Only shown when Ghidra is actually installed."""
+    if not common.which("ghidra"):
+        return None
+    profile = _FIREJAIL_PROFILE_DIR / "ghidra.profile"
+    opensnitch_active, _ = _svc_active("opensnitchd")
+    if profile.is_file() or opensnitch_active:
+        how = "firejail net-none profile" if profile.is_file() else "opensnitch (system-wide)"
+        return _check("ghidra-egress", "Ghidra egress containment", "opsec", "ok",
+                      f"Ghidra installed and egress-contained ({how})", "")
+    return _check("ghidra-egress", "Ghidra egress containment", "opsec", "warn",
+                  "Ghidra installed with no egress containment. It's open-source with no default "
+                  "phone-home, but for full opsec run it with no network path at all.",
+                  "firejail --net=none ghidra   # profile lives at ~/.config/firejail/ghidra.profile")
+
+
 _PRIVACY_TOOLS = [
     ("keepassxc", "KeePassXC (password vault)"),
     ("firejail", "Firejail (sandboxing)"),
+    ("opensnitch", "OpenSnitch (per-app egress firewall)"),
     ("mat2", "mat2 (metadata stripping)"),
     ("torbrowser-launcher", "Tor Browser launcher"),
     ("wg", "WireGuard tools"),
@@ -417,6 +457,10 @@ def _run_all_uncached() -> dict:
     checks.append(check_wireguard())
     checks.append(check_wifi_mac())
     checks.append(check_firewall())
+    checks.append(check_egress_control())
+    ghidra_check = check_ghidra_containment()
+    if ghidra_check is not None:
+        checks.append(ghidra_check)
     checks.extend(check_privacy_tools())
     checks.extend(check_audit_tools())
     checks.append(check_rkhunter())
