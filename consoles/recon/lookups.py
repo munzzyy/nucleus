@@ -31,7 +31,8 @@ FETCH_TIMEOUT = 5.0
 KEYED_TIMEOUT = 6.0
 DNS_TIMEOUT = 5.0
 USERNAME_SITE_TIMEOUT = 6.0
-USERNAME_CONCURRENCY = 8
+USERNAME_CONCURRENCY = 24  # WMN adds hundreds of candidate sites -- needs real
+                            # throughput to cover a useful sample inside the budget
 USERNAME_BUDGET = 25.0  # overall wall-clock cap for the whole username scan
 
 VAR_DIR = Path(__file__).resolve().parents[2] / "var"
@@ -140,18 +141,15 @@ def _geo_lookup(ip: str) -> dict | None:
 
 
 # ==========================================================================
-# 1. Username -- ~30 sites, thread-pooled, capped concurrency.
+# 1. Username -- WhatsMyName dataset (700+ sites) + a couple of supplemental
+#    checkers for accounts WMN doesn't cover, thread-pooled, budget-capped.
 #
 # Every checker returns {"found": True/False/None, "url": ..., "note": ...}.
-# `None` means "couldn't confirm" -- several major platforms (X, Instagram,
-# TikTok, Spotify, Twitch, Reddit) serve an identical client-rendered shell
-# or bot-wall to every request regardless of whether the account exists, so
-# a confident true/false there would just be a fabricated signal. We say so
-# in the note instead of guessing.
+# `None` means "couldn't confirm" -- plenty of platforms serve an identical
+# client-rendered shell or bot-wall regardless of whether the account
+# exists, so a confident true/false there would just be a fabricated
+# signal. We say so in the note instead of guessing.
 # ==========================================================================
-_DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9-]{1,63}$")
-
-
 def _c_github(u):
     url = f"https://api.github.com/users/{quote(u, safe='')}"
     status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT,
@@ -172,112 +170,6 @@ def _c_github(u):
     return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
 
 
-def _c_github_gist(u):
-    url = f"https://gist.github.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_gitlab(u):
-    url = f"https://gitlab.com/{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=2000)
-    if status == 200 and "Just a moment" not in text:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": "bot-challenge or unreachable"}
-
-
-def _c_reddit(u):
-    url = f"https://www.reddit.com/user/{quote(u, safe='')}/about.json"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT,
-                                     headers={"User-Agent": "web:nucleus-recon:1.0 (by /u/nucleusrecon)"})
-    profile = f"https://www.reddit.com/user/{u}/"
-    if status == 200:
-        return {"found": True, "url": profile, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": profile, "note": "HTTP 404"}
-    return {"found": None, "url": profile, "note": "reddit bot-walls scripted requests (403)"}
-
-
-def _c_youtube(u):
-    url = f"https://www.youtube.com/@{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_keybase(u):
-    url = f"https://keybase.io/_/api/1.0/user/lookup.json?usernames={quote(u, safe='')}"
-    status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://keybase.io/{u}"
-    if status == 200:
-        data = _json_or_none(body) or {}
-        them = data.get("them") or []
-        found = bool(them) and them[0] is not None
-        return {"found": found, "url": profile, "note": "Keybase lookup API"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_medium(u):
-    url = f"https://medium.com/@{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=5000)
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    if status == 200:
-        bare = '<title data-rh="true">Medium</title>' in text
-        return {"found": not bare, "url": url,
-                "note": "bare shell title = no profile" if bare else "profile title present"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_devto(u):
-    url = f"https://dev.to/api/users/by_username?url={quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://dev.to/{u}"
-    if status == 200:
-        return {"found": True, "url": profile, "note": "dev.to API"}
-    if status == 404:
-        return {"found": False, "url": profile, "note": "dev.to API"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_hackernews(u):
-    url = f"https://hacker-news.firebaseio.com/v0/user/{quote(u, safe='')}.json"
-    status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://news.ycombinator.com/user?id={u}"
-    if status == 200:
-        return {"found": body.strip() != b"null", "url": profile, "note": "Firebase user API"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_pastebin(u):
-    url = f"https://pastebin.com/u/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_gravatar(u):
-    url = f"https://gravatar.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
 def _c_wikipedia(u):
     url = f"https://en.wikipedia.org/w/api.php?action=query&list=users&ususers={quote(u, safe='')}&format=json"
     status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
@@ -290,46 +182,6 @@ def _c_wikipedia(u):
     return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
 
 
-def _c_soundcloud(u):
-    url = f"https://soundcloud.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_vimeo(u):
-    url = f"https://vimeo.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_flickr(u):
-    url = f"https://www.flickr.com/people/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_aboutme(u):
-    url = f"https://about.me/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
 def _c_behance(u):
     url = f"https://www.behance.net/{quote(u, safe='')}"
     status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
@@ -340,240 +192,264 @@ def _c_behance(u):
     return {"found": None, "url": url, "note": err or f"HTTP {status}"}
 
 
-def _c_dribbble(u):
-    url = f"https://dribbble.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_steam(u):
-    url = f"https://steamcommunity.com/id/{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=200_000)
-    if status == 200:
-        notfound = "The specified profile could not be found" in text
-        return {"found": not notfound, "url": url, "note": "soft-404 signature check"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_patreon(u):
-    url = f"https://www.patreon.com/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_npm(u):
-    url = f"https://registry.npmjs.org/-/v1/search?text=maintainer:{quote(u, safe='')}&size=1"
-    status, body, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://www.npmjs.com/~{u}"
-    if status == 200:
-        data = _json_or_none(body) or {}
-        found = bool(data.get("objects"))
-        return {"found": found, "url": profile,
-                "note": "best-effort: has published packages under this name "
-                        "(npm's own profile pages are bot-walled, no direct existence check)"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_pypi(u):
-    url = f"https://pypi.org/user/{quote(u, safe='')}/"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=3000)
-    if "Client Challenge" in text or "Just a moment" in text:
-        return {"found": None, "url": url, "note": "bot-challenge page returned"}
-    if status == 200:
-        return {"found": True, "url": url, "note": "HTTP 200"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_dockerhub(u):
-    url = f"https://hub.docker.com/v2/users/{quote(u, safe='')}/"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://hub.docker.com/u/{u}"
-    if status == 200:
-        return {"found": True, "url": profile, "note": "Docker Hub API"}
-    if status == 404:
-        return {"found": False, "url": profile, "note": "Docker Hub API"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_trello(u):
-    url = f"https://trello.com/1/Members/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://trello.com/{u}"
-    if status == 200:
-        return {"found": True, "url": profile, "note": "Trello API"}
-    if status == 404:
-        return {"found": False, "url": profile, "note": "Trello API"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_mastodon(u):
-    url = f"https://mastodon.social/api/v1/accounts/lookup?acct={quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT)
-    profile = f"https://mastodon.social/@{u}"
-    if status == 200:
-        return {"found": True, "url": profile, "note": "Mastodon API (mastodon.social instance only)"}
-    if status == 404:
-        return {"found": False, "url": profile, "note": "Mastodon API (mastodon.social instance only)"}
-    return {"found": None, "url": profile, "note": err or f"HTTP {status}"}
-
-
-def _c_tumblr(u):
-    profile = f"https://{u}.tumblr.com/"
-    if not _DNS_LABEL_RE.match(u):
-        return {"found": None, "url": profile, "note": "username not usable as a subdomain label"}
-    status, _, _, err = _safe_fetch(profile, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status is None:
-        return {"found": False, "url": profile, "note": "blog subdomain does not resolve"}
-    return {"found": True, "url": profile, "note": f"HTTP {status}"}
-
-
-def _c_twitter(u):
-    url = f"https://x.com/{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=4000)
-    if "doesn't exist" in text.lower() or "account doesn" in text.lower():
-        return {"found": False, "url": url, "note": "not-found signature"}
-    if status == 200:
-        return {"found": None, "url": url,
-                "note": "X serves an identical client-rendered shell for any handle -- can't confirm without JS"}
-    return {"found": None, "url": url, "note": err or f"HTTP {status}"}
-
-
-def _c_instagram(u):
-    url = f"https://www.instagram.com/{quote(u, safe='')}/"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=300_000)
-    low = text.lower()
-    if status == 200 and f'"username":"{u.lower()}"' in low:
-        return {"found": True, "url": url, "note": "username present in page data"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": "Instagram bot-walls anonymous requests -- can't confirm"}
-
-
-def _c_tiktok(u):
-    url = f"https://www.tiktok.com/@{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=300_000)
-    if status == 200 and f'"uniqueId":"{u}"' in text:
-        return {"found": True, "url": url, "note": "uniqueId present in page data"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": "TikTok bot-walls anonymous requests -- can't confirm"}
-
-
-def _c_telegram(u):
-    url = f"https://t.me/{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=8000)
-    if status is None:
-        return {"found": None, "url": url, "note": err or "unreachable"}
-    if 'tgme_page_title' in text and u.lower() in text.lower():
-        return {"found": True, "url": url, "note": "channel/user preview present"}
-    if "If you have Telegram" in text:
-        return {"found": False, "url": url, "note": "generic no-preview page"}
-    return {"found": None, "url": url, "note": "ambiguous preview page"}
-
-
-def _c_twitch(u):
-    url = f"https://www.twitch.tv/{quote(u, safe='')}"
-    status, text, _, err = _fetch_text(url, headers={"User-Agent": _UA_BROWSER}, max_bytes=250_000)
-    if status == 200 and f'"login":"{u.lower()}"' in text.lower():
-        return {"found": True, "url": url, "note": "login present in page data"}
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": "Twitch is heavily client-rendered -- can't confirm without JS"}
-
-
-def _c_spotify(u):
-    url = f"https://open.spotify.com/user/{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url,
-            "note": "Spotify serves a client-rendered shell for any user id -- can't confirm without JS"}
-
-
-def _c_replit(u):
-    url = f"https://replit.com/@{quote(u, safe='')}"
-    status, _, _, err = _safe_fetch(url, timeout=USERNAME_SITE_TIMEOUT, headers={"User-Agent": _UA_BROWSER})
-    if status == 404:
-        return {"found": False, "url": url, "note": "HTTP 404"}
-    return {"found": None, "url": url, "note": "Replit redirects profile views to login -- can't confirm"}
-
-
+# Sites WMN doesn't carry (GitHub is kept for the profile-enrichment fields,
+# not because WMN lacks a GitHub check). Also doubles as the fallback list
+# for the rare case the WMN dataset can't be loaded at all -- see
+# _wmn_checkable_sites() below.
 SITES: list[tuple[str, object]] = [
     ("GitHub", _c_github),
-    ("GitHub Gist", _c_github_gist),
-    ("GitLab", _c_gitlab),
-    ("Reddit", _c_reddit),
-    ("Twitter/X", _c_twitter),
-    ("Instagram", _c_instagram),
-    ("TikTok", _c_tiktok),
-    ("YouTube", _c_youtube),
-    ("Twitch", _c_twitch),
-    ("Steam", _c_steam),
-    ("Keybase", _c_keybase),
-    ("Telegram", _c_telegram),
-    ("Medium", _c_medium),
-    ("Dev.to", _c_devto),
-    ("Hacker News", _c_hackernews),
-    ("Pastebin", _c_pastebin),
-    ("Gravatar", _c_gravatar),
     ("Wikipedia", _c_wikipedia),
-    ("SoundCloud", _c_soundcloud),
-    ("Spotify", _c_spotify),
-    ("Vimeo", _c_vimeo),
-    ("Flickr", _c_flickr),
-    ("About.me", _c_aboutme),
-    ("Patreon", _c_patreon),
     ("Behance", _c_behance),
-    ("Dribbble", _c_dribbble),
-    ("npm", _c_npm),
-    ("PyPI", _c_pypi),
-    ("Docker Hub", _c_dockerhub),
-    ("Replit", _c_replit),
-    ("Trello", _c_trello),
-    ("Mastodon", _c_mastodon),
-    ("Tumblr", _c_tumblr),
 ]
+
+# --------------------------------------------------------------------------
+# WhatsMyName dataset -- github.com/WebBreacher/WhatsMyName, 700+
+# community-maintained site checkers. Fetched through common.fetch (same
+# SSRF guard as every other outbound call here) and cached to disk so a scan
+# never re-downloads a ~260KB JSON file on every request.
+# --------------------------------------------------------------------------
+WMN_URL = "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json"
+WMN_CACHE_FILE = VAR_DIR / "wmn-data.json"
+WMN_CACHE_TTL = 7 * 24 * 3600   # WMN moves slowly -- a week-old copy is fine
+WMN_RETRY_TTL = 600             # but retry sooner than that if the last load degraded
+WMN_FETCH_TIMEOUT = 15.0        # ~260KB off a CDN; generous headroom over FETCH_TIMEOUT
+WMN_MAX_BYTES = 3_000_000       # dataset is ~260KB today -- plenty of room to grow
+
+# GitHub's own WMN entry is redundant with _c_github above (which also pulls
+# the enrichment block) -- drop it so the site doesn't show up twice.
+_WMN_EXCLUDE_NAMES = {"github (user)"}
+
+# Curated high-signal sites, checked first so they're never crowded out of
+# the budget by the long tail of WMN's 700+ entries. Matched against WMN's
+# `name` field (case-insensitive substring, except the bare "X" which needs
+# an exact match to avoid matching every name containing the letter x).
+_WMN_PRIORITY_EXACT = {"x"}
+_WMN_PRIORITY_SUBSTR = (
+    "gitlab", "reddit", "instagram", "tiktok", "youtube", "twitch", "steam",
+    "keybase", "telegram", "hacker news", "mastodon api", "npm", "pypi",
+    "dev.to", "spotify", "soundcloud", "medium", "patreon", "pastebin",
+    "trello", "tumblr", "vimeo", "flickr", "dribbble", "gravatar", "replit",
+    "docker hub (user)", "github (gists)",
+)
+
+_wmn_lock = threading.Lock()
+_wmn_mem: dict = {"sites": None, "dataset": "", "loaded_at": 0.0, "ok": False}
+
+
+def _normalize_wmn_site(raw: dict) -> dict | None:
+    """One WMN dataset entry -> our internal shape, or None if it's not a
+    plain GET-and-substitute check we can run (a POST-body check, a
+    malformed entry, or one WMN itself has flagged invalid)."""
+    if not isinstance(raw, dict) or raw.get("valid") is False:
+        return None
+    name = raw.get("name")
+    uri_check = raw.get("uri_check")
+    if not name or not uri_check or "{account}" not in uri_check or raw.get("post_body"):
+        return None
+    headers = raw.get("headers")
+    return {
+        "name": name,
+        "uri_check": uri_check,
+        "uri_pretty": raw.get("uri_pretty") or uri_check,
+        "e_code": raw.get("e_code"),
+        "e_string": raw.get("e_string") or "",
+        "m_code": raw.get("m_code"),
+        "m_string": raw.get("m_string") or "",
+        "strip_bad_char": raw.get("strip_bad_char") or "",
+        "headers": headers if isinstance(headers, dict) else {},
+    }
+
+
+def _parse_wmn_payload(body: bytes) -> list[dict] | None:
+    data = _json_or_none(body)
+    if not isinstance(data, dict):
+        return None
+    raw_sites = data.get("sites")
+    if not isinstance(raw_sites, list) or not raw_sites:
+        return None
+    sites = [n for n in (_normalize_wmn_site(r) for r in raw_sites) if n]
+    return sites or None
+
+
+def _load_wmn_cache_file() -> list[dict] | None:
+    try:
+        return _parse_wmn_payload(WMN_CACHE_FILE.read_bytes())
+    except OSError:
+        return None
+
+
+def _fetch_wmn_dataset() -> tuple[list[dict], str, bool]:
+    """Sites + a provenance label + whether the load was healthy (fresh
+    cache or a live fetch) vs. degraded (stale cache or empty). The health
+    flag controls how soon _wmn_checkable_sites() retries -- a degraded
+    load gets rechecked every WMN_RETRY_TTL instead of sitting stale for a
+    full week.
+    """
+    try:
+        age = time.time() - WMN_CACHE_FILE.stat().st_mtime
+    except OSError:
+        age = None
+    if age is not None and age < WMN_CACHE_TTL:
+        cached = _load_wmn_cache_file()
+        if cached:
+            stamp = datetime.fromtimestamp(WMN_CACHE_FILE.stat().st_mtime, timezone.utc)
+            return cached, f"whatsmyname ({len(cached)} sites, cached {stamp:%Y-%m-%d})", True
+
+    status, body, _, err = _safe_fetch(WMN_URL, timeout=WMN_FETCH_TIMEOUT, max_bytes=WMN_MAX_BYTES)
+    if status == 200:
+        sites = _parse_wmn_payload(body)
+        if sites:
+            try:
+                VAR_DIR.mkdir(parents=True, exist_ok=True)
+                WMN_CACHE_FILE.write_bytes(body)
+            except OSError:
+                pass  # cache write is best-effort -- the fetched sites are still good for this run
+            stamp = datetime.now(timezone.utc)
+            return sites, f"whatsmyname ({len(sites)} sites, fetched {stamp:%Y-%m-%d})", True
+
+    stale = _load_wmn_cache_file()
+    if stale:
+        return stale, f"whatsmyname ({len(stale)} sites, stale cache -- live fetch failed: {err or status})", False
+
+    return [], f"whatsmyname unavailable ({err or status}) -- using the {len(SITES)}-site hardcoded fallback", False
+
+
+def _wmn_priority_rank(name: str) -> int:
+    low = name.lower()
+    if low in _WMN_PRIORITY_EXACT:
+        return 0
+    for i, kw in enumerate(_WMN_PRIORITY_SUBSTR):
+        if kw in low:
+            return i + 1
+    return len(_WMN_PRIORITY_SUBSTR) + 1
+
+
+def _wmn_checkable_sites() -> tuple[list[dict], str]:
+    """In-process-cached, GitHub-deduped, priority-ordered WMN site list.
+
+    Re-reads disk/network at most once per WMN_CACHE_TTL when the last load
+    was healthy, or every WMN_RETRY_TTL when it degraded -- so a transient
+    GitHub outage self-heals within the process lifetime instead of being
+    stuck on the hardcoded fallback for a week.
+    """
+    now = time.monotonic()
+    with _wmn_lock:
+        loaded = _wmn_mem["sites"] is not None
+        ttl = WMN_CACHE_TTL if _wmn_mem["ok"] else WMN_RETRY_TTL
+        if loaded and (now - _wmn_mem["loaded_at"]) < ttl:
+            return _wmn_mem["sites"], _wmn_mem["dataset"]
+
+    raw_sites, dataset, ok = _fetch_wmn_dataset()
+    checkable = [s for s in raw_sites if s["name"].lower() not in _WMN_EXCLUDE_NAMES]
+    checkable.sort(key=lambda s: (_wmn_priority_rank(s["name"]), s["name"]))
+    with _wmn_lock:
+        _wmn_mem.update(sites=checkable, dataset=dataset, loaded_at=now, ok=ok)
+    return checkable, dataset
+
+
+def _check_wmn_site(u: str, site: dict) -> dict:
+    """Run one WMN entry's check: substitute `u` into uri_check, fetch it,
+    and decide found/not-found/unknown from the e_code/e_string/m_code/
+    m_string signature WMN ships for that site."""
+    account = u
+    for ch in site["strip_bad_char"]:
+        account = account.replace(ch, "")
+    encoded = quote(account, safe="")
+    url = site["uri_check"].replace("{account}", encoded)
+    profile = site["uri_pretty"].replace("{account}", encoded)
+    headers = {"User-Agent": _UA_BROWSER}
+    headers.update(site["headers"])
+    status, text, _, err = _fetch_text(url, headers=headers, max_bytes=200_000)
+    if status is None:
+        return {"found": None, "url": profile, "note": err or "unreachable or timed out"}
+    e_code, e_string = site["e_code"], site["e_string"]
+    m_code, m_string = site["m_code"], site["m_string"]
+    if status == e_code and e_string in text:
+        return {"found": True, "url": profile, "note": f"HTTP {status}, e_string matched (whatsmyname)"}
+    if status == m_code or (m_string and m_string in text):
+        return {"found": False, "url": profile, "note": f"HTTP {status} (whatsmyname)"}
+    return {"found": None, "url": profile, "note": f"HTTP {status}, ambiguous signature (whatsmyname)"}
+
+
+_USERNAME_CHARSET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,39}$")
 
 
 def username_scan(u: str) -> dict:
     t0 = time.monotonic()
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=USERNAME_CONCURRENCY)
-    results = []
+
+    # Defense in depth -- app.py already runs detect.validate() before this
+    # is ever called, but this module substitutes `u` straight into a URL
+    # for 700+ sites and must never trust a caller upstream of app.py.
+    if not _USERNAME_CHARSET_RE.match(u or ""):
+        return {
+            "input": u, "sites": [], "github": None,
+            "found_count": 0, "not_found_count": 0, "unknown_count": 0,
+            "checked": 0, "total_available": 0,
+            "dataset": "rejected -- username outside the safe charset [A-Za-z0-9._-]",
+            "took_ms": round((time.monotonic() - t0) * 1000),
+        }
+
+    wmn_sites, dataset_label = _wmn_checkable_sites()
+    tasks: list[tuple[str, object]] = [(name, (lambda fn=fn: fn(u))) for name, fn in SITES]
+    if wmn_sites:
+        tasks += [(s["name"], (lambda s=s: _check_wmn_site(u, s))) for s in wmn_sites]
+    total_available = len(tasks)
+
+    # Rolling window instead of "submit everything, wait once": WMN alone can
+    # be 600+ sites and USERNAME_BUDGET can't cover them all, so we keep
+    # exactly USERNAME_CONCURRENCY checks in flight and pull the next queued
+    # site the moment one finishes, until the budget runs out. That way
+    # "checked" only ever counts sites a request actually went out for --
+    # never the hundreds still sitting in the queue when the budget hits.
+    deadline = t0 + USERNAME_BUDGET
+    pending = list(tasks)
+    in_flight: dict = {}
+    results: list[dict] = []
     github_enrich = None
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=USERNAME_CONCURRENCY)
     try:
-        futures = {ex.submit(fn, u): name for name, fn in SITES}
-        done, not_done = concurrent.futures.wait(futures, timeout=USERNAME_BUDGET)
-        for fut in done:
-            name = futures[fut]
-            try:
-                r = fut.result()
-            except Exception as e:  # a single site bug must not sink the scan
-                r = {"found": None, "url": "", "note": f"error: {type(e).__name__}: {e}"}
-            entry = {"site": name, "url": r.get("url", ""), "found": r.get("found"),
-                      "note": r.get("note", "")}
-            results.append(entry)
-            if name == "GitHub" and r.get("enrich"):
-                github_enrich = r["enrich"]
-        for fut in not_done:
-            results.append({"site": futures[fut], "url": "", "found": None, "note": "timed out"})
+        def _submit_next() -> bool:
+            if not pending:
+                return False
+            name, call = pending.pop(0)
+            in_flight[ex.submit(call)] = name
+            return True
+
+        for _ in range(USERNAME_CONCURRENCY):
+            if not _submit_next():
+                break
+
+        while in_flight:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _ = concurrent.futures.wait(
+                list(in_flight), timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                break
+            for fut in done:
+                name = in_flight.pop(fut)
+                try:
+                    r = fut.result()
+                except Exception as e:  # a single site bug must not sink the scan
+                    r = {"found": None, "url": "", "note": f"error: {type(e).__name__}: {e}"}
+                results.append({"site": name, "url": r.get("url", ""), "found": r.get("found"),
+                                 "note": r.get("note", "")})
+                if name == "GitHub" and r.get("enrich"):
+                    github_enrich = r["enrich"]
+                _submit_next()
     finally:
         # wait=False + cancel_futures: don't block the response on slow
         # stragglers past the budget above; any still-running fetch just
-        # finishes in the background and its result is discarded.
+        # finishes in the background and its result is discarded. Every
+        # site still queued (never submitted) is simply left out of
+        # `results` -- it was never checked, so it doesn't get an entry.
         ex.shutdown(wait=False, cancel_futures=True)
 
-    order = {name: i for i, (name, _) in enumerate(SITES)}
-    results.sort(key=lambda r: order.get(r["site"], 999))
+    order = {name: i for i, (name, _) in enumerate(tasks)}
+    results.sort(key=lambda r: order.get(r["site"], 10**9))
     return {
         "input": u,
         "sites": results,
@@ -582,6 +458,8 @@ def username_scan(u: str) -> dict:
         "not_found_count": sum(1 for r in results if r["found"] is False),
         "unknown_count": sum(1 for r in results if r["found"] is None),
         "checked": len(results),
+        "total_available": total_available,
+        "dataset": dataset_label,
         "took_ms": round((time.monotonic() - t0) * 1000),
     }
 

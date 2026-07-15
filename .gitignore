@@ -1,6 +1,7 @@
 # local state + secrets — never commit
 var/.env
 var/.env.lock
+var/*.json
 var/*.jsonl
 var/*.log
 var/redcell-out/

@@ -18,10 +18,13 @@
   const btnDownload = document.getElementById("res-download");
   const historyWrap = document.getElementById("recon-history-wrap");
   const historyList = document.getElementById("recon-history");
+  const trailEl = document.getElementById("pivot-trail");
 
   let lastScanData = null;
   let lastScanQuery = "";
   let scanTicker = null;
+  let pivotTrail = [];
+  const MAX_TRAIL = 8;
 
   const TYPE_LABEL = {
     username: "Username", email: "Email", domain: "Domain", ip: "IP address",
@@ -58,6 +61,49 @@
 
   function boolStr(v) {
     return v === true ? "yes" : v === false ? "no" : "";
+  }
+
+  // -- pivot chips: turn a discovered entity Nucleus can itself scan into a
+  // "run it here" affordance instead of a dead end out to an external site.
+  // Every chip just carries the value/type in data-* attrs; the click is
+  // handled by one delegated listener on #results (see launchPivot below).
+  function pivotChip(value, type) {
+    if (!value) return "";
+    return `<button type="button" class="pivot-chip" data-pivot-value="${esc(value)}" data-pivot-type="${esc(type)}">⇢ scan</button>`;
+  }
+
+  function pivotRow(value, type) {
+    return `<div class="pivot-row"><span class="pivot-val">${esc(value)}</span>${pivotChip(value, type)}</div>`;
+  }
+
+  function pivotValue(value, type) {
+    return `<span class="pivot-inline">${esc(value)}${pivotChip(value, type)}</span>`;
+  }
+
+  function pivotArrayList(items, type) {
+    if (!items || !items.length) return "";
+    return items.map(v => pivotRow(v, type)).join("");
+  }
+
+  function pivotList(items, type) {
+    if (!items || !items.length) return '<p class="faint">none</p>';
+    return `<div class="subdomain-list">${items.map(i => pivotRow(i, type)).join("")}</div>`;
+  }
+
+  // MX answers come back "<preference> <exchange>." e.g. "10 mail.example.com." --
+  // pivot on the exchange hostname, not the whole record.
+  function mxHostname(entry) {
+    const parts = String(entry || "").trim().split(/\s+/);
+    const host = parts.length > 1 ? parts[parts.length - 1] : (parts[0] || "");
+    return host.replace(/\.$/, "");
+  }
+
+  function pivotMxList(mx) {
+    if (!mx || !mx.length) return "";
+    return mx.map(entry => {
+      const host = mxHostname(entry);
+      return `<div class="pivot-row"><span class="pivot-val">${esc(entry)}</span>${host ? pivotChip(host, "domain") : ""}</div>`;
+    }).join("");
   }
 
   // -- keyed-source cards: only rendered when the module actually ran the
@@ -124,8 +170,11 @@
         ${pill("ok", `${m.found_count} found`)}
         ${pill("bad", `${m.not_found_count} not found`)}
         ${pill("warn", `${m.unknown_count} unknown`)}
-        <span class="faint">checked ${m.checked} sites in ${m.took_ms}ms</span>
+        <span class="faint">checked ${m.checked}${m.total_available ? ` of ${m.total_available}` : ""} sites in ${m.took_ms}ms${m.dataset ? ` · ${esc(m.dataset)}` : ""}</span>
       </div>`;
+    const sampleNote = (m.total_available && m.checked < m.total_available)
+      ? `<p class="faint mt small">Sample within the time budget — ${m.total_available - m.checked} more sites weren't checked. Re-run to cover more.</p>`
+      : "";
     let githubCard = "";
     if (m.github) {
       githubCard = card("GitHub profile", kv([
@@ -134,7 +183,7 @@
         ["Created", m.github.created_at], ["Blog", m.github.blog], ["Location", m.github.location],
       ]));
     }
-    return card("Username", summary + `<div class="site-grid">${sites}</div>`) + githubCard;
+    return card("Username", summary + `<div class="site-grid">${sites}</div>` + sampleNote) + githubCard;
   }
 
   function renderEmail(m) {
@@ -143,6 +192,7 @@
     const gv = m.gravatar || {};
     const k = m.keyed || {};
     const summary = kv([
+      ["Domain", m.domain ? raw(pivotValue(m.domain, "domain")) : ""],
       ["Breached", bc.ok ? (bc.breached ? `yes — ${bc.breaches.length} breach(es)` : "no known exposure") : "check failed"],
       ["Risk", an.risk_label ? `${an.risk_label} (${an.risk_score})` : "n/a"],
       ["Gravatar", gv.checked ? (gv.exists ? "profile exists" : "no profile") : "check failed"],
@@ -195,9 +245,9 @@
     const k = m.keyed || {};
     const dns = m.dns || {};
     const dnsHtml = kv([
-      ["A", (dns.A || []).join(", ")],
-      ["AAAA", (dns.AAAA || []).join(", ")],
-      ["MX", (dns.MX || []).join(", ")],
+      ["A", (dns.A || []).length ? raw(pivotArrayList(dns.A, "ip")) : ""],
+      ["AAAA", (dns.AAAA || []).length ? raw(pivotArrayList(dns.AAAA, "ip")) : ""],
+      ["MX", (dns.MX || []).length ? raw(pivotMxList(dns.MX)) : ""],
       ["NS", (dns.NS || []).join(", ")],
       ["CNAME", (dns.CNAME || []).join(", ")],
       ["TXT", raw((dns.TXT || []).map(esc).join("<br>"))],
@@ -243,7 +293,7 @@
       ? `, SecurityTrails: ${stSrc.count || 0}${stSrc.error ? ` (${esc(stSrc.error)})` : ""}` : "";
     const subsHtml = (subs.names || []).length
       ? `<p class="faint mb">${subs.count} unique name(s) — crt.sh: ${crtSrc.count || 0}${crtSrc.error ? ` (${esc(crtSrc.error)})` : ""}, `
-        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${list(subs.names)}`
+        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${pivotList(subs.names, "domain")}`
       : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}${stPart}</p>`;
 
     const us = m.urlscan || {};
@@ -271,7 +321,7 @@
 
     const h = m.hosting || {};
     const hostingHtml = kv([
-      ["IP", h.ip],
+      ["IP", h.ip ? raw(pivotValue(h.ip, "ip")) : ""],
       ["Open ports", (h.ports || []).join(", ")],
       ["CVEs", (h.cves || []).join(", ")],
       ["Tags", (h.tags || []).join(", ")],
@@ -317,7 +367,7 @@
       ? kv([
           ["Open ports", (idb.ports || []).join(", ") || "none"],
           ["CVEs", (idb.cves || []).join(", ") || "none"],
-          ["Hostnames", (idb.hostnames || []).join(", ")],
+          ["Hostnames", (idb.hostnames || []).length ? raw(pivotArrayList(idb.hostnames, "domain")) : ""],
           ["Tags", (idb.tags || []).join(", ")],
         ]) + renderUnlock(m.unlock)
       : `<p class="faint">${esc(idb.error || "unavailable")}</p>` + renderUnlock(m.unlock);
@@ -329,7 +379,9 @@
       : '<p class="faint">unavailable</p>';
 
     const rdns = m.reverse_dns || {};
-    const rdnsHtml = rdns.ok ? kv([["Hostname", rdns.hostname]]) : `<p class="faint">${esc(rdns.error || "no PTR record")}</p>`;
+    const rdnsHtml = rdns.ok
+      ? kv([["Hostname", rdns.hostname ? raw(pivotValue(rdns.hostname, "domain")) : ""]])
+      : `<p class="faint">${esc(rdns.error || "no PTR record")}</p>`;
 
     const rdap = m.rdap || {};
     const rdapHtml = rdap.ok
@@ -602,6 +654,64 @@
     if (scanTicker) { clearInterval(scanTicker); scanTicker = null; }
   }
 
+  // -- pivot trail: an in-session breadcrumb of the scans chained together
+  // in this investigation. Purely client-side (no server round-trip to show
+  // lineage); clicking back into a crumb truncates the trail there and
+  // re-runs that scan for real. -----------------------------------------
+  function renderTrail() {
+    if (!trailEl) return;
+    if (!pivotTrail.length) { trailEl.classList.add("hidden"); trailEl.innerHTML = ""; return; }
+    trailEl.classList.remove("hidden");
+    trailEl.innerHTML = pivotTrail.map((t, i) => {
+      const isLast = i === pivotTrail.length - 1;
+      const sep = i === 0 ? "" : '<span class="trail-sep">›</span>';
+      const cls = "trail-crumb" + (isLast ? " current" : "");
+      return `${sep}<button type="button" class="${cls}" data-trail-index="${i}"${isLast ? " disabled" : ""}>${esc(t.value)}</button>`;
+    }).join("");
+  }
+
+  function pushTrail(value, type) {
+    const last = pivotTrail[pivotTrail.length - 1];
+    if (last && last.value === value && last.type === type) { renderTrail(); return; }
+    pivotTrail.push({ value, type });
+    if (pivotTrail.length > MAX_TRAIL) pivotTrail.splice(0, pivotTrail.length - MAX_TRAIL);
+    renderTrail();
+  }
+
+  function goToTrail(i) {
+    const entry = pivotTrail[i];
+    if (!entry) return;
+    pivotTrail = pivotTrail.slice(0, i + 1);
+    launchPivot(entry.value, entry.type);
+  }
+
+  if (trailEl) trailEl.addEventListener("click", (e) => {
+    const btn = e.target.closest(".trail-crumb");
+    if (!btn || btn.disabled) return;
+    const i = Number(btn.dataset.trailIndex);
+    if (!Number.isNaN(i)) goToTrail(i);
+  });
+
+  // -- pivot chips: fill the search box with the discovered value, set its
+  // type, and re-run the scan in-app. Shared by every "⇢ scan" chip and by
+  // trail crumbs. -----------------------------------------------------------
+  function launchPivot(value, type) {
+    qInput.value = value;
+    if (type && TYPE_LABEL[type]) typeSelect.value = type;
+    else typeSelect.value = "auto";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    runScan(value, type || "auto");
+  }
+
+  results.addEventListener("click", (e) => {
+    const chip = e.target.closest(".pivot-chip");
+    if (!chip) return;
+    const value = chip.dataset.pivotValue;
+    const type = chip.dataset.pivotType;
+    if (!value) return;
+    launchPivot(value, type);
+  });
+
   async function runScan(q, type) {
     scanBtn.disabled = true;
     results.innerHTML = "";
@@ -615,6 +725,7 @@
       statusLine.classList.remove("hidden");
       statusLine.textContent = `detected: ${TYPE_LABEL[data.detected_type] || data.detected_type} · ${data.took_ms}ms`;
       if (resultsToolbar) resultsToolbar.classList.remove("hidden");
+      pushTrail(q, data.detected_type || type);
       loadReconHistory();
     } catch (e) {
       stopTicker();

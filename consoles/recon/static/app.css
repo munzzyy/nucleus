@@ -77,3 +77,39 @@
 .unlock-line a { color: var(--txt-dim); }
 .unlock-line a:hover { color: var(--txt); }
 .unlock-line::before { content: "+ "; }
+
+/* -- pivot chips: turn a discovered entity into a same-app "scan it here"
+   affordance instead of a dead end. Small and ghost-styled so it sits
+   quietly inside kv rows and subdomain lists. -- */
+.pivot-chip {
+  display: inline-flex; align-items: center; flex: none;
+  padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line-2);
+  background: transparent; color: var(--txt-faint);
+  font: inherit; font-size: 11px; font-weight: 700;
+  cursor: pointer; white-space: nowrap; transition: color .12s, border-color .12s;
+}
+.pivot-chip:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+
+.pivot-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 2px 0; break-inside: avoid;
+}
+.pivot-row .pivot-val { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.pivot-inline { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* -- pivot trail: session breadcrumb of the scans chained in this
+   investigation. Last crumb marks the current scan and isn't clickable. -- */
+.pivot-trail { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12.5px; }
+.trail-crumb {
+  padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line-2);
+  background: var(--bg-2); color: var(--txt-dim); font-family: var(--mono); font-size: 12px;
+  font-weight: 600; cursor: pointer; max-width: 240px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.trail-crumb:hover:not(:disabled) { color: var(--txt); border-color: var(--accent); }
+.trail-crumb.current, .trail-crumb:disabled {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); cursor: default;
+}
+.trail-sep { color: var(--txt-faint); }
