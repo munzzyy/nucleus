@@ -7,7 +7,7 @@ Everything binds to `127.0.0.1` only. Pure stdlib Python, zero dependencies. Not
 ```
 ┌─ Nucleus hub  :8890 ─ the command center. links + live status of everything.
 ├─ Recon        :8900 ─ OSINT. paste a username / email / domain / IP / phone, get live passive recon.
-├─ Redcell      :8910 ─ the pentest kit. tool inventory + authorization-gated safe runners + command builder.
+├─ Redcell      :8910 ─ the pentest kit. safe runners + web analyzer + hash ID + one-click assessments.
 └─ Bastion      :8920 ─ opsec posture of this box + the OSINT report engine (graded domain assessments).
 ```
 
@@ -55,7 +55,15 @@ The switcher at the top of every console lights up whichever siblings it can rea
 
 **Recon (OSINT).** A rebuild of the old osint-console. Auto-detects what you paste and runs live, passive, keyless lookups: username presence across ~30 sites, email breach exposure + Gravatar + MX, full domain workup (DNS, whois, subdomains via crt.sh, SPF/DMARC, security headers, hosting/ports/CVEs), IP intel (open ports, CVEs, geo, reverse DNS, Tor relay check), and phone validation (optional API key). Anything without a live module falls back to curated pivot links and a Google-dork builder. Every outbound request goes through one SSRF-guarded fetch; DNS rides encrypted DNS-over-HTTPS.
 
-**Redcell (offensive).** A front-end over the ~80-tool pentest kit from `~/security-setup/`. It shows which tools are actually installed, runs a small set of **safe, non-destructive** checks behind a hard "I am authorized to test this target" gate (no shell, allow-listed binaries, validated targets, audit-logged), and — for the aggressive tools — builds the command for you to run yourself instead of executing it. Authorized / lab / CTF use only.
+**Redcell (offensive).** A front-end over the ~80-tool pentest kit from `~/security-setup/`. It shows which tools are actually installed, runs a small set of **safe, non-destructive** checks behind a hard "I am authorized to test this target" gate (no shell, allow-listed binaries, validated targets, audit-logged), and — for the aggressive tools — builds the command for you to run yourself instead of executing it. On top of that it now has four things that don't need any external tool:
+
+- **Website assessment playbooks** — pick a recipe ("Website quick assessment", "Domain recon", "TLS audit"), type the target once, and it runs the right tools in order and collects the findings. One click instead of remembering which five tools to run and retyping the target five times.
+- **Native web analyzer** — point it at a URL and get an instant graded read on security headers, cookie flags, CORS, and version disclosure. Pure stdlib through the same SSRF-guarded fetch recon uses, so it works even on a box where nothing else is installed.
+- **Secret / API-key leak scanner** — pulls a site's HTML, inline scripts, and its own JS bundles, and flags credentials shipped to the browser by accident: cloud keys, payment keys, source-control tokens, webhook URLs, private keys, JWTs, and high-entropy `apiKey: "..."` assignments. It separates real leaks from keys that are *meant* to be public (Stripe `pk_live_`, Firebase browser keys) so the report is signal, not noise. Only scans the site's own JS (same host / same apex), and the audit log records counts, never the secrets themselves.
+- **Hash identifier** — paste a hash, get the type, the hashcat `-m` mode, the John `--format`, and a ready-to-paste crack command. ~40 types confirmed against hashcat's example hashes; raw hex is shown as the honest ambiguous set (a 32-hex string is MD5 *or* NTLM, and it says so) instead of one confident wrong guess.
+- **Wordlist browser** — search the installed wordlists and preview any of them (first lines + total count) before you kick off a brute that runs for five minutes.
+
+Authorized / lab / CTF use only.
 
 **Bastion (defensive).** Two halves. A read-only posture dashboard that tells you whether this machine is actually hardened — kernel sysctls, auditd, encrypted Quad9 DNS, Tor, WireGuard, MAC randomization, firewall, CVE audit — and shows the exact command to fix anything that isn't. And the **OSINT report engine**: give it a domain and it produces a graded (A–F) passive security assessment with prioritized findings, rendered to Markdown and HTML.
 
@@ -69,6 +77,23 @@ The switcher at the top of every console lights up whichever siblings it can rea
 - **Read-only on the system.** Bastion inspects and reports; it never runs sudo or changes system state.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it all fits together.
+
+## OpSec — keeping a scan from leading back to you
+
+Two different things, and it's worth being clear about which is which.
+
+**What the tool does for you:**
+- **Neutral fingerprint.** Outbound requests use a normal browser `User-Agent`, not a self-identifying tool name, and the CORS probe sends a neutral `Origin`. Nothing in a request labels the traffic as this tool. Set your own with `NUCLEUS_UA="..."` per engagement (e.g. to match a UA the client expects).
+- **Exposure gate.** Every target-touching run is refused while your real IP is exposed — no VPN detected — unless the target is your own lab or you tick "scan anyway". The top bar already shows EXPOSED/protected in real time; the gate turns that warning into an actual block so you don't fire a scan from your home IP by reflex.
+
+**What the tool cannot do — and you have to handle yourself:**
+- **It does not anonymize your traffic.** A local tool can change a header and refuse to run; it can't route your packets. Your source IP is whatever your machine is using.
+- **The external scanners connect on their own.** nmap, nuclei, nikto, sqlmap, hydra, gobuster and the rest open their own sockets from your real IP regardless of anything here. The command builder and Expert mode run real binaries — same story.
+
+**To actually be covered on an engagement:**
+1. Bring up your VPN (Mullvad is what the exposure check looks for) *before* you touch a target. With it up, the gate stops blocking and everything — native tools and external binaries — rides the tunnel.
+2. For the external CLI tools specifically, if you want per-tool routing or a chain, run them through `proxychains` (or a SOCKS proxy / your VPN's kill-switch) so a VPN drop can't leak a single packet mid-scan.
+3. Use a client-agreed source IP where the scope calls for one, and keep the local audit log (`var/redcell-scans.jsonl`, which stays on your box) as your record of what ran when.
 
 ## Layout
 

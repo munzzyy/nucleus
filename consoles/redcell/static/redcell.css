@@ -10,6 +10,10 @@
 
 .build-note { border-left: 2px solid var(--redcell); padding-left: 10px; }
 
+/* opsec override — amber caution accent, set apart from the auth checkboxes */
+.opsec-line { border-left: 2px solid color-mix(in srgb, #e0a400 65%, var(--line)); padding-left: 10px; }
+.opsec-line span { color: var(--txt-dim); font-size: 13px; }
+
 .local-tool-card { display: flex; flex-direction: column; gap: 8px; }
 .local-tool-card .row2 { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .local-tool-card .path-input { display: flex; gap: 8px; margin-top: 4px; }
@@ -76,4 +80,131 @@ td.mono.small, .small.mono { font-size: 11.5px; }
 .w-140 { max-width: 140px; }
 .w-160 { max-width: 160px; }
 .w-220 { max-width: 220px; }
+.w-320 { max-width: 320px; }
 .grow-2 { flex: 2; }
+
+/* ---- extra pill severity: shared nucleus.css only ships ok/bad/warn ---- */
+.pill.low { color: var(--txt-dim); border-color: var(--line-2); background: var(--bg-2); }
+.pill.info { color: var(--txt-faint); border-color: var(--line); background: transparent; }
+.pill.critical { color: #fff; font-weight: 800; border-color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 60%, transparent); }
+
+button.ghost.small, .ghost.small { padding: 5px 10px; font-size: 12px; }
+
+/* ---- how-this-works help card (native <details>, no JS needed to toggle) ---- */
+.help-card summary {
+  cursor: pointer; font-weight: 650; font-size: 15px; color: var(--txt); list-style: none;
+  display: flex; align-items: center; gap: 8px;
+}
+.help-card summary::-webkit-details-marker { display: none; }
+.help-card summary::before {
+  content: "›"; display: inline-block; width: 14px; color: var(--txt-faint); transition: transform .15s;
+}
+.help-card[open] summary::before { transform: rotate(90deg); color: var(--accent); }
+.help-card .help-body { margin-top: 14px; color: var(--txt-dim); font-size: 13.5px; line-height: 1.6; }
+.help-card .help-body p { margin: 0 0 10px; }
+.help-card .help-body ul { margin: 0 0 10px; padding-left: 20px; }
+.help-card .help-body li { margin-bottom: 4px; }
+
+/* ---- Run tab recipe quick-start row ---- */
+#run-recipes { align-items: center; }
+.recipe-lbl { color: var(--txt-faint); font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+  font-weight: 700; flex: 0 0 auto; }
+.recipe-btn { flex: 0 0 auto; }
+
+/* ---- Web tab: playbook cards ---- */
+.playbook-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left;
+  white-space: normal; background: linear-gradient(180deg, var(--bg-1), var(--bg));
+  border: 1px solid var(--line); color: var(--txt); font-weight: 500;
+}
+.playbook-card:hover { border-color: var(--line-2); }
+.playbook-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.playbook-card-head { display: flex; align-items: center; gap: 10px; width: 100%; justify-content: space-between; }
+.playbook-card p.sub { margin: 0; }
+
+/* ---- Web tab: playbook run panel ---- */
+.playbook-panel { border-top: 1px solid var(--line); padding-top: 16px; }
+.pb-steps { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+.pb-step { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: var(--bg-1); }
+.pb-step-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pb-step-head .checkline { margin: 0; }
+.pb-status { min-width: 74px; justify-content: center; }
+.pb-step-note { margin: 6px 0 0 26px; }
+.pb-step-result { margin-top: 10px; }
+.pb-step-body { margin-top: 8px; }
+.pb-step-body .term { max-height: 320px; }
+
+/* ---- Web tab: quick analyzer grade card ---- */
+.analyze-card { margin-top: 14px; }
+.grade-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 6px; }
+.grade-badge {
+  width: 60px; height: 60px; border-radius: 14px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 30px; font-weight: 800; font-family: var(--mono); border: 2px solid var(--line-2);
+}
+.grade-badge.grade-A { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.grade-badge.grade-B { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 9%, transparent); }
+.grade-badge.grade-C { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.grade-badge.grade-D { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+.grade-badge.grade-F { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent); background: color-mix(in srgb, var(--bad) 15%, transparent); }
+.grade-meta { flex: 1 1 260px; display: flex; flex-direction: column; gap: 2px; }
+.grade-score { font-weight: 700; font-size: 15px; }
+.grade-counts { display: flex; gap: 6px; flex: 0 0 auto; }
+.findings-list { display: flex; flex-direction: column; gap: 8px; }
+.finding-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.finding-row:last-child { border-bottom: none; }
+.finding-row .pill { flex: none; margin-top: 1px; }
+.finding-title { font-weight: 600; font-size: 13.5px; }
+.disclosure-list { display: flex; flex-direction: column; gap: 5px; }
+.disclosure-row { font-size: 13px; }
+
+/* ---- Password tab: hash identifier ---- */
+.hash-candidates { display: flex; flex-direction: column; gap: 10px; }
+.hash-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--bg-1); }
+.hash-card.top { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.hash-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cmd-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.cmd-line { display: flex; align-items: center; gap: 8px; background: #060a0f; border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; }
+.cmd-line code { flex: 1; overflow-x: auto; white-space: pre; color: #b8c4d4; }
+
+/* ---- Password tab: wordlist browser ---- */
+.wl-browser { display: flex; gap: 16px; flex-wrap: wrap; }
+.wl-results { flex: 1 1 260px; max-height: 380px; overflow-y: auto; overflow-x: hidden;
+  border: 1px solid var(--line); border-radius: 8px; }
+.wl-row {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: none; border-radius: 0; border-bottom: 1px solid var(--line);
+  color: var(--txt-dim); padding: 9px 12px; font-weight: 500;
+}
+.wl-row:last-child { border-bottom: none; }
+.wl-row:hover { background: var(--bg-2); color: var(--txt); }
+.wl-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--txt); }
+/* min-width:0 lets this flex item shrink below its unbroken-text intrinsic width;
+   truncate with an ellipsis instead of wrapping — a wrapped second line would sit
+   underneath the vertically-centered badge/size siblings and overlap them. */
+.wl-row .mono { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wl-row .src-badge, .wl-row .faint { flex: none; }
+.wl-preview { flex: 2 1 360px; }
+.wl-preview .term { max-height: 380px; }
+
+/* ---- Web tab: secret / API-key leak scan (flagship feature) ---- */
+.secret-scan-card { border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent), var(--shadow); }
+.secret-scan-card h2 { display: flex; align-items: center; gap: 10px; }
+.secret-card { margin-top: 14px; }
+.secret-headline { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  flex-wrap: wrap; margin-bottom: 8px; }
+.secret-headline > .pill:first-child { font-size: 14px; padding: 7px 14px; }
+.secret-findings { display: flex; flex-direction: column; gap: 10px; }
+.secret-findings-public { opacity: .74; }
+.secret-finding { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: var(--bg-1); }
+.secret-finding.public-ok { border-style: dashed; }
+.secret-finding-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 2px; }
+.secret-snippet { margin: 6px 0; max-height: 120px; font-size: 11.5px; }
+.secret-value-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.secret-value-row code { background: #060a0f; border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 9px; word-break: break-all; }
+.secret-footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-top: 10px; margin-top: 4px; border-top: 1px solid var(--line); }

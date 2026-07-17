@@ -631,6 +631,38 @@ def _resolve_options(spec: RunnerSpec, body: dict) -> tuple[Optional[dict], Opti
     return resolved, None
 
 
+# --------------------------------------------------------------------------
+# OpSec gate — don't let an authorized run leave the box while the real IP is
+# exposed. This is the "nothing comes back to me" safety: it turns the passive
+# EXPOSED banner into an actual refusal, enforcing VPN-on discipline. It does
+# NOT anonymize traffic (only a VPN/Tor/proxy can) — it just refuses to be the
+# thing that fires a scan from your real IP by accident.
+#
+# Applies to every target-touching action (runners, expert, web-analyze,
+# secret-scan). Skipped for lab/local targets (no external exposure) and
+# overridable per request with proceed_exposed:true for the times you know
+# you're clear (or the anonymity oracles are simply unreachable). Reads the
+# process-wide opsec cache (~25s TTL, kept warm by the UI's opsec poll), so on
+# the hot path it's a dict read, not a network round-trip.
+# --------------------------------------------------------------------------
+def opsec_gate(lab: bool, body: dict) -> Optional["common.Response"]:
+    if lab or body.get("proceed_exposed") is True:
+        return None
+    try:
+        status = common.opsec_status()
+    except Exception:
+        return None  # a broken opsec check must never be why authorized work is blocked
+    if not status.get("exposed"):
+        return None
+    ip = status.get("public_ip") or "?"
+    reason = status.get("reason") or "no VPN detected"
+    return common.Response.json({
+        "error": (f"OPSEC BLOCK — you're exposed ({reason}). Your real IP {ip} would reach the "
+                  "target. Turn on your VPN (Mullvad), or enable 'scan anyway' to override."),
+        "status": 403, "opsec_block": True, "public_ip": ip,
+    }, status=403)
+
+
 def handle_run(req) -> "common.Response":
     body = req.json()
     tool = str(body.get("tool") or "")
@@ -665,6 +697,10 @@ def handle_run(req) -> "common.Response":
     in_scope, reason = scope_check(scope_host, lab)
     if not in_scope:
         return common.Response.error(403, reason)
+
+    blocked = opsec_gate(lab, body)
+    if blocked is not None:
+        return blocked
 
     resolved_options, err = _resolve_options(spec, body)
     if err is not None:
@@ -870,6 +906,11 @@ def handle_expert(req) -> "common.Response":
         return common.Response.error(403, "authorization required — check the box first")
     if body.get("expert_ack") is not True:
         return common.Response.error(403, "expert mode: acknowledge you're running your own arguments on a target you're authorized to test")
+    # Expert has no lab flag (arbitrary args), so the opsec gate always applies
+    # unless proceed_exposed is set — override it when your target is local.
+    blocked = opsec_gate(False, body)
+    if blocked is not None:
+        return blocked
     tool = str(body.get("tool", "")).strip()
     args_raw = str(body.get("args", ""))
     if tool not in _expert_binaries():
@@ -934,6 +975,81 @@ def handle_wordlists(req) -> "common.Response":
     return common.Response.json({
         "results": wordlists.search(q, limit=limit),
         "total_registered": wordlists.registry_count(),
+    })
+
+
+# Bounds for the preview: enough lines to eyeball a list, a hard cap on how far
+# we'll count into a huge file (rockyou is ~14M lines / 130MB), and a per-read
+# byte window so a pathological single-huge-line file can't be buffered whole.
+_WL_PREVIEW_LINES = 40
+_WL_COUNT_CAP = 2_000_000
+_WL_LINE_MAXLEN = 512
+_WL_CHUNK = 1 << 20           # 1 MiB read window — bounds memory per iteration
+_WL_PREVIEW_BYTE_CAP = 65_536  # never buffer more than this for the preview slice
+
+
+def handle_wordlist_preview(req) -> "common.Response":
+    """GET /api/wordlist-preview?id=...  ->  first lines + a bounded line count.
+
+    Read-only, no exec. The id resolves through wordlists.resolve() — the SAME
+    allowlist + allowed-root re-validation a runner uses — so this can only ever
+    read a file already in the registry, never an arbitrary path.
+
+    Read in fixed 1 MiB byte chunks (never `for line in f`, which would buffer
+    one whole line first — a single-line 130MB file would then be read whole).
+    Memory is bounded to the chunk window plus a 64 KiB preview buffer no matter
+    how the file is shaped; line counting streams and stops at the 2M cap."""
+    wid = req.q("id", "")
+    if not wid:
+        return common.Response.error(400, "missing ?id=")
+    path = wordlists.resolve(wid)
+    if path is None:
+        return common.Response.error(400, "unknown or out-of-scope wordlist id")
+
+    preview_buf = bytearray()
+    newlines = 0
+    total_bytes = 0
+    last_byte = b""
+    capped = False
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(_WL_CHUNK)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                last_byte = chunk[-1:]
+                newlines += chunk.count(b"\n")
+                if len(preview_buf) < _WL_PREVIEW_BYTE_CAP:
+                    preview_buf += chunk[:_WL_PREVIEW_BYTE_CAP - len(preview_buf)]
+                if newlines >= _WL_COUNT_CAP:
+                    capped = True
+                    break
+    except OSError as e:
+        return common.Response.error(500, f"could not read wordlist: {e}")
+
+    # line_count ≈ newline count, +1 for a final line with no trailing newline
+    # (only meaningful when we read the whole file, i.e. not capped).
+    line_count = newlines
+    if not capped and total_bytes > 0 and last_byte != b"\n":
+        line_count += 1
+
+    parts = preview_buf.decode("utf-8", "replace").split("\n")
+    if parts and parts[-1] == "":     # drop the empty tail from a trailing newline
+        parts.pop()
+    preview = [ln.rstrip("\r")[:_WL_LINE_MAXLEN] for ln in parts[:_WL_PREVIEW_LINES]]
+
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        size = 0
+
+    return common.Response.json({
+        "id": wid,
+        "preview": preview,
+        "line_count": line_count,
+        "count_capped": capped,      # True -> real count is "line_count+"
+        "size": size,
     })
 
 

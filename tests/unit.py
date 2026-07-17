@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import json
 import os
 import socket
 import sys
@@ -36,6 +37,10 @@ from shared import apikeys
 from engine import osint_report as report
 from consoles.redcell import runners
 from consoles.redcell import wordlists
+from consoles.redcell import hashtools
+from consoles.redcell import webscan
+from consoles.redcell import playbooks
+from consoles.redcell import secretscan
 
 
 # ==========================================================================
@@ -573,6 +578,43 @@ class ResolveOptionsTests(unittest.TestCase):
         self.assertNotEqual(resolved["tags"], "cves")
 
 
+class OpsecGateTests(unittest.TestCase):
+    """The opsec gate refuses a target-touching run while the real IP is
+    exposed, unless it's a lab target or the caller overrides. This is the
+    'don't fire a scan from your real IP by accident' safety."""
+
+    def test_lab_target_never_blocked(self):
+        with mock.patch.object(runners.common, "opsec_status",
+                               return_value={"exposed": True, "public_ip": "1.2.3.4"}):
+            self.assertIsNone(runners.opsec_gate(lab=True, body={}))
+
+    def test_explicit_override_bypasses(self):
+        with mock.patch.object(runners.common, "opsec_status",
+                               return_value={"exposed": True, "public_ip": "1.2.3.4"}):
+            self.assertIsNone(runners.opsec_gate(lab=False, body={"proceed_exposed": True}))
+
+    def test_not_exposed_allows(self):
+        with mock.patch.object(runners.common, "opsec_status",
+                               return_value={"exposed": False}):
+            self.assertIsNone(runners.opsec_gate(lab=False, body={}))
+
+    def test_exposed_blocks_with_marker(self):
+        with mock.patch.object(runners.common, "opsec_status",
+                               return_value={"exposed": True, "public_ip": "24.197.212.75",
+                                             "reason": "no VPN detected"}):
+            resp = runners.opsec_gate(lab=False, body={})
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 403)
+        payload = json.loads(resp.body)
+        self.assertTrue(payload["opsec_block"])
+        self.assertIn("24.197.212.75", payload["error"])
+
+    def test_opsec_check_error_does_not_hard_block(self):
+        # A broken anonymity check must not be why authorized work is refused.
+        with mock.patch.object(runners.common, "opsec_status", side_effect=RuntimeError("boom")):
+            self.assertIsNone(runners.opsec_gate(lab=False, body={}))
+
+
 class ExpertDenyListTests(unittest.TestCase):
     """Shell-equivalent binaries must never be reachable through Expert mode's
     arbitrary-argument runner, even though they may legitimately sit in the
@@ -814,6 +856,448 @@ class TlsCertRebindTests(unittest.TestCase):
             out = report._tls_cert("rebind.evil")
         self.assertFalse(out.get("ok"))
         self.assertEqual(called["n"], 0)  # never opened a socket
+
+
+# ==========================================================================
+# 9. consoles/redcell/hashtools.py — hash identification (labeled corpus)
+# ==========================================================================
+class HashIdentifyCorpusTests(unittest.TestCase):
+    """A labeled corpus is the only honest test of an identifier: each real
+    hash must surface its true type (as the top candidate for structured
+    hashes, or somewhere in the ambiguous set for raw hex), with the RIGHT
+    hashcat mode — a wrong -m sends a pentester off cracking with the wrong
+    algorithm. Every case here is a real, validly-shaped hash of its type."""
+
+    # (hash, expected-type-substring, expected hashcat mode among candidates)
+    STRUCTURED = [
+        ("$2a$05$LhayLxezLhK1LhWvKxCyLOj0j1u.Kj0jZ0pEmm134uzrQlFvQJLF6", "bcrypt", 3200),
+        ("$6$52450745$k5ka2p8bFuSmoVT1tzOyyuaREkkKBcCNqoDKzYiJL9RaE8yMnPgh2XzzF0NDrUhgrcLwg78xs1w5pJiypEdFX/", "sha512crypt", 1800),
+        ("$5$rounds=5000$GX7BopJZJxPc/KEK$le16UF8I2Anb.rOrn22AUPWvzUETDGefUmAV8AZkGcD", "sha256crypt", 7400),
+        ("$1$28772684$iEwNOgGugqO9.bIz5sk8k/", "md5crypt", 500),
+        ("$P$984478476IagS59wHZvyQMArzfx58u.", "phpass", 400),
+        ("$apr1$71850310$gh9m4xcAn3MGxogwX/ztb.", "apr1", 1600),
+        ("*E6CC90B878B948C35E92B003C792C46C58C4AF40", "MySQL 4.1", 300),
+        ("{SSHA}uFT2G5401Kk6MImUYtG4Ynf5R6E6Z0Zw", "SSHA", 111),
+        ("aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", "NTLM", 1000),
+        ("admin::N46iSNekpT:08ca45b7d7ea58ee:88dcbe4446168966a153a0064958dac6:0101000000000000", "NetNTLMv2", 5600),
+        ("u4-netntlm::kNS:338d08f8e26de93300000000000000000000000000000000:9526fb8c23a90751cdd619b6cea564742e1e4bf33006ba41:cb8086049ec4736c", "NetNTLMv1", 5500),
+        ("$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$abcdefghijk", "Argon2", None),
+    ]
+
+    def test_structured_hashes_identify_as_top_candidate(self):
+        for h, name_sub, _mode in self.STRUCTURED:
+            with self.subTest(hash=h[:24]):
+                cands = hashtools.identify(h)
+                self.assertTrue(cands, f"no candidates for {name_sub}")
+                self.assertIn(name_sub.lower(), cands[0]["name"].lower())
+
+    def test_structured_hashes_carry_correct_hashcat_mode(self):
+        for h, name_sub, mode in self.STRUCTURED:
+            with self.subTest(hash=h[:24]):
+                cands = hashtools.identify(h)
+                self.assertEqual(cands[0]["hashcat"], mode)
+
+    def test_raw_md5_is_ambiguous_and_lists_ntlm(self):
+        # A bare 32-hex is genuinely MD5 *or* NTLM (and more). The identifier
+        # must return the whole ambiguous set, not a single confident guess.
+        cands = hashtools.identify("b4b9b02e6f09a9bd760f388b67351e2b")
+        names = " ".join(c["name"] for c in cands)
+        self.assertGreater(len(cands), 1)
+        self.assertIn("MD5", names)
+        self.assertIn("NTLM", names)
+        self.assertTrue(all(c["ambiguous"] for c in cands))
+
+    def test_raw_sha256_top_candidate_is_sha256(self):
+        cands = hashtools.identify("127e6fbfe24a750e72930c220a8e138275656b8e5d8f48a98c3c92df2caba935")
+        self.assertIn("SHA-256", cands[0]["name"])
+        self.assertEqual(cands[0]["hashcat"], 1400)
+
+    def test_every_catalog_example_self_identifies(self):
+        # An example that doesn't match its own pattern is a broken catalog
+        # entry — it would mislead anyone who pastes it to see the shape.
+        for _pat, ht in hashtools._STRUCTURED:
+            if not ht.example:
+                continue
+            with self.subTest(type=ht.name):
+                names = [c["name"] for c in hashtools.identify(ht.example)]
+                self.assertIn(ht.name, names)
+
+    def test_garbage_and_empty_return_no_candidates(self):
+        for junk in ("", "   ", "not a hash at all!!", "xyz"):
+            with self.subTest(junk=junk):
+                self.assertEqual(hashtools.identify(junk), [])
+
+    def test_oversized_input_rejected(self):
+        self.assertEqual(hashtools.identify("a" * 9000), [])
+
+    def test_crack_commands_wire_mode_and_format(self):
+        cmds = hashtools.crack_commands(1000, "nt", attack="wordlist")
+        self.assertIn("-m 1000", cmds["hashcat"])
+        self.assertIn("--format=nt", cmds["john"])
+        bf = hashtools.crack_commands(0, "raw-md5", attack="bruteforce")
+        self.assertIn("-a 3", bf["hashcat"])
+
+    def test_crack_commands_none_mode_yields_no_hashcat(self):
+        # Argon2/yescrypt have no hashcat mode — must not fabricate one.
+        cmds = hashtools.crack_commands(None, "argon2")
+        self.assertIsNone(cmds["hashcat"])
+        self.assertIsNotNone(cmds["john"])
+
+
+# ==========================================================================
+# 10. consoles/redcell/webscan.py — grading + header/cookie/CORS logic
+# ==========================================================================
+class WebScanGradeTests(unittest.TestCase):
+
+    def test_grade_boundaries(self):
+        self.assertEqual(webscan._grade(90, 100)[0], "A")
+        self.assertEqual(webscan._grade(80, 100)[0], "B")
+        self.assertEqual(webscan._grade(65, 100)[0], "C")
+        self.assertEqual(webscan._grade(50, 100)[0], "D")
+        self.assertEqual(webscan._grade(49, 100)[0], "F")
+
+    def test_grade_zero_max_no_divide_by_zero(self):
+        letter, pct = webscan._grade(0, 0)
+        self.assertEqual(letter, "F")
+        self.assertEqual(pct, 0.0)
+
+    def test_missing_hsts_is_high_finding(self):
+        pts, mx, findings = webscan._check_hsts(None)
+        self.assertEqual(pts, 0)
+        self.assertTrue(any(f["severity"] == "high" for f in findings))
+
+    def test_strong_hsts_scores_full_no_findings(self):
+        pts, mx, findings = webscan._check_hsts("max-age=31536000; includeSubDomains; preload")
+        self.assertEqual(pts, mx)
+        self.assertEqual(findings, [])
+
+    def test_csp_unsafe_inline_flagged(self):
+        pts, mx, findings = webscan._check_csp("default-src 'self' 'unsafe-inline'")
+        self.assertLess(pts, mx)
+        self.assertTrue(any("unsafe-inline" in f["title"].lower() or "unsafe-inline" in f["detail"].lower()
+                            for f in findings))
+
+
+class WebScanCookieTests(unittest.TestCase):
+    """The Set-Cookie splitter must survive the Expires=...GMT comma that sits
+    INSIDE one cookie without treating it as a cookie boundary — the classic
+    bug in naive comma-splitting of a collapsed Set-Cookie header."""
+
+    def test_splits_two_cookies_not_on_expires_comma(self):
+        raw = ("session=abc; Path=/; Expires=Wed, 09 Jun 2021 10:18:14 GMT; Secure; HttpOnly, "
+               "token=xyz; SameSite=Strict")
+        cookies, findings = webscan._analyze_cookies(raw)
+        names = [c["name"] for c in cookies]
+        self.assertEqual(names, ["session", "token"])
+
+    def test_flags_detected_correctly(self):
+        raw = "session=abc; Secure; HttpOnly, token=xyz; SameSite=Strict"
+        cookies, _ = webscan._analyze_cookies(raw)
+        by = {c["name"]: c for c in cookies}
+        self.assertTrue(by["session"]["secure"])
+        self.assertTrue(by["session"]["httponly"])
+        self.assertEqual(by["session"]["samesite"], "(none)")
+        self.assertFalse(by["token"]["secure"])
+        self.assertEqual(by["token"]["samesite"], "Strict")
+
+    def test_insecure_cookie_raises_medium_findings(self):
+        _cookies, findings = webscan._analyze_cookies("id=1")
+        sevs = {f["severity"] for f in findings}
+        self.assertIn("medium", sevs)  # missing Secure + HttpOnly
+
+    def test_no_cookies_no_findings(self):
+        self.assertEqual(webscan._analyze_cookies(None), ([], []))
+
+
+class WebScanAnalyzeIntegrationTests(unittest.TestCase):
+    """End-to-end analyze() with common.fetch mocked, so no network. Proves the
+    grade/findings pipeline wires together and a hostile response body can't
+    escape (title is extracted as text, never interpreted)."""
+
+    def _fake_fetch(self, status, headers, body=b""):
+        def _f(url, **kwargs):
+            return status, body, headers
+        return _f
+
+    def test_wide_open_site_grades_poorly(self):
+        headers = {"Server": "nginx/1.18.0", "Content-Type": "text/html",
+                   "Set-Cookie": "sid=1"}
+        with mock.patch.object(webscan.common, "fetch",
+                               side_effect=self._fake_fetch(200, headers, b"<title>hi</title>")):
+            r = webscan.analyze("http://example.com")
+        self.assertTrue(r["ok"])
+        self.assertIn(r["grade"], ("D", "F"))  # no security headers at all
+        self.assertTrue(any(f["severity"] == "high" for f in r["findings"]))
+        self.assertEqual(r["title"], "hi")
+        # version disclosure caught
+        self.assertTrue(any("disclosure" in f["title"].lower() for f in r["findings"]))
+
+    def test_hardened_site_grades_well(self):
+        headers = {
+            "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+            "Content-Security-Policy": "default-src 'none'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Permissions-Policy": "geolocation=()",
+            "Content-Type": "text/html",
+        }
+        with mock.patch.object(webscan.common, "fetch",
+                               side_effect=self._fake_fetch(200, headers, b"")):
+            r = webscan.analyze("https://example.com")
+        self.assertIn(r["grade"], ("A", "B"))
+
+    def test_blocked_target_returns_error_not_crash(self):
+        def _raise(url, **kw):
+            raise ValueError("host resolves to non-public address")
+        with mock.patch.object(webscan.common, "fetch", side_effect=_raise):
+            r = webscan.analyze("http://169.254.169.254/")
+        self.assertFalse(r["ok"])
+        self.assertIn("blocked", r["error"])
+
+
+# ==========================================================================
+# 11. consoles/redcell/playbooks.py — recipe integrity
+# ==========================================================================
+class PlaybookIntegrityTests(unittest.TestCase):
+    """A playbook step that names a runner not in SAFE_RUNNERS would 400 at
+    execution time and break the one-click flow — catch it at test time."""
+
+    def test_every_runner_step_references_a_real_safe_runner(self):
+        for p in playbooks.catalog():
+            for step in p["steps"]:
+                if step["kind"] == "runner":
+                    with self.subTest(playbook=p["key"], tool=step["tool"]):
+                        self.assertIn(step["tool"], runners.SAFE_RUNNERS)
+
+    def test_step_kinds_are_known(self):
+        for p in playbooks.catalog():
+            for step in p["steps"]:
+                self.assertIn(step["kind"], ("runner", "web-analyze", "secret-scan"))
+
+    def test_playbook_keys_unique(self):
+        keys = [p["key"] for p in playbooks.catalog()]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_every_playbook_has_target_kind(self):
+        for p in playbooks.catalog():
+            self.assertIn(p["target_kind"], ("url", "host"))
+
+    def test_wordlist_steps_marked(self):
+        # A step needing a wordlist must say so, else the executor won't pass one.
+        for p in playbooks.catalog():
+            for step in p["steps"]:
+                if step.get("kind") == "runner" and step.get("tool") in ("ffuf", "gobuster-dir", "gobuster-dns"):
+                    with self.subTest(playbook=p["key"]):
+                        self.assertTrue(step.get("needs_wordlist"))
+
+    def test_step_kinds_include_secret_scan(self):
+        # secret-scan is a valid client-executed kind (its own endpoint).
+        for p in playbooks.catalog():
+            for step in p["steps"]:
+                self.assertIn(step["kind"], ("runner", "web-analyze", "secret-scan"))
+
+
+# ==========================================================================
+# 12. consoles/redcell/secretscan.py — API-key / secret leak detection
+# ==========================================================================
+class SecretScanCorpusTests(unittest.TestCase):
+    """Labeled corpus: each planted credential must be found under the right
+    rule AND the right severity. Getting severity wrong is as bad as missing
+    it — a report that screams about a public Stripe key and buries the live
+    secret key is worse than useless."""
+
+    CASES = [
+        ("AWS Access Key ID", 'const k="AKIAIOSFODNN7EXAMPLE";', "critical", False),
+        ("GitHub token", 'token: "ghp_' + "a" * 36 + '"', "critical", False),
+        ("GitLab personal access token", 'x = "glpat-' + "a" * 20 + '"', "critical", False),
+        ("Stripe secret key (LIVE)", 'stripe="sk_live_' + "a" * 24 + '"', "critical", False),
+        ("Stripe publishable key (LIVE)", 'pub="pk_live_' + "b" * 24 + '"', "info", True),
+        ("Slack token", 'x="xoxb-123456789012-abcdefghijkl"', "high", False),
+        ("Google API key", 'key:"AIza' + "C" * 35 + '"', "medium", True),
+        ("Private key block", '-----BEGIN RSA PRIVATE KEY-----', "critical", False),
+        ("SendGrid API key", 'SG.' + "a" * 22 + '.' + "b" * 43, "critical", False),
+        ("Anthropic API key", 'k="sk-ant-' + "x" * 30 + '"', "critical", False),
+        ("Basic-auth credentials in URL", 'fetch("https://user:s3cretpass@api.example.com/x")', "high", False),
+    ]
+
+    def test_every_planted_secret_is_found(self):
+        for rule, text, _sev, _pub in self.CASES:
+            with self.subTest(rule=rule):
+                names = [f["rule"] for f in secretscan.scan_text(text, "t")]
+                self.assertIn(rule, names)
+
+    def test_severity_and_public_flag_correct(self):
+        for rule, text, sev, pub in self.CASES:
+            with self.subTest(rule=rule):
+                f = next(f for f in secretscan.scan_text(text, "t") if f["rule"] == rule)
+                self.assertEqual(f["severity"], sev)
+                self.assertEqual(f["public_ok"], pub)
+
+    def test_generic_placeholder_is_suppressed(self):
+        for placeholder in ('apiKey: "your_api_key_here"', 'secret = "changeme12345678"',
+                            'token: "xxxxxxxxxxxxxxxx"'):
+            with self.subTest(v=placeholder):
+                fs = [f for f in secretscan.scan_text(placeholder, "t") if "assignment" in f["rule"]]
+                self.assertEqual(fs, [])
+
+    def test_generic_high_entropy_secret_is_caught(self):
+        fs = [f for f in secretscan.scan_text('apiKey: "a8Fk2Lp9Qz3Xr7Vn1Bm4Cw6"', "t")
+              if "assignment" in f["rule"]]
+        self.assertTrue(fs)
+
+    def test_masked_never_contains_full_secret(self):
+        secret = "ghp_" + "a" * 36
+        f = secretscan.scan_text(f'x="{secret}"', "t")[0]
+        self.assertNotIn(secret, f["masked"])
+        self.assertEqual(f["match"], secret)  # full value still available to the report
+
+    def test_entropy_of_random_higher_than_word(self):
+        self.assertGreater(secretscan._entropy("a8Fk2Lp9Qz3Xr7Vn1Bm4Cw6"),
+                           secretscan._entropy("passwordpassword"))
+
+    def test_clean_page_has_no_findings(self):
+        self.assertEqual(secretscan.scan_text("<html><body>hello world</body></html>", "t"), [])
+
+
+class SecretScanScopeTests(unittest.TestCase):
+    """The JS harvester must stay on the target's own site — a scan of site X
+    must not go fetch site Y's bundles."""
+
+    def test_same_host_is_same_site(self):
+        self.assertTrue(secretscan._same_site("app.example.com", "app.example.com"))
+
+    def test_subdomain_of_apex_is_same_site(self):
+        self.assertTrue(secretscan._same_site("cdn.example.com", "www.example.com"))
+        self.assertTrue(secretscan._same_site("example.com", "www.example.com"))
+
+    def test_third_party_is_not_same_site(self):
+        self.assertFalse(secretscan._same_site("cdn.jsdelivr.net", "www.example.com"))
+        self.assertFalse(secretscan._same_site("evil.com", "example.com"))
+
+    def test_relative_url_treated_as_same_site(self):
+        self.assertTrue(secretscan._same_site("", "example.com"))
+
+    def test_cross_origin_scripts_skipped_not_fetched(self):
+        html = (b'<script src="https://cdn.jsdelivr.net/x.js"></script>'
+                b'<script src="/app.js"></script>')
+        urls, skipped = secretscan._collect_script_urls(html, "https://example.com/", "example.com")
+        self.assertEqual(skipped, 1)
+        self.assertEqual(urls, ["https://example.com/app.js"])
+
+
+class SecretScanAnalyzeIntegrationTests(unittest.TestCase):
+    """analyze() with fetch mocked: a secret in the HTML and one in a same-site
+    JS bundle must both surface, and a cross-origin script must not be fetched."""
+
+    def test_finds_secrets_in_html_and_same_site_js(self):
+        page = (b'<html><script src="/bundle.js"></script>'
+                b'<script src="https://cdn.jsdelivr.net/lib.js"></script>'
+                b'<script>var t="ghp_' + b"a" * 36 + b'";</script></html>')
+        js = 'const stripe = "sk_live_' + "z" * 24 + '";'
+
+        def fake_fetch(url, **kwargs):
+            if url == "https://example.com/":
+                return 200, page, {}
+            if url == "https://example.com/bundle.js":
+                return 200, js.encode(), {}
+            raise AssertionError(f"should not fetch cross-origin: {url}")
+
+        with mock.patch.object(secretscan.common, "fetch", side_effect=fake_fetch):
+            r = secretscan.analyze("https://example.com/")
+        self.assertTrue(r["ok"])
+        rules = {f["rule"] for f in r["findings"]}
+        self.assertIn("GitHub token", rules)          # from inline HTML script
+        self.assertIn("Stripe secret key (LIVE)", rules)  # from same-site JS
+        self.assertEqual(r["scripts_skipped_cross_origin"], 1)
+        self.assertGreaterEqual(r["real_leak_count"], 2)
+
+    def test_blocked_target_returns_error_not_crash(self):
+        with mock.patch.object(secretscan.common, "fetch",
+                               side_effect=ValueError("non-public address")):
+            r = secretscan.analyze("http://169.254.169.254/")
+        self.assertFalse(r["ok"])
+        self.assertIn("blocked", r["error"])
+
+    def test_total_scan_budget_caps_work_on_huge_target(self):
+        # A page linking many large same-site scripts must stop SCANNING once
+        # the byte budget is hit — bounds worst-case CPU regardless of target.
+        n_scripts = (secretscan._TOTAL_SCAN_BUDGET // 2_000_000) + 4
+        page = b"<html>" + b"".join(
+            b'<script src="/s%d.js"></script>' % i for i in range(n_scripts)) + b"</html>"
+        big_js = b"var x=1;" * 250_000  # ~2MB, no secrets
+
+        def fake_fetch(url, **kwargs):
+            return (200, page, {}) if url.endswith("/") else (200, big_js, {})
+
+        with mock.patch.object(secretscan.common, "fetch", side_effect=fake_fetch):
+            r = secretscan.analyze("https://example.com/")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["scan_truncated"])
+        self.assertLessEqual(r["bytes_scanned"], secretscan._TOTAL_SCAN_BUDGET + 2_000_000)
+        # some scripts were fetched but explicitly marked not-scanned
+        self.assertTrue(any(s.get("fetched") and not s.get("scanned") for s in r["scripts_scanned"]))
+
+    def test_keyword_prefilter_does_not_drop_detections(self):
+        # The pre-filter is an optimization, not a behavior change — a real
+        # secret whose keyword is present must still be found.
+        fs = secretscan.scan_text('const s = "sk_live_' + "a" * 30 + '";', "t")
+        self.assertTrue(any(f["rule"] == "Stripe secret key (LIVE)" for f in fs))
+
+    def test_inline_script_extraction_is_linear_on_unclosed_tags(self):
+        # Regression: a `.*?</script>` regex over a page full of UNCLOSED
+        # <script> tags backtracks O(n^2) (a multi-minute stall). The linear
+        # find-scan must finish a 2MB pathological page effectively instantly.
+        import time
+        pathological = b"<script>" * 250_000  # ~2MB, no closing tags
+        t0 = time.monotonic()
+        out = secretscan._iter_inline_scripts(pathological)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.0, f"inline extraction took {elapsed:.1f}s — O(n^2) regression")
+        self.assertLessEqual(len(out), secretscan._MAX_INLINE_SCRIPTS)
+
+    def test_inline_extraction_finds_inline_skips_external(self):
+        page = (b'<script>var a="ghp_' + b"a" * 36 + b'";</script>'
+                b'<script src="/x.js">this is not inline body</script>')
+        out = secretscan._iter_inline_scripts(page)
+        self.assertEqual(len(out), 1)           # the src= script is skipped
+        self.assertIn(b"ghp_", out[0])
+
+    def test_secret_scan_audit_strips_query_string(self):
+        # A querystring can itself carry a secret (?api_key=...); the audit log
+        # must record scheme/host/path only, never the query.
+        captured = {}
+        page = b'<html><script>var k="AKIAIOSFODNN7EXAMPLE";</script></html>'
+
+        def fake_fetch(url, **kwargs):
+            return 200, page, {}
+
+        class Req:
+            def json(self):
+                return {"url": "https://example.com/app?api_key=supersecret123456",
+                        "authorized": True, "proceed_exposed": True}  # skip the opsec gate in this test
+
+        with mock.patch.object(secretscan.common, "fetch", side_effect=fake_fetch), \
+             mock.patch.object(secretscan.runners, "_resolve_public_ips_safe", return_value=["93.184.216.34"]), \
+             mock.patch.object(secretscan.common, "host_is_public", return_value=True), \
+             mock.patch.object(secretscan.runners, "_append_audit",
+                               side_effect=lambda e: captured.update(e)):
+            secretscan.handle_secret_scan(Req())
+        self.assertIn("target", captured)
+        self.assertNotIn("?", captured["target"])
+        self.assertNotIn("supersecret", captured["target"])
+        self.assertEqual(captured["target"], "https://example.com/app")
+
+
+class WebScanTitleTests(unittest.TestCase):
+    def test_title_extraction_linear_on_unclosed_tags(self):
+        import time
+        t0 = time.monotonic()
+        webscan._extract_title(b"<title>" * 300_000)  # ~2MB unclosed
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_title_extracted_normally(self):
+        self.assertEqual(webscan._extract_title(b"<html><title>Hi There</title></html>"), "Hi There")
 
 
 if __name__ == "__main__":

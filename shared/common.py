@@ -250,7 +250,15 @@ def host_is_public(hostname: str) -> bool:
 # --------------------------------------------------------------------------
 # Outbound fetch (SSRF-guarded) — recon's only door to the internet
 # --------------------------------------------------------------------------
-_UA = "nucleus-recon/1.0 (+local osint console)"
+# Outbound User-Agent. Defaults to a common browser string, NOT a self-identifying
+# "nucleus-recon" tool name — during an authorized engagement you don't want your
+# scan traffic labelled with your personal tooling in the target's logs. Override
+# per-engagement with NUCLEUS_UA (e.g. to match the client's expected UA, or a
+# current browser build). This only changes a request header; it does not, and
+# cannot, hide your source IP — see the OpSec notes in the README.
+_UA = os.environ.get("NUCLEUS_UA") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
 _MAX_REDIRECTS = 5
 
 

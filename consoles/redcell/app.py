@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import common
-from consoles.redcell import runners, inventory, builder
+from consoles.redcell import runners, inventory, builder, hashtools, webscan, playbooks, secretscan
 
 ROUTES = {
     "GET /api/inventory": inventory.handle_inventory,
@@ -12,12 +12,18 @@ ROUTES = {
     "POST /api/run": runners.handle_run,
     "GET /api/history": runners.handle_history,
     "GET /api/wordlists": runners.handle_wordlists,
+    "GET /api/wordlist-preview": runners.handle_wordlist_preview,
     "GET /api/outputs": runners.handle_outputs,
     "GET /api/output-file": runners.handle_output_file,
     "POST /api/build": builder.handle_build,
     "POST /api/local-tool": runners.handle_local_tool,
     "GET /api/expert-tools": runners.handle_expert_tools,
     "POST /api/expert": runners.handle_expert,
+    # ---- new: password cracking, native web analysis, assessment playbooks ----
+    "POST /api/hash-id": hashtools.handle_hash_id,
+    "POST /api/web-analyze": webscan.handle_web_analyze,
+    "POST /api/secret-scan": secretscan.handle_secret_scan,
+    "GET /api/playbooks": playbooks.handle_playbooks,
 }
 
 

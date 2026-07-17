@@ -10,6 +10,8 @@ import importlib
 import json
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -140,6 +142,63 @@ def main():
         st, j = jget(port, "/api/run", method="POST",
                      body={"tool": "nmap", "target": "x; rm -rf /", "authorized": True})
         check("redcell refuses injection target", st != 200 or (isinstance(j, dict) and j.get("error")), str(j)[:120])
+
+        # ---- new: hash identifier (pure offline, no gate) ----
+        st, j = jget(port, "/api/hash-id", method="POST",
+                     body={"hash": "5f4dcc3b5aa765d61d8327deb882cf99"})
+        top = (j.get("candidates") or [{}])[0] if isinstance(j, dict) else {}
+        check("redcell hash-id identifies md5", st == 200 and top.get("hashcat") == 0, str(j)[:120])
+        check("redcell hash-id builds crack command",
+              isinstance(top.get("commands"), dict) and bool(top["commands"].get("hashcat")), str(top)[:120])
+        # NTLM must appear in the ambiguous set for a bare 32-hex
+        st, j = jget(port, "/api/hash-id", method="POST",
+                     body={"hash": "b4b9b02e6f09a9bd760f388b67351e2b"})
+        names = " ".join(c.get("name", "") for c in (j.get("candidates") or [])) if isinstance(j, dict) else ""
+        check("redcell hash-id shows NTLM ambiguity", "NTLM" in names and "MD5" in names, names[:120])
+        # hash-id is a mutating POST route -> must still enforce the CSRF Origin check
+        noorigin = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/hash-id", method="POST", data=b'{"hash":"x"}',
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(noorigin, timeout=5) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("redcell hash-id POST without Origin refused", code == 403, f"got {code}")
+
+        # ---- new: assessment playbooks (catalog only; steps are client-run) ----
+        st, j = jget(port, "/api/playbooks")
+        pbs = j.get("playbooks") if isinstance(j, dict) else None
+        check("redcell playbooks catalog", st == 200 and isinstance(pbs, list) and len(pbs) >= 3, str(j)[:120])
+
+        # ---- new: native web analyzer (same auth + scope gate as runners) ----
+        st, j = jget(port, "/api/web-analyze", method="POST",
+                     body={"url": "https://example.com"})  # no authorized flag
+        check("redcell web-analyze refuses without authorization", st == 403, f"got {st}")
+        st, j = jget(port, "/api/web-analyze", method="POST",
+                     body={"url": "http://127.0.0.1/", "authorized": True})  # private, no lab
+        check("redcell web-analyze refuses loopback out of scope", st == 403, f"got {st}")
+
+        # ---- new: secret / API-key leak scanner (same gate) ----
+        st, j = jget(port, "/api/secret-scan", method="POST",
+                     body={"url": "https://example.com"})  # no authorized flag
+        check("redcell secret-scan refuses without authorization", st == 403, f"got {st}")
+        st, j = jget(port, "/api/secret-scan", method="POST",
+                     body={"url": "http://169.254.169.254/", "authorized": True})  # link-local metadata
+        check("redcell secret-scan refuses non-public target", st == 403, f"got {st}")
+
+        # ---- new: wordlist preview (read-only, registry-gated path) ----
+        st, wl = jget(port, "/api/wordlists?q=common&limit=3")
+        wid = (wl.get("results") or [{}])[0].get("id") if isinstance(wl, dict) else None
+        if wid:
+            st, j = jget(port, "/api/wordlist-preview?id=" + urllib.parse.quote(wid))
+            check("redcell wordlist-preview reads a registered list",
+                  st == 200 and isinstance(j.get("preview"), list) and j.get("line_count", 0) > 0, str(j)[:120])
+            # an unregistered / traversal id must be refused
+            st, j = jget(port, "/api/wordlist-preview?id=" + urllib.parse.quote("../../../../etc/passwd"))
+            check("redcell wordlist-preview blocks unknown/traversal id", st == 400, f"got {st}")
+        else:
+            skip("redcell wordlist-preview", "no wordlists registered on this box")
 
     # ---- bastion ----
     if "bastion" in servers:

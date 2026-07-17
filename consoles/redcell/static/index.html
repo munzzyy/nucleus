@@ -19,6 +19,10 @@
   <div class="tabbar" id="tabbar" role="tablist" aria-label="Redcell sections">
     <button type="button" class="tab-btn" id="tabbtn-run" data-tab="run"
       role="tab" aria-selected="true" aria-controls="tab-run">Run</button>
+    <button type="button" class="tab-btn" id="tabbtn-web" data-tab="web"
+      role="tab" aria-selected="false" aria-controls="tab-web" tabindex="-1">Web</button>
+    <button type="button" class="tab-btn" id="tabbtn-password" data-tab="password"
+      role="tab" aria-selected="false" aria-controls="tab-password" tabindex="-1">Password</button>
     <button type="button" class="tab-btn" id="tabbtn-arsenal" data-tab="arsenal"
       role="tab" aria-selected="false" aria-controls="tab-arsenal" tabindex="-1">Arsenal <span class="tab-count" id="tabcount-arsenal"></span></button>
     <button type="button" class="tab-btn" id="tabbtn-build" data-tab="build"
@@ -34,6 +38,25 @@
   <!-- ================= RUN (hero) ================= -->
   <div class="tab-panel" id="tab-run" role="tabpanel" aria-labelledby="tabbtn-run" tabindex="0">
 
+    <details class="card mb help-card" id="help-card">
+      <summary>How this works — start here</summary>
+      <div class="help-body">
+        <p>Every action that touches a target goes through the <b>authorization gate</b> below.
+          It's enforced server-side, not just a UI checkbox — nothing can run without it, and a
+          separate "lab" box unlocks your own private/local addresses.</p>
+        <p>Four capability areas:</p>
+        <ul>
+          <li><b>Run</b> — safe runners: fixed argv templates, your target fills exactly one slot.</li>
+          <li><b>Web</b> — one-click website assessment playbooks, plus an instant header/CORS grade.</li>
+          <li><b>Password</b> — offline hash identification and a crack-command builder with a wordlist browser.</li>
+          <li><b>Build</b> — aggressive tools (brute force, exploitation). This only assembles a command
+            string for you to run yourself — nothing executes here.</li>
+        </ul>
+        <p class="m0">Arsenal, Tools, History, and Expert round out the kit: the full tool inventory, your
+          own published CLIs, a run log, and a raw-argument mode for anything installed.</p>
+      </div>
+    </details>
+
     <div class="card mb authcard" id="authbox">
       <h2>Authorization required <span class="tag">gate</span></h2>
       <p class="sub">Every run on this page is gated server-side. Nothing executes without this box checked,
@@ -48,6 +71,11 @@
         <span>This target is my own lab/localhost/private network (required to scan RFC1918, loopback, or
           link-local addresses — logged when used).</span>
       </label>
+      <label class="checkline mt-8 opsec-line">
+        <input type="checkbox" id="g-proceed-exposed">
+        <span>Scan anyway even if my real IP is exposed — overrides the opsec block. Only check this if
+          you're behind a VPN the check can't see, or the target is internal.</span>
+      </label>
     </div>
 
     <div class="card mb">
@@ -55,6 +83,13 @@
       <p class="sub">Fixed argv templates — your target fills exactly one slot. Any other choice you make
          (scan profile, tags, wordlist) is validated against a server-side list; only the looked-up fixed
          value ever reaches the command.</p>
+      <div class="row mt" id="run-recipes">
+        <span class="recipe-lbl">Quick start:</span>
+        <button type="button" class="ghost recipe-btn" id="recipe-portscan" data-tool="nmap">Port scan</button>
+        <button type="button" class="ghost recipe-btn" id="recipe-webfp" data-tool="whatweb">Web fingerprint</button>
+        <button type="button" class="ghost recipe-btn" id="recipe-tls" data-tool="sslscan">TLS check</button>
+        <button type="button" class="ghost recipe-btn" id="recipe-subdomains" data-tool="subfinder">Subdomain enum</button>
+      </div>
       <div class="row mt">
         <div class="field w-220">
           <label>Tool</label>
@@ -81,6 +116,145 @@
       <span id="run-status" class="sub ml-10"></span>
       <pre class="term mt hidden" id="run-output"></pre>
       <button class="ghost mt hidden" id="run-copy" type="button">Copy output</button>
+    </div>
+  </div>
+
+  <!-- ================= WEB ================= -->
+  <div class="tab-panel hidden" id="tab-web" role="tabpanel" aria-labelledby="tabbtn-web" tabindex="0">
+
+    <div class="card mb authcard" id="web-authbox">
+      <h2>Authorization <span class="tag">gate</span></h2>
+      <p class="sub">Same gate as the Run tab — checking one keeps the other in sync.</p>
+      <label class="checkline mt-10 auth-line">
+        <input type="checkbox" id="w-authorized">
+        <span>I am authorized to test the target below.</span>
+      </label>
+      <label class="checkline mt-8">
+        <input type="checkbox" id="w-lab">
+        <span>This target is my own lab/localhost/private network.</span>
+      </label>
+      <label class="checkline mt-8 opsec-line">
+        <input type="checkbox" id="w-proceed-exposed">
+        <span>Scan anyway even if my real IP is exposed — overrides the opsec block.</span>
+      </label>
+    </div>
+
+    <div class="card mb secret-scan-card" id="secret-scan-card">
+      <h2>Secret / API-key leak scan <span class="tag">flagship</span></h2>
+      <p class="sub">Scans the page's own HTML and same-site JS bundles for hardcoded credentials —
+        cloud keys, payment keys, source-control tokens, private keys — the single most common real-world
+        web leak. Publishable-by-design keys (Stripe <code>pk_live</code>, Google/Firebase browser keys)
+        are called out separately so the report doesn't cry wolf.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="secret-scan-target">URL</label>
+          <input type="text" id="secret-scan-target" placeholder="https://example.com">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="secret-scan-btn">Scan for leaked keys</button>
+        </div>
+      </div>
+      <span id="secret-scan-status" class="sub"></span>
+      <div id="secret-scan-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card mb">
+      <h2>Website assessment <span class="tag">playbooks</span></h2>
+      <p class="sub">One click runs the right tools in order and rolls the findings up. Every step runs
+        through the same gated endpoint the Run tab uses by hand — a playbook can't do anything a manual
+        run couldn't.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label>Target</label>
+          <input type="text" id="web-target" placeholder="https://example.com — or a bare host for domain-recon playbooks">
+        </div>
+      </div>
+      <div id="playbook-cards" class="grid cols-2 mt"></div>
+      <div id="playbook-run" class="hidden mt"></div>
+    </div>
+
+    <div class="card">
+      <h2>Quick header / CORS analyzer</h2>
+      <p class="sub">One passive request, no tool install required — reads security headers, cookie flags,
+        server disclosures, and probes for a CORS misconfiguration.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label>URL</label>
+          <input type="text" id="web-analyze-target" placeholder="https://example.com">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="web-analyze-btn">Analyze</button>
+        </div>
+      </div>
+      <span id="web-analyze-status" class="sub"></span>
+      <div id="web-analyze-result" class="mt hidden"></div>
+    </div>
+  </div>
+
+  <!-- ================= PASSWORD ================= -->
+  <div class="tab-panel hidden" id="tab-password" role="tabpanel" aria-labelledby="tabbtn-password" tabindex="0">
+
+    <div class="card mb">
+      <h2>Hash identifier</h2>
+      <p class="sub">Pure offline string analysis — no exec, no network, so no authorization gate is needed.
+        Raw hex hashes (32/40/64-char, etc) are genuinely ambiguous by length alone; every real candidate is
+        shown, not just a guess.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="hash-input">Hash</label>
+          <textarea id="hash-input" rows="2" class="mono" spellcheck="false"
+            placeholder="8743b52063cd84097a65d1633f5c74f5"></textarea>
+        </div>
+        <div class="field w-220">
+          <label for="hash-attack">Attack</label>
+          <select id="hash-attack">
+            <option value="wordlist">Wordlist (rockyou + best64 rules)</option>
+            <option value="bruteforce">Brute force (mask, increment)</option>
+          </select>
+        </div>
+      </div>
+      <button type="button" id="hash-id-btn">Identify</button>
+      <span id="hash-id-status" class="sub ml-10"></span>
+      <div id="hash-id-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card">
+      <h2>Crack command builder <span class="tag">copy-only</span></h2>
+      <p class="sub">Same builder as the Build tab, scoped to hashcat and John — assembles a shell-quoted
+        command string, never executes it.</p>
+      <div class="row mt">
+        <div class="field w-220">
+          <label>Tool</label>
+          <select id="pw-build-tool"></select>
+        </div>
+      </div>
+      <div id="pw-build-desc" class="sub mb"></div>
+      <div id="pw-build-note" class="sub build-note hidden"></div>
+      <div id="pw-build-fields" class="grid cols-3"></div>
+      <button type="button" id="pw-build-btn">Build command</button>
+      <div class="mt hidden" id="pw-build-result-wrap">
+        <label>Command (run this yourself in a terminal)</label>
+        <pre class="term" id="pw-build-result"></pre>
+        <button class="ghost mt" type="button" id="pw-build-copy">Copy to clipboard</button>
+      </div>
+
+      <hr>
+
+      <h2>Wordlist browser</h2>
+      <p class="sub">Search the wordlists registered on this box and preview the first lines before you
+        commit to one.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="pw-wl-search">Search</label>
+          <input type="search" id="pw-wl-search" placeholder="type to filter, e.g. 'rockyou', 'common', 'raft'…">
+        </div>
+      </div>
+      <div class="wl-browser mt">
+        <div id="pw-wl-results" class="wl-results"></div>
+        <div id="pw-wl-preview" class="wl-preview"></div>
+      </div>
     </div>
   </div>
 
@@ -190,6 +364,10 @@
       <label class="checkline mt-8">
         <input type="checkbox" id="x-ack">
         <span>I understand I'm running my own arguments and I'm responsible for them.</span>
+      </label>
+      <label class="checkline mt-8 opsec-line">
+        <input type="checkbox" id="x-proceed-exposed">
+        <span>Scan anyway even if my real IP is exposed — overrides the opsec block.</span>
       </label>
     </div>
     <div class="card">
