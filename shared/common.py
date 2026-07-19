@@ -42,6 +42,15 @@ from urllib.parse import parse_qs, urlparse
 BIND_ADDR = "127.0.0.1"  # loopback only — never a config knob
 VERSION = "1.0.0"
 
+# Persistent activity logging — the redcell audit trail (var/redcell-scans.jsonl),
+# the recon case history (var/recon-scans.jsonl), and saved nmap/nuclei output
+# copies (var/redcell-out/). OFF by default: Nucleus runs authorized client
+# engagements and the operator generally does not want an on-disk record of what
+# was scanned sitting around afterward. Nothing is written to disk unless this is
+# explicitly turned back on with NUCLEUS_LOGGING=1. Results still render live in
+# the UI for the life of the session — only the disk writes are suppressed.
+LOGGING_ENABLED = os.environ.get("NUCLEUS_LOGGING") == "1"
+
 # The whole suite, in one place. Hub + every console read this to draw the
 # switcher and to health-check siblings. Ports are fixed so a bookmark or a
 # systemd unit never has to guess.
@@ -362,11 +371,14 @@ class _DeadlineSock:
 
 def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict] = None,
           data: Optional[bytes] = None, allow_hosts: Optional[set] = None,
-          max_bytes: int = 2_000_000) -> tuple[int, bytes, dict]:
+          max_bytes: int = 2_000_000, follow_redirects: bool = True) -> tuple[int, bytes, dict]:
     """GET/POST a URL with a hard SSRF guard. Returns (status, body, headers).
 
     Redirects are followed manually and the guard runs again on every hop's
-    host, so a public URL can't 3xx-bounce into loopback/metadata. Each hop is
+    host, so a public URL can't 3xx-bounce into loopback/metadata. Set
+    follow_redirects=False to get the first 3xx response back verbatim (status +
+    Location header) instead — useful for auditing whether http:// forces https.
+    Each hop is
     connected to the exact IP the guard validated (hostname preserved for TLS
     SNI + cert check), which also closes the resolve-then-reconnect race.
     Each hop gets its own fresh `timeout`-second deadline (connect through
@@ -419,7 +431,7 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
             resp = conn.getresponse()
             status = resp.status
             loc = resp.getheader("Location")
-            if status in (301, 302, 303, 307, 308) and loc:
+            if follow_redirects and status in (301, 302, 303, 307, 308) and loc:
                 resp.read()  # drain before closing
                 conn.close()
                 current = urllib.parse.urljoin(current, loc)

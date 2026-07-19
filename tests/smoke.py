@@ -187,6 +187,35 @@ def main():
                      body={"url": "http://169.254.169.254/", "authorized": True})  # link-local metadata
         check("redcell secret-scan refuses non-public target", st == 403, f"got {st}")
 
+        # ---- new: DDoS resilience (bounded probe + load-test builder) ----
+        st, j = jget(port, "/api/stress-probe", method="POST",
+                     body={"url": "https://example.com"})  # no authorized flag
+        check("redcell stress-probe refuses without authorization", st == 403, f"got {st}")
+        st, j = jget(port, "/api/stress-probe", method="POST",
+                     body={"url": "https://example.com", "authorized": True, "tier": "nuke"})
+        check("redcell stress-probe refuses invalid tier", st == 400, f"got {st}")
+        st, j = jget(port, "/api/stress-probe", method="POST",
+                     body={"url": "http://10.0.0.1", "authorized": True})  # private, no lab
+        check("redcell stress-probe refuses private out of scope", st == 403, f"got {st}")
+        st, j = jget(port, "/api/stress-build", method="POST",
+                     body={"engine": "k6", "params": {"url": "https://example.com"}})
+        check("redcell stress-build assembles a command, unexecuted",
+              st == 200 and isinstance(j, dict) and j.get("executed") is False
+              and bool(j.get("files") or j.get("command")), str(j)[:120])
+        st, j = jget(port, "/api/stress-token", method="POST", body={"target": "example.com"})
+        check("redcell stress-token mints a token",
+              st == 200 and isinstance(j, dict) and str(j.get("token", "")).startswith("nucleus-loadtest-"), str(j)[:120])
+        # CSRF: a POST without a same-origin Origin must be refused like the others
+        noorigin = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/stress-probe", method="POST", data=b"{}",
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(noorigin, timeout=5) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("redcell stress-probe POST without Origin refused", code == 403, f"got {code}")
+
         # ---- new: wordlist preview (read-only, registry-gated path) ----
         st, wl = jget(port, "/api/wordlists?q=common&limit=3")
         wid = (wl.get("results") or [{}])[0].get("id") if isinstance(wl, dict) else None

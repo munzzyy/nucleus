@@ -584,6 +584,8 @@ def _cap(s: str) -> str:
 
 
 def _append_audit(entry: dict) -> None:
+    if not common.LOGGING_ENABLED:   # no on-disk trail by default (NUCLEUS_LOGGING=1 to opt in)
+        return
     try:
         AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(AUDIT_LOG, "a", encoding="utf-8") as f:
@@ -744,7 +746,8 @@ def handle_run(req) -> "common.Response":
                 "immediately before running) — refusing; set lab:true only "
                 "for your own lab or localhost")
 
-    out_path = _out_path(tool, spec.needs_output) if spec.needs_output else None
+    # Saved output copies are part of the on-disk trail — off unless logging is on.
+    out_path = _out_path(tool, spec.needs_output) if (spec.needs_output and common.LOGGING_ENABLED) else None
     apikey = apikeys.get_key(spec.uses_apikey) if spec.uses_apikey else None
     apikey = apikey or None  # "" -> None, so build() can just check truthiness
 
@@ -886,11 +889,23 @@ def _expert_binaries() -> set:
     return {b for b in bins if b not in _EXPERT_DENY and common.which(b)}
 
 
+def _all_secret_env_names() -> set:
+    """Every env-var name that holds a secret the app might place in an argv —
+    the OSINT catalog PLUS any token a runner declares via uses_apikey (e.g.
+    WPSCAN_API_TOKEN, which isn't in the recon catalog). Expert mode redacts all
+    of them, so a token passed as a raw Expert argument can't leak in cleartext
+    to the audit log or the HTTP response the way it would if only CATALOG were
+    scrubbed."""
+    names = {s["name"] for s in apikeys.CATALOG}
+    names |= {spec.uses_apikey for spec in SAFE_RUNNERS.values() if spec.uses_apikey}
+    return names
+
+
 def _redact_all(text: str) -> str:
     if not text:
         return text
-    for spec in apikeys.CATALOG:
-        v = apikeys.get_key(spec["name"])
+    for name in _all_secret_env_names():
+        v = apikeys.get_key(name)
         if v:
             text = text.replace(v, "***REDACTED***")
     return text

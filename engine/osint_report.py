@@ -27,6 +27,7 @@ import socket
 import ssl
 import sys
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,9 +76,11 @@ def _txt_values(name: str) -> list[str]:
     return vals
 
 
-def _fetch(url: str, timeout: float = _SRC_TIMEOUT, max_bytes: int = 400_000) -> dict:
+def _fetch(url: str, timeout: float = _SRC_TIMEOUT, max_bytes: int = 400_000,
+           *, follow_redirects: bool = True) -> dict:
     try:
-        status, body, headers = common.fetch(url, timeout=timeout, max_bytes=max_bytes)
+        status, body, headers = common.fetch(url, timeout=timeout, max_bytes=max_bytes,
+                                             follow_redirects=follow_redirects)
         return {"ok": True, "status": status, "headers": {k.lower(): v for k, v in headers.items()},
                 "body_len": len(body), "body": body, "url": url}
     except (ValueError, OSError) as e:
@@ -111,10 +114,17 @@ def _apex_ip(dns_section: dict) -> str | None:
 def _check_spf(domain: str) -> dict:
     spf_vals = [v for v in _txt_values(domain) if v.lower().startswith("v=spf1")]
     if not spf_vals:
-        return {"present": False, "record": None, "valid": False}
+        return {"present": False, "record": None, "valid": False, "qualifier": None}
     rec = spf_vals[0]
-    valid = bool(re.search(r"[-~?+]all\s*$", rec.strip(), re.I)) or "redirect=" in rec.lower()
-    return {"present": True, "record": rec, "valid": valid}
+    m = re.search(r"([-~?+])all\s*$", rec.strip(), re.I)
+    qualifier = m.group(1) if m else None
+    has_redirect = "redirect=" in rec.lower()
+    # "valid" = the record actually asserts a policy that protects the domain.
+    # -all (fail) and ~all (softfail) do; a bare redirect= delegates to another
+    # policy. ?all (neutral) and +all (pass-all) do NOT — +all in particular
+    # tells receivers to accept mail from ANY server as this domain.
+    protective = qualifier in ("-", "~") or (has_redirect and qualifier is None)
+    return {"present": True, "record": rec, "valid": protective, "qualifier": qualifier}
 
 
 def _check_dmarc(domain: str) -> dict:
@@ -137,10 +147,32 @@ def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool) -> tuple[
     max_pts, pts, findings = 30, 0, []
 
     if spf["present"]:
-        pts += 12
-        if not spf["valid"]:
-            findings.append(finding("medium", "SPF record present but looks malformed",
-                                     "Must start with v=spf1 and end in a qualifier (-all/~all/?all)."))
+        q = spf.get("qualifier")
+        if q == "-":
+            pts += 12
+        elif q == "~":
+            pts += 11
+            findings.append(finding("low", "SPF ends in ~all (soft fail, not hard fail)",
+                                     "~all asks receivers to accept-but-mark unlisted senders. Move to "
+                                     "-all once every legitimate sender is listed."))
+        elif spf["valid"]:  # redirect= delegation, no explicit all qualifier
+            pts += 12
+        elif q == "?":
+            pts += 6
+            findings.append(finding("medium", "SPF ends in ?all (neutral — provides no protection)",
+                                     "?all makes no assertion, so receivers won't reject spoofed mail. "
+                                     "Use -all (or ~all while testing)."))
+        elif q == "+":
+            pts += 2
+            findings.append(finding("high", "SPF ends in +all — it authorizes every sender",
+                                     "+all tells receivers to accept mail from ANY server as you, which is "
+                                     "worse than having no SPF. Change the qualifier to -all (hard fail) or "
+                                     "~all (soft fail)."))
+        else:
+            pts += 6
+            findings.append(finding("medium", "SPF record present but has no 'all' qualifier",
+                                     "End the record in a qualifier (-all/~all) so receivers know what to "
+                                     "do with senders you didn't list."))
     else:
         sev = "high" if mx_present else "low"
         findings.append(finding(sev, "No SPF record found",
@@ -183,14 +215,21 @@ def _parse_max_age(hsts_value: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _redirects_to_https(http_res: dict, https_res: dict):
-    """Best-effort: common.fetch follows redirects transparently (stdlib urllib), so
-    we can't see the 301 itself — only infer from whether the http:// fetch landed
-    on the same final resource as the https:// fetch."""
-    if not http_res.get("ok") or not https_res.get("ok"):
+def _redirects_to_https(http_noredir: dict):
+    """Does plaintext :80 force a redirect to HTTPS? Reads the actual 3xx +
+    Location from a non-following fetch instead of guessing from page sizes.
+    True  = :80 redirects to an https URL.
+    False = :80 answers 2xx with content (served in the clear, no redirect).
+    None  = nothing answered on :80, so there's nothing to grade (which is fine)."""
+    if not http_noredir.get("ok"):
         return None
-    return (http_res.get("status") == 200 and https_res.get("status") == 200
-            and http_res.get("body_len") == https_res.get("body_len"))
+    status = http_noredir.get("status")
+    loc = ((http_noredir.get("headers") or {}).get("location", "") or "").strip().lower()
+    if status in (301, 302, 303, 307, 308):
+        return loc.startswith("https://")
+    if isinstance(status, int) and 200 <= status < 300:
+        return False
+    return None
 
 
 def _score_web(https_res: dict, http_res: dict) -> tuple[int, int, list, dict]:
@@ -249,7 +288,7 @@ def _score_web(https_res: dict, http_res: dict) -> tuple[int, int, list, dict]:
         findings.append(finding("high", "HTTPS not reachable",
                                  https_res.get("error", "site did not respond over HTTPS")))
 
-    redirects = _redirects_to_https(http_res, https_res)
+    redirects = _redirects_to_https(http_res)
     if redirects is True:
         pts += 3
     elif redirects is False:
@@ -281,6 +320,40 @@ def _parse_cert_time(s: str) -> datetime | None:
         return None
 
 
+def _decode_cert_pem(pem: str) -> dict:
+    """Parse a PEM cert into the dict shape getpeercert() returns, without the
+    cert having to validate. getpeercert() returns {} on an unverified socket,
+    so an expired/self-signed/mismatched cert would otherwise be invisible — we
+    decode it ourselves via the stdlib ssl module's own certificate decoder."""
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".pem")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        return ssl._ssl._test_decode_cert(path)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _host_matches_cert(domain: str, subject_cn: str | None, sans: list[str]) -> bool:
+    names = [n.lower() for n in sans]
+    if subject_cn:
+        names.append(subject_cn.lower())
+    d = domain.lower()
+    for n in names:
+        if n == d:
+            return True
+        if n.startswith("*.") and "." in d and d.split(".", 1)[1] == n[2:]:
+            return True  # wildcard covers exactly one left-most label
+    return False
+
+
 def _tls_cert(domain: str, timeout: float = 5.0) -> dict:
     # Resolve once and connect to the validated IP literal, not the hostname —
     # otherwise the tool re-resolves and a DNS rebind (short TTL, alternating
@@ -293,25 +366,67 @@ def _tls_cert(domain: str, timeout: float = 5.0) -> dict:
         return {"ok": False, "error": str(e)}
     if not ips:
         return {"ok": False, "error": "host did not resolve to a public address"}
+
+    trusted = False
+    verify_error = None
+    protocol = cipher = None
+    cert: dict | None = None
+    # 1) A verifying handshake first — this is what tells us whether a real
+    # browser will trust the chain (and, implicitly, that it isn't expired or
+    # name-mismatched).
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((ips[0], 443), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-    except Exception as e:  # noqa: BLE001 — any handshake/cert/timeout failure must not crash the report
+                protocol = ssock.version()
+                c = ssock.cipher()
+                cipher = c[0] if c else None
+        trusted = True
+    except ssl.SSLCertVerificationError as e:
+        verify_error = getattr(e, "verify_message", None) or str(e)
+    except ssl.SSLError as e:
+        verify_error = str(e)
+    except (OSError, socket.timeout) as e:
+        # Connection-level failure: nothing listening / no TLS at all. No cert.
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+    # 2) If it didn't validate, connect again WITHOUT verification so we can
+    # still read the leaf and report exactly why it's bad (this is the whole
+    # point — an expired/self-signed cert must show up as a finding, not vanish).
+    if not cert:
+        try:
+            uctx = ssl._create_unverified_context()
+            with socket.create_connection((ips[0], 443), timeout=timeout) as sock:
+                with uctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                    der = ssock.getpeercert(binary_form=True)
+                    protocol = protocol or ssock.version()
+                    c = ssock.cipher()
+                    cipher = cipher or (c[0] if c else None)
+            cert = _decode_cert_pem(ssl.DER_cert_to_PEM_cert(der)) if der else {}
+        except Exception as e:  # noqa: BLE001 — degrade instead of crashing the report
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    cert = cert or {}
     issuer = dict(x[0] for x in cert.get("issuer", [])) if cert.get("issuer") else {}
     subject = dict(x[0] for x in cert.get("subject", [])) if cert.get("subject") else {}
     sans = sorted({v for k, v in cert.get("subjectAltName", []) if k == "DNS"})
     not_after_raw = cert.get("notAfter", "")
     not_after = _parse_cert_time(not_after_raw)
     days_left = (not_after - datetime.now(timezone.utc)).days if not_after else None
+    subject_cn = subject.get("commonName")
 
     return {
         "ok": True,
+        "trusted": trusted,
+        "verify_error": verify_error,
+        "self_signed": bool(subject) and subject == issuer,
+        "hostname_ok": (_host_matches_cert(domain, subject_cn, sans)
+                        if (subject_cn or sans) else None),
+        "protocol": protocol,
+        "cipher": cipher,
         "issuer": issuer.get("organizationName") or issuer.get("commonName") or "unknown",
-        "subject_cn": subject.get("commonName"),
+        "subject_cn": subject_cn,
         "not_after": not_after_raw,
         "days_left": days_left,
         "sans": sans[:25],
@@ -319,29 +434,51 @@ def _tls_cert(domain: str, timeout: float = 5.0) -> dict:
 
 
 def _score_tls(tls: dict) -> tuple[int, int, list]:
-    max_pts, pts, findings = 8, 0, []
+    max_pts, findings = 8, []
     if not tls.get("ok"):
         findings.append(finding("high", "Could not complete a TLS handshake on :443",
                                  f"{tls.get('error', 'connection failed')} — confirm the cert chain is "
                                  "complete and the host isn't blocking automated clients."))
-        return pts, max_pts, findings
+        return 0, max_pts, findings
 
     days_left = tls.get("days_left")
-    if days_left is None:
-        pts += 4
-        findings.append(finding("info", "Could not parse the TLS certificate's expiry date", ""))
-    elif days_left < 0:
+    expired = days_left is not None and days_left < 0
+
+    # A cert a browser won't accept is broken — name the reason and score it at
+    # the floor, regardless of how many days are left on it. Each failure mode
+    # is reported once, worst first.
+    if tls.get("self_signed"):
+        findings.append(finding("high", "TLS certificate is self-signed",
+                                 "Browsers reject it with a hard, unskippable warning. Get a cert from a "
+                                 "public CA — Let's Encrypt is free and automatable."))
+        return 0, max_pts, findings
+    if expired:
         findings.append(finding("high", f"TLS certificate expired {-days_left} day(s) ago",
                                  "Renew immediately — an expired cert breaks every browser connection "
                                  "with a hard, unskippable warning."))
-    elif days_left < 14:
-        pts += 2
+        return 0, max_pts, findings
+    if tls.get("hostname_ok") is False:
+        findings.append(finding("high", "TLS certificate does not cover this hostname",
+                                 "The certificate's names don't include this domain, so browsers show a "
+                                 "name-mismatch warning. Reissue with the correct SAN(s)."))
+        return 0, max_pts, findings
+    if not tls.get("trusted"):
+        ve = tls.get("verify_error") or "chain did not validate"
+        findings.append(finding("high", "TLS certificate chain does not validate",
+                                 f"{ve} — install the full chain (leaf + intermediates) so clients don't "
+                                 "reject it."))
+        return 1, max_pts, findings  # reachable and speaks TLS, but untrusted
+
+    # Trusted, name matches, not expired — grade on remaining lifetime.
+    if days_left is None:
+        findings.append(finding("info", "Could not read the TLS certificate's expiry date", ""))
+        return 6, max_pts, findings
+    if days_left < 14:
         findings.append(finding("medium", f"TLS certificate expires in {days_left} day(s)",
-                                 "Renew now. If this is unexpected, check that ACME/auto-renewal is "
-                                 "actually running — it should renew well before this point."))
-    else:
-        pts += 8
-    return pts, max_pts, findings
+                                 "Renew now. If this is unexpected, check ACME/auto-renewal is actually "
+                                 "running — it should renew well before this point."))
+        return 6, max_pts, findings
+    return 8, max_pts, findings
 
 
 # --------------------------------------------------------------------------
@@ -454,8 +591,13 @@ def _shodan_internetdb(ip: str | None) -> dict:
 
 
 def _score_attack_surface(subdomains: dict, shodan: dict) -> tuple[int, int, list]:
-    max_pts, pts, findings = 20, 20, []
+    # NB: max_pts is built up from the sources that actually answered. A source
+    # outage must NOT read as a clean surface — an unreachable Shodan lookup is
+    # excluded from BOTH numerator and denominator rather than scored 20/20.
+    findings: list = []
+    pts = max_pts = 0
 
+    # crt.sh subdomains — informational only, contributes no points either way.
     if subdomains.get("ok") and subdomains.get("count") is not None:
         c = subdomains["count"]
         if c > 200:
@@ -467,11 +609,15 @@ def _score_attack_surface(subdomains: dict, shodan: dict) -> tuple[int, int, lis
                                  f"{subdomains.get('error', 'source did not respond')} — retry later, "
                                  "crt.sh rate-limits aggressively."))
 
+    # Shodan InternetDB — the graded portion, worth 20, but only when the lookup
+    # succeeded (a 404 = indexed-and-clean still counts; an error does not).
     if shodan.get("ok"):
+        max_pts += 20
+        pts += 20
         cves = shodan.get("cves") or []
         ports = shodan.get("ports") or []
         if cves:
-            pts -= min(10, 3 * len(cves))
+            pts -= min(14, 4 * len(cves))
             findings.append(finding("high", f"{len(cves)} known CVE(s) tagged against the apex IP",
                                      "; ".join(cves[:8])))
         risky_ports = [p for p in ports if p not in (80, 443)]
@@ -480,10 +626,16 @@ def _score_attack_surface(subdomains: dict, shodan: dict) -> tuple[int, int, lis
             findings.append(finding("medium", f"Non-web ports open on the apex IP: {risky_ports}",
                                      "Confirm each is intentional and reachable only from where it "
                                      "needs to be."))
-    elif shodan.get("error") and shodan.get("error") != "no apex IP resolved":
-        findings.append(finding("info", "Shodan InternetDB lookup unavailable", shodan.get("error")))
+        pts = max(0, pts)
+    elif shodan.get("error") == "no apex IP resolved":
+        findings.append(finding("info", "Apex has no A/AAAA record, so exposed ports/CVEs couldn't be checked",
+                                 "This section is omitted from the grade."))
+    elif shodan.get("error"):
+        findings.append(finding("info", "Shodan InternetDB lookup unavailable — attack surface not graded",
+                                 f"{shodan.get('error')}. Excluded from the score rather than assumed "
+                                 "clean, so an outage can't inflate the grade."))
 
-    return max(0, pts), max_pts, findings
+    return pts, max_pts, findings
 
 
 # --------------------------------------------------------------------------
@@ -570,8 +722,11 @@ def diff(domain: str, out_dir: Path = REPORTS_DIR, *, before: str | None = None)
 #   web (53 = 40 existing + 13 new): HSTS/CSP/X-Frame/nosniff/Referrer/
 #     Permissions-Policy/redirect (40) + TLS cert health (8) + CAA (3) +
 #     security.txt (2)
-#   attack_surface (25 = 20 existing + 5 new): crt.sh/Shodan (20) + DNSSEC
-#     presence (5)
+#   attack_surface (up to 25): Shodan InternetDB (20, ONLY when the lookup
+#     answered — excluded from the total on an outage so it can't inflate the
+#     grade) + DNSSEC presence (5); crt.sh subdomains are informational.
+# The max is therefore not fixed — it's the sum of the sections that actually
+# ran, so the grade always reflects what was measured, never what was assumed.
 # --------------------------------------------------------------------------
 def assess(domain: str) -> dict:
     domain = _safe_domain(domain)
@@ -579,34 +734,51 @@ def assess(domain: str) -> dict:
     if not domain:
         raise ValueError("empty domain")
 
+    # DNS first — apex IP and MX presence gate the Shodan/email logic below.
     dns_section = _collect_dns(domain)
     mx_present = bool(dns_section.get("MX"))
+    apex_ip = _apex_ip(dns_section)
 
-    spf = _check_spf(domain)
-    dmarc = _check_dmarc(domain)
-    dkim = _check_dkim_hint(domain)
+    # Every remaining source is an independent network call. Fan them out so an
+    # assessment takes about as long as its slowest source, not the sum of all
+    # of them. Each collector already degrades to a result dict on failure
+    # (never raises), so a dead/slow source can't sink the pool — and the
+    # scoring below stays serial + deterministic on the collected results.
+    collectors = {
+        "spf": lambda: _check_spf(domain),
+        "dmarc": lambda: _check_dmarc(domain),
+        "dkim": lambda: _check_dkim_hint(domain),
+        "https": lambda: _fetch(f"https://{domain}"),
+        # Non-following on purpose: we want to SEE whether :80 issues a 3xx to
+        # https, not land on the final page and guess.
+        "http": lambda: _fetch(f"http://{domain}", follow_redirects=False),
+        "tls": lambda: _tls_cert(domain),
+        "caa": lambda: _check_caa(domain),
+        "sec_txt": lambda: _check_security_txt(domain),
+        "dnssec": lambda: _check_dnssec(domain),
+        "subdomains": lambda: _crtsh_subdomains(domain),
+        "shodan": lambda: _shodan_internetdb(apex_ip),
+    }
+    with ThreadPoolExecutor(max_workers=len(collectors)) as ex:
+        futures = {k: ex.submit(fn) for k, fn in collectors.items()}
+        r = {k: f.result() for k, f in futures.items()}
+
+    spf, dmarc, dkim = r["spf"], r["dmarc"], r["dkim"]
+    https_res, http_res, tls = r["https"], r["http"], r["tls"]
+    caa, sec_txt, dnssec = r["caa"], r["sec_txt"], r["dnssec"]
+    subdomains, shodan = r["subdomains"], r["shodan"]
+
     email_pts, email_max, email_findings = _score_email(spf, dmarc, dkim, mx_present)
 
-    https_res = _fetch(f"https://{domain}")
-    http_res = _fetch(f"http://{domain}")
     web_pts, web_max, web_findings, banner = _score_web(https_res, http_res)
-
-    tls = _tls_cert(domain)
     tls_pts, tls_max, tls_findings = _score_tls(tls)
-    caa = _check_caa(domain)
     caa_pts, caa_max, caa_findings = _score_caa(caa)
-    sec_txt = _check_security_txt(domain)
     sec_pts, sec_max, sec_findings = _score_security_txt(sec_txt)
     web_pts += tls_pts + caa_pts + sec_pts
     web_max += tls_max + caa_max + sec_max
     web_findings = web_findings + tls_findings + caa_findings + sec_findings
 
-    apex_ip = _apex_ip(dns_section)
-    subdomains = _crtsh_subdomains(domain)
-    shodan = _shodan_internetdb(apex_ip)
     surf_pts, surf_max, surf_findings = _score_attack_surface(subdomains, shodan)
-
-    dnssec = _check_dnssec(domain)
     dnssec_pts, dnssec_max, dnssec_findings = _score_dnssec(dnssec)
     surf_pts += dnssec_pts
     surf_max += dnssec_max
@@ -638,7 +810,7 @@ def assess(domain: str) -> dict:
                       "error": https_res.get("error"), "headers": https_res.get("headers", {})},
             "http": {"ok": http_res.get("ok"), "status": http_res.get("status"),
                      "error": http_res.get("error")},
-            "redirects_to_https": _redirects_to_https(http_res, https_res),
+            "redirects_to_https": _redirects_to_https(http_res),
             "banner": banner,
             "tls": tls,
             "caa": caa,

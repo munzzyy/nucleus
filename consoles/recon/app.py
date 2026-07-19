@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import common
-from consoles.recon import detect, lookups, resources
+from consoles.recon import detect, lookups, resources, takeover
 
 MAX_QUERY_LEN = 512
 
@@ -111,6 +111,8 @@ ROUTES = {
     "GET /api/resources": _resources,
     "GET /api/recon-history": _recon_history,
     "GET /api/recon-scan": _recon_scan_get,
+    # ---- new: passive subdomain-takeover checker ----
+    "POST /api/takeover": takeover.handle_takeover,
 }
 
 

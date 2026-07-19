@@ -21,6 +21,8 @@
       role="tab" aria-selected="true" aria-controls="tab-run">Run</button>
     <button type="button" class="tab-btn" id="tabbtn-web" data-tab="web"
       role="tab" aria-selected="false" aria-controls="tab-web" tabindex="-1">Web</button>
+    <button type="button" class="tab-btn" id="tabbtn-stress" data-tab="stress"
+      role="tab" aria-selected="false" aria-controls="tab-stress" tabindex="-1">Resilience</button>
     <button type="button" class="tab-btn" id="tabbtn-password" data-tab="password"
       role="tab" aria-selected="false" aria-controls="tab-password" tabindex="-1">Password</button>
     <button type="button" class="tab-btn" id="tabbtn-arsenal" data-tab="arsenal"
@@ -141,10 +143,12 @@
 
     <div class="card mb secret-scan-card" id="secret-scan-card">
       <h2>Secret / API-key leak scan <span class="tag">flagship</span></h2>
-      <p class="sub">Scans the page's own HTML and same-site JS bundles for hardcoded credentials —
-        cloud keys, payment keys, source-control tokens, private keys — the single most common real-world
-        web leak. Publishable-by-design keys (Stripe <code>pk_live</code>, Google/Firebase browser keys)
-        are called out separately so the report doesn't cry wolf.</p>
+      <p class="sub">Scans the page's own HTML, response headers, same-site JS bundles, and the source
+        maps those bundles reference for hardcoded credentials — cloud/payment/source-control tokens,
+        private keys, JWTs (decoded inline), DB URLs, and 40+ provider key shapes — the single most common
+        real-world web leak. Each real leak carries the exact safe, read-only command to confirm it's live
+        (built for you to run, never auto-fired). Publishable-by-design keys (Stripe <code>pk_live</code>,
+        Google/Firebase browser keys) are called out separately so the report doesn't cry wolf.</p>
       <div class="row mt">
         <div class="field grow-2">
           <label for="secret-scan-target">URL</label>
@@ -155,8 +159,70 @@
           <button type="button" id="secret-scan-btn">Scan for leaked keys</button>
         </div>
       </div>
+      <label class="checkline mt-8" title="Also probe commonly-exposed files (.env, .git/config, config.json …) and the site's Wayback history for orphaned JS. More thorough, but a noisier scanner signature (extra requests, some 404s).">
+        <input type="checkbox" id="secret-scan-deep"> Deep scan — exposed files + Wayback history <span class="faint small">(noisier)</span>
+      </label>
       <span id="secret-scan-status" class="sub"></span>
       <div id="secret-scan-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card mb">
+      <h2>TLS / cipher deep audit <span class="tag">new</span></h2>
+      <p class="sub">Dials <code>:443</code> directly and enumerates which TLS versions the server still
+        accepts (1.0–1.3), the negotiated cipher, and the full certificate health — chain trust, expiry,
+        self-signed, and hostname match — read even when the cert fails to validate. Legacy protocols and
+        a broken cert are graded and called out. One handshake per version, passive.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="tls-audit-target">Host</label>
+          <input type="text" id="tls-audit-target" placeholder="example.com">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="tls-audit-btn">Audit TLS</button>
+        </div>
+      </div>
+      <span id="tls-audit-status" class="sub"></span>
+      <div id="tls-audit-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card mb">
+      <h2>Tech-stack fingerprint <span class="tag">new</span></h2>
+      <p class="sub">One passive request, then a signature pass over response headers, cookie names,
+        generator tags, and script paths to identify the server, CDN/WAF, CMS, frameworks, and JS
+        libraries in use — the first thing to know before choosing an attack surface.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="techfp-target">URL</label>
+          <input type="text" id="techfp-target" placeholder="https://example.com">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="techfp-btn">Fingerprint</button>
+        </div>
+      </div>
+      <span id="techfp-status" class="sub"></span>
+      <div id="techfp-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card mb">
+      <h2>JWT analyzer <span class="tag">offline</span></h2>
+      <p class="sub">Paste a JWT to decode its header and claims and flag real weaknesses — <code>alg:none</code>,
+        HS/RS algorithm confusion, <code>jku</code>/<code>x5u</code>/<code>kid</code> injection surface, and
+        expiry problems. Nothing leaves the box; for HS* tokens it builds (never runs) a hashcat/John command
+        to crack the signing secret offline. No target, no gate.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="jwt-input">Token</label>
+          <input type="text" id="jwt-input" placeholder="eyJhbGciOi…">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="jwt-btn">Analyze</button>
+        </div>
+      </div>
+      <span id="jwt-status" class="sub"></span>
+      <div id="jwt-result" class="mt hidden"></div>
     </div>
 
     <div class="card mb">
@@ -190,6 +256,151 @@
       </div>
       <span id="web-analyze-status" class="sub"></span>
       <div id="web-analyze-result" class="mt hidden"></div>
+    </div>
+  </div>
+
+  <!-- ================= RESILIENCE (DDoS) ================= -->
+  <div class="tab-panel hidden" id="tab-stress" role="tabpanel" aria-labelledby="tabbtn-stress" tabindex="0">
+
+    <details class="card mb help-card">
+      <summary>DDoS resilience testing — what this does, and what it deliberately won't</summary>
+      <div class="help-body">
+        <p>This tests whether a target's <b>DDoS defenses hold</b>: does rate limiting kick in, is there a
+          CDN/WAF absorbing the edge, does latency stay flat under load, where's the breaking point. You get
+          a graded read-out with concrete fixes to hand the client.</p>
+        <p>The native probe runs a real, bounded load test — hard-capped in code at <b id="cap-conc">100</b>
+          requests in flight, <b id="cap-req">50,000</b> total, over <b id="cap-dur">180</b>s, and it holds at
+          peak so a well-provisioned target actually gets exercised (a few hundred requests won't touch a site
+          with datacenter capacity). Pick the tier to match the target — <b>Stress</b> is for real CDN/datacenter
+          clients and can hurt a small origin, so use the lighter tiers there. Load climbs from gentle and a
+          circuit breaker stops the moment a target buckles, so a weak target trips out early. It speaks real HTTP
+          over real TCP from your own IP; no packet flood, no spoofing, no amplification. For volume beyond one
+          box, the <b>command builder</b> below emits a k6/vegeta/wrk command you run yourself.</p>
+        <p class="m0">Same gate as the rest of Redcell: the authorization box is required, the opsec gate
+          refuses to fire while your real IP is exposed, and ownership verification (optional) stamps the
+          report with proof you control the target.</p>
+      </div>
+    </details>
+
+    <div class="card mb authcard" id="stress-authbox">
+      <h2>Authorization <span class="tag">gate</span></h2>
+      <p class="sub">Same gate as the Run tab — checking one keeps the others in sync.</p>
+      <label class="checkline mt-10 auth-line">
+        <input type="checkbox" id="s-authorized">
+        <span>I am authorized to load-test the target below.</span>
+      </label>
+      <label class="checkline mt-8">
+        <input type="checkbox" id="s-lab">
+        <span>This target is my own lab/localhost/private network.</span>
+      </label>
+      <label class="checkline mt-8 opsec-line">
+        <input type="checkbox" id="s-proceed-exposed">
+        <span>Run anyway even if my real IP is exposed — overrides the opsec block.</span>
+      </label>
+    </div>
+
+    <div class="card mb">
+      <h2>Ownership verification <span class="tag">optional · proof of scope</span></h2>
+      <p class="sub">Prove you control the target and the report gets stamped "scope verified" — worth having
+        on a real engagement. Place the token in DNS or a file, then verify. Optional: the authorization box
+        is the actual gate.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="stress-verify-target">Target host or URL</label>
+          <input type="text" id="stress-verify-target" placeholder="example.com">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="stress-token-btn" class="secondary">Get token</button>
+        </div>
+      </div>
+      <div id="stress-token-out" class="mt hidden"></div>
+      <div class="row mt hidden" id="stress-verify-row">
+        <div class="field fit">
+          <label for="stress-verify-method">Method</label>
+          <select id="stress-verify-method">
+            <option value="dns">DNS TXT record</option>
+            <option value="file">Well-known file</option>
+          </select>
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="stress-verify-btn">Verify ownership</button>
+        </div>
+        <div class="field grow-2">
+          <label>&nbsp;</label>
+          <span id="stress-verify-status" class="sub"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb">
+      <h2>Resilience probe <span class="tag">native · bounded</span></h2>
+      <p class="sub">A ramped, auto-aborting L7 load probe through the SSRF-guarded fetch. Measures rate-limit
+        engagement, CDN/WAF presence, latency under load, and the breaking point — then grades it A–F with fixes.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="stress-probe-target">URL</label>
+          <input type="text" id="stress-probe-target" placeholder="https://example.com">
+        </div>
+        <div class="field fit">
+          <label for="stress-probe-tier">Intensity</label>
+          <select id="stress-probe-tier">
+            <option value="smoke">Smoke — lightest read / small origin</option>
+            <option value="standard">Standard — modest sustained load</option>
+            <option value="thorough">Thorough — real sustained load</option>
+            <option value="stress">Stress — datacenter-scale (can hurt a small origin)</option>
+          </select>
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="stress-probe-btn">Run resilience test</button>
+        </div>
+      </div>
+      <span id="stress-probe-status" class="sub"></span>
+      <div id="stress-probe-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card">
+      <h2>Load-test command builder <span class="tag">real stress · you run it</span></h2>
+      <p class="sub">For true high-volume stress the native probe won't do, this assembles a command for an
+        industry-standard load generator. It never executes — copy it and run it yourself, against an
+        authorized target, from infrastructure your engagement allows.</p>
+      <div class="row mt">
+        <div class="field fit">
+          <label for="stress-build-engine">Engine</label>
+          <select id="stress-build-engine">
+            <option value="k6">k6 (ramped stages)</option>
+            <option value="vegeta">vegeta (constant rate)</option>
+            <option value="hey">hey</option>
+            <option value="wrk">wrk</option>
+            <option value="ab">ApacheBench</option>
+          </select>
+        </div>
+        <div class="field grow-2">
+          <label for="stress-build-url">URL</label>
+          <input type="text" id="stress-build-url" placeholder="https://example.com">
+        </div>
+      </div>
+      <div class="row mt">
+        <div class="field fit">
+          <label for="stress-build-rate">Rate (RPS)</label>
+          <input type="text" id="stress-build-rate" placeholder="50" value="50">
+        </div>
+        <div class="field fit">
+          <label for="stress-build-concurrency">Concurrency</label>
+          <input type="text" id="stress-build-concurrency" placeholder="50" value="50">
+        </div>
+        <div class="field fit">
+          <label for="stress-build-duration">Duration</label>
+          <input type="text" id="stress-build-duration" placeholder="30s" value="30s">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="stress-build-btn" class="secondary">Build command</button>
+        </div>
+      </div>
+      <div id="stress-build-out" class="mt hidden"></div>
     </div>
   </div>
 

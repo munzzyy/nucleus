@@ -61,7 +61,7 @@ This is the only console that can run security tools, so it's built to assume th
 - **Scope + authorization gate.** RFC1918/loopback targets are refused unless an explicit `lab` flag is set; every run requires `authorized: true` server-side. The checkbox in the UI is a convenience, not the enforcement.
 - **Non-destructive only.** Runners use safe, read-mostly flags with hard timeouts and output caps, and degrade cleanly to "not installed — here's the install command" when a binary is absent.
 - **Aggressive tools are never executed.** For hydra/hashcat/sqlmap/metasploit/etc. the console *builds the command string* for you to run yourself.
-- **Audit log.** Every run is appended to `var/redcell-scans.jsonl`.
+- **Audit log — off by default.** When persistent logging is enabled (`NUCLEUS_LOGGING=1`) every run is appended to `var/redcell-scans.jsonl`. It ships OFF: an authorized engagement generally shouldn't leave an on-disk record of what was scanned. With it off, nothing is written to `var/` — not the redcell audit trail, not the recon case history (`var/recon-scans.jsonl`), not saved nmap/nuclei output copies (`var/redcell-out/`). Results still render live in the UI for the session; only the disk writes are suppressed. The switch is one flag in `shared/common.py` (`LOGGING_ENABLED`).
 
 ### Redcell's native capabilities (no external tool, same guards)
 

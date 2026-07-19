@@ -104,18 +104,50 @@
     try {
       const j = await N.get("/api/hardening");
       el.innerHTML = j.scripts.map(scriptCard).join("");
-      el.querySelectorAll("button.copy").forEach(btn => {
-        btn.addEventListener("click", async () => {
-          try {
-            await navigator.clipboard.writeText(btn.getAttribute("data-cmd"));
-            N.toast("command copied", "ok");
-          } catch (_) {
-            N.toast("copy failed — select manually", "bad");
-          }
-        });
-      });
+      wireCopyButtons(el);
     } catch (e) {
       el.innerHTML = `<div class="card"><p class="muted">hardening panel failed: ${N.esc(e.message)}</p></div>`;
+    }
+  }
+
+  // ---- priority fix plan ----------------------------------------------
+  function planStep(s, i) {
+    return `
+      <div class="card script-card">
+        <div class="head"><h3>${i + 1}. ${N.esc(s.label)}</h3></div>
+        ${s.why ? `<div class="desc">${N.esc(s.why)}</div>` : ""}
+        <div class="cmdrow">
+          <code>${N.esc(s.command)}</code>
+          <button class="ghost copy" data-cmd="${N.esc(s.command)}">copy</button>
+        </div>
+      </div>`;
+  }
+
+  function wireCopyButtons(el) {
+    el.querySelectorAll("button.copy").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(btn.getAttribute("data-cmd"));
+          N.toast("command copied", "ok");
+        } catch (_) {
+          N.toast("copy failed — select manually", "bad");
+        }
+      });
+    });
+  }
+
+  async function loadHardeningPlan() {
+    const el = document.getElementById("hardening-plan");
+    try {
+      const j = await N.get("/api/hardening-plan");
+      if (!j.steps || !j.steps.length) {
+        el.innerHTML = `<div class="card"><p class="muted">Nothing to fix — every posture check that has a fix is already passing.</p></div>`;
+        return;
+      }
+      el.innerHTML = `<div class="grid cols-2">${j.steps.map(planStep).join("")}</div>`;
+      wireCopyButtons(el);
+    } catch (e) {
+      el.innerHTML = `<div class="card"><p class="muted">fix plan failed: ${N.esc(e.message)}</p></div>`;
     }
   }
 
@@ -197,6 +229,7 @@
     loadAnonymity();
     setInterval(loadAnonymity, 20000);
     loadPosture();
+    loadHardeningPlan();
     loadHardening();
     document.getElementById("report-run").addEventListener("click", runReport);
     document.getElementById("report-domain").addEventListener("keydown", e => {

@@ -64,6 +64,27 @@
 
   <div id="results" class="mt"></div>
 
+  <div class="section-title">Subdomain takeover check</div>
+  <div class="card" id="takeover-card">
+    <p class="sub">Follows each name's CNAME chain and flags any that point at a third-party service with a
+      dangling / unclaimed resource — the classic subdomain-takeover setup. Passive: a CNAME lookup and one
+      GET per name. Enter a single host, or paste several (comma / space / newline separated — e.g. the
+      subdomains a domain scan turned up).</p>
+    <div class="row mt">
+      <div class="field grow">
+        <label for="takeover-input">Host(s)</label>
+        <input type="text" id="takeover-input" autocomplete="off" spellcheck="false"
+               placeholder="app.example.com  blog.example.com  …">
+      </div>
+      <div class="field fit">
+        <label>&nbsp;</label>
+        <button type="button" id="takeover-btn">Check</button>
+      </div>
+    </div>
+    <span id="takeover-status" class="sub"></span>
+    <div id="takeover-result" class="mt hidden"></div>
+  </div>
+
   <div id="recon-history-wrap" class="hidden">
     <div class="section-title">Scan history</div>
     <div id="recon-history" class="grid cols-3 mt"></div>

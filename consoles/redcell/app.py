@@ -4,7 +4,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import common
-from consoles.redcell import runners, inventory, builder, hashtools, webscan, playbooks, secretscan
+from consoles.redcell import (runners, inventory, builder, hashtools, webscan, playbooks,
+                               secretscan, stresstest, tlsaudit, techfp, jwtaudit)
 
 ROUTES = {
     "GET /api/inventory": inventory.handle_inventory,
@@ -24,6 +25,15 @@ ROUTES = {
     "POST /api/web-analyze": webscan.handle_web_analyze,
     "POST /api/secret-scan": secretscan.handle_secret_scan,
     "GET /api/playbooks": playbooks.handle_playbooks,
+    # ---- new: DDoS resilience testing (bounded L7 probe + load-test builder) ----
+    "POST /api/stress-token": stresstest.handle_stress_token,
+    "POST /api/stress-verify": stresstest.handle_stress_verify,
+    "POST /api/stress-probe": stresstest.handle_stress_probe,
+    "POST /api/stress-build": stresstest.handle_stress_build,
+    # ---- new: deep TLS audit, passive tech fingerprinting, offline JWT analysis ----
+    "POST /api/tls-audit": tlsaudit.handle_tls_audit,
+    "POST /api/tech-fingerprint": techfp.handle_tech_fingerprint,
+    "POST /api/jwt-audit": jwtaudit.handle_jwt_audit,
 }
 
 

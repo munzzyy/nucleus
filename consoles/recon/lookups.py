@@ -116,16 +116,10 @@ def _keyed_note(status, err) -> str:
 
 
 def _geo_lookup(ip: str) -> dict | None:
-    status, body, _, _ = _safe_fetch(f"http://ip-api.com/json/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        if data.get("status") == "success":
-            return {
-                "country": data.get("country"), "region": data.get("regionName"),
-                "city": data.get("city"), "lat": data.get("lat"), "lon": data.get("lon"),
-                "isp": data.get("isp"), "org": data.get("org"), "asn": data.get("as"),
-                "source": "ip-api.com",
-            }
+    # HTTPS source first — this is an opsec tool, and the IP being looked up is
+    # exactly the thing you don't want leaking over cleartext to a passive
+    # observer. ip-api.com's free tier is HTTP-only, so it's the last-resort
+    # fallback, not the default path.
     status, body, _, _ = _safe_fetch(f"https://ipwho.is/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
     if status == 200:
         data = _json_or_none(body) or {}
@@ -136,6 +130,16 @@ def _geo_lookup(ip: str) -> dict | None:
                 "city": data.get("city"), "lat": data.get("latitude"), "lon": data.get("longitude"),
                 "isp": conn.get("isp"), "org": conn.get("org"), "asn": conn.get("asn"),
                 "source": "ipwho.is",
+            }
+    status, body, _, _ = _safe_fetch(f"http://ip-api.com/json/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
+    if status == 200:
+        data = _json_or_none(body) or {}
+        if data.get("status") == "success":
+            return {
+                "country": data.get("country"), "region": data.get("regionName"),
+                "city": data.get("city"), "lat": data.get("lat"), "lon": data.get("lon"),
+                "isp": data.get("isp"), "org": data.get("org"), "asn": data.get("as"),
+                "source": "ip-api.com (cleartext fallback)",
             }
     return None
 
@@ -364,7 +368,7 @@ def _check_wmn_site(u: str, site: dict) -> dict:
         return {"found": None, "url": profile, "note": err or "unreachable or timed out"}
     e_code, e_string = site["e_code"], site["e_string"]
     m_code, m_string = site["m_code"], site["m_string"]
-    if status == e_code and e_string in text:
+    if status == e_code and e_string and e_string in text:
         return {"found": True, "url": profile, "note": f"HTTP {status}, e_string matched (whatsmyname)"}
     if status == m_code or (m_string and m_string in text):
         return {"found": False, "url": profile, "note": f"HTTP {status} (whatsmyname)"}
@@ -1651,6 +1655,8 @@ def log_scan(kind: str, query: str, scan: dict) -> None:
     """Append one finished scan to var/recon-scans.jsonl. Best-effort and
     silent on failure -- case history is a convenience, never a scan
     dependency."""
+    if not common.LOGGING_ENABLED:   # no on-disk trail by default (NUCLEUS_LOGGING=1 to opt in)
+        return
     try:
         scan_id = secrets.token_hex(4) + format(int(time.time()), "x")
         entry = {

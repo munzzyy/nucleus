@@ -908,5 +908,70 @@
     }
   }
 
+  // ---- subdomain takeover checker ----
+  function takeoverVerdictPill(v) {
+    if (v === "vulnerable") return "bad";
+    if (v === "likely") return "warn";
+    if (v === "safe") return "ok";
+    return "";  // error
+  }
+
+  function renderTakeover(data) {
+    const c = data.counts || {};
+    let body = `<p class="sub">Checked ${data.checked} host(s): `
+      + `<span class="pill bad">${c.vulnerable || 0} vulnerable</span> `
+      + `<span class="pill warn">${c.likely || 0} likely</span> `
+      + `<span class="pill ok">${c.safe || 0} safe</span>`
+      + (c.error ? ` <span class="pill">${c.error} error</span>` : "")
+      + `</p>`;
+    (data.results || []).forEach((r) => {
+      const chain = (r.cname_chain && r.cname_chain.length) ? esc(r.cname_chain.join(" → ")) : "no CNAME";
+      body += `<div style="padding:8px 0;border-top:1px solid var(--line)">`
+        + `<div><span class="pill ${takeoverVerdictPill(r.verdict)}">${esc(r.verdict)}</span> `
+        + `<strong>${esc(r.subdomain)}</strong>`
+        + (r.service ? ` <span class="faint small">— ${esc(r.service)}</span>` : "")
+        + `</div>`
+        + `<p class="sub mono small">CNAME: ${chain}${r.http_status ? " · HTTP " + esc(String(r.http_status)) : ""}</p>`;
+      if (r.evidence && r.evidence.length) body += `<p class="sub">${esc(r.evidence.join("; "))}</p>`;
+      if (r.note) body += `<p class="sub faint">${esc(r.note)}</p>`;
+      body += `</div>`;
+    });
+    return body;
+  }
+
+  async function runTakeover() {
+    const input = document.getElementById("takeover-input");
+    const status = document.getElementById("takeover-status");
+    const resultWrap = document.getElementById("takeover-result");
+    const rawVal = (input.value || "").trim();
+    if (!rawVal) { N.toast("enter a host first", "bad"); return; }
+    const parts = rawVal.split(/[\s,]+/).filter(Boolean);
+    const btn = document.getElementById("takeover-btn");
+    btn.disabled = true;
+    status.textContent = "following CNAME chains…";
+    resultWrap.classList.remove("hidden");
+    resultWrap.innerHTML = "";
+    try {
+      const payload = parts.length === 1 ? { domain: parts[0] } : { subdomains: parts };
+      const data = await N.post("/api/takeover", payload);
+      status.textContent = "";
+      resultWrap.innerHTML = renderTakeover(data);
+    } catch (e) {
+      status.textContent = "";
+      resultWrap.innerHTML = `<p class="bad">${esc(e.message || "takeover check failed")}</p>`;
+      N.toast(e.message || "takeover check failed", "bad");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  const takeoverBtn = document.getElementById("takeover-btn");
+  if (takeoverBtn) {
+    takeoverBtn.addEventListener("click", runTakeover);
+    document.getElementById("takeover-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") runTakeover();
+    });
+  }
+
   loadResources();
 })();

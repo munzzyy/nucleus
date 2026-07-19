@@ -1,7 +1,7 @@
 (function () {
   "use strict";
   const N = window.Nucleus;
-  const TABS = ["run", "web", "password", "arsenal", "build", "tools", "history", "expert"];
+  const TABS = ["run", "web", "stress", "password", "arsenal", "build", "tools", "history", "expert"];
   let INV = null;          // last /api/inventory payload
   let ACTIVE_CAT = "";
   let INV_SEARCH = "";
@@ -55,11 +55,13 @@
     wireArsenal();
     wireExpert();
     wireWebTab();
+    wireStressTab();
     wirePasswordTab();
     wireTargetField("run-target");
     wireTargetField("web-target");
     wireTargetField("web-analyze-target");
     wireTargetField("secret-scan-target");
+    wireTargetField("stress-probe-target");
     document.getElementById("hist-refresh").addEventListener("click", loadHistory);
     document.getElementById("outputs-refresh").addEventListener("click", loadOutputs);
     await loadInventory(false);
@@ -114,13 +116,20 @@
   // looking unauthorized). Client-side UX only — the real gate is server-side.
   // ------------------------------------------------------------------
   function wireAuthGate() {
-    const pairs = [["g-authorized", "w-authorized"], ["g-lab", "w-lab"],
-                   ["g-proceed-exposed", "w-proceed-exposed"]];
-    pairs.forEach(([a, b]) => {
-      const elA = document.getElementById(a), elB = document.getElementById(b);
-      if (!elA || !elB) return;
-      elA.addEventListener("change", () => { elB.checked = elA.checked; syncGateButtons(); });
-      elB.addEventListener("change", () => { elA.checked = elB.checked; syncGateButtons(); });
+    // Every tab's authorization/lab/opsec checkbox mirrors the Run tab's canonical
+    // g-* box, so checking the gate on one tab keeps the others honest. Server-side
+    // enforcement doesn't care which was checked — this is UI consistency only.
+    const groups = [
+      ["g-authorized", "w-authorized", "s-authorized"],
+      ["g-lab", "w-lab", "s-lab"],
+      ["g-proceed-exposed", "w-proceed-exposed", "s-proceed-exposed"],
+    ];
+    groups.forEach(ids => {
+      const els = ids.map(id => document.getElementById(id)).filter(Boolean);
+      els.forEach(el => el.addEventListener("change", () => {
+        els.forEach(other => { if (other !== el) other.checked = el.checked; });
+        syncGateButtons();
+      }));
     });
     syncGateButtons();
   }
@@ -132,7 +141,7 @@
   // unless proceed_exposed is set. Any of the "scan anyway" boxes (Run / Web /
   // Expert) flips it — it's a session-level "I accept being exposed" ack.
   function opsecOverride() {
-    return ["g-proceed-exposed", "w-proceed-exposed", "x-proceed-exposed"].some(id => {
+    return ["g-proceed-exposed", "w-proceed-exposed", "s-proceed-exposed", "x-proceed-exposed"].some(id => {
       const el = document.getElementById(id);
       return el && el.checked;
     });
@@ -144,6 +153,12 @@
     if (analyzeBtn) analyzeBtn.disabled = !gateChecked();
     const secretBtn = document.getElementById("secret-scan-btn");
     if (secretBtn) secretBtn.disabled = !gateChecked();
+    const stressBtn = document.getElementById("stress-probe-btn");
+    if (stressBtn) stressBtn.disabled = !gateChecked();
+    const tlsBtn = document.getElementById("tls-audit-btn");
+    if (tlsBtn) tlsBtn.disabled = !gateChecked();
+    const techBtn = document.getElementById("techfp-btn");
+    if (techBtn) techBtn.disabled = !gateChecked();
     refreshPlaybookRunButton();
   }
 
@@ -651,6 +666,22 @@
       if (e.key === "Enter" && !secretBtn.disabled) runSecretScan();
     });
     document.getElementById("web-target").addEventListener("input", refreshPlaybookRunButton);
+
+    const tlsBtn = document.getElementById("tls-audit-btn");
+    tlsBtn.addEventListener("click", runTlsAudit);
+    document.getElementById("tls-audit-target").addEventListener("keydown", e => {
+      if (e.key === "Enter" && !tlsBtn.disabled) runTlsAudit();
+    });
+    const techBtn = document.getElementById("techfp-btn");
+    techBtn.addEventListener("click", runTechFingerprint);
+    document.getElementById("techfp-target").addEventListener("keydown", e => {
+      if (e.key === "Enter" && !techBtn.disabled) runTechFingerprint();
+    });
+    const jwtBtn = document.getElementById("jwt-btn");  // offline, never gated
+    jwtBtn.addEventListener("click", runJwtAudit);
+    document.getElementById("jwt-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") runJwtAudit();
+    });
   }
 
   async function loadPlaybooks() {
@@ -960,7 +991,8 @@
     resultWrap.classList.remove("hidden");
     resultWrap.innerHTML = "";
     try {
-      const r = await N.post("/api/secret-scan", { url: target, authorized: gateChecked(), lab: labChecked(), proceed_exposed: opsecOverride() });
+      const deep = !!document.getElementById("secret-scan-deep") && document.getElementById("secret-scan-deep").checked;
+      const r = await N.post("/api/secret-scan", { url: target, authorized: gateChecked(), lab: labChecked(), deep, proceed_exposed: opsecOverride() });
       status.textContent = "";
       resultWrap.appendChild(buildSecretScanCard(r));
     } catch (e) {
@@ -970,6 +1002,179 @@
       N.toast("secret scan refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
     } finally {
       btn.disabled = !gateChecked();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // TLS deep-audit / tech fingerprint / JWT analyzer — the native tools
+  // added alongside the header/CORS analyzer and secret scanner.
+  // ------------------------------------------------------------------
+  function gradePillClass(grade) {
+    if (grade === "A" || grade === "B") return "ok";
+    if (grade === "C") return "warn";
+    return "bad";  // D / F
+  }
+
+  function buildFindingList(findings) {
+    const wrap = N.el("div", { class: "mt-8" });
+    if (!findings || !findings.length) {
+      wrap.appendChild(N.el("p", { class: "sub", text: "No issues flagged." }));
+      return wrap;
+    }
+    findings.forEach(f => {
+      const row = N.el("div", { class: "finding-row sev-" + N.esc(f.severity) });
+      const head = N.el("div");
+      head.appendChild(N.el("span", { class: "pill " + severityPillClass(f.severity), text: f.severity }));
+      head.appendChild(document.createTextNode(" "));
+      head.appendChild(N.el("strong", { text: f.title }));
+      row.appendChild(head);
+      if (f.detail) row.appendChild(N.el("p", { class: "sub", text: f.detail }));
+      wrap.appendChild(row);
+    });
+    return wrap;
+  }
+
+  function buildTlsCard(r) {
+    const wrap = N.el("div", { class: "card" });
+    if (!r.ok) {
+      wrap.appendChild(N.el("p", { class: "sub", text: "TLS audit failed: " + (r.error || "unknown") }));
+      return wrap;
+    }
+    wrap.appendChild(N.el("div", {}, [
+      N.el("span", { class: "pill " + gradePillClass(r.grade), text: "Grade " + r.grade }),
+      document.createTextNode(`  ${r.score_pct}%  ·  ${r.host} (${r.resolved_ip})`),
+    ]));
+    const parts = [];
+    Object.entries(r.protocols || {}).forEach(([label, p]) => {
+      const state = p.accepted === true ? "accepted" : p.accepted === false ? "refused" : "?";
+      parts.push(`${label}: ${state}`);
+    });
+    if (parts.length) wrap.appendChild(N.el("p", { class: "sub mono small mt-8", text: parts.join("   ·   ") }));
+    const c = r.cert || {};
+    const certBits = [`issuer ${c.issuer || "?"}`, c.trusted ? "trusted" : "UNTRUSTED"];
+    if (c.self_signed) certBits.push("self-signed");
+    if (c.hostname_ok === false) certBits.push("name mismatch");
+    if (c.days_left != null) certBits.push(`${c.days_left}d left`);
+    if (c.subject_cn) certBits.push(`CN ${c.subject_cn}`);
+    wrap.appendChild(N.el("p", { class: "sub mono small", text: "cert: " + certBits.join(" · ") }));
+    wrap.appendChild(buildFindingList(r.findings));
+    return wrap;
+  }
+
+  function buildTechCard(r) {
+    const wrap = N.el("div", { class: "card" });
+    if (!r.ok) {
+      wrap.appendChild(N.el("p", { class: "sub", text: "Fingerprint failed: " + (r.error || "unknown") }));
+      return wrap;
+    }
+    wrap.appendChild(N.el("p", { class: "sub", text: `${r.count} technolog${r.count === 1 ? "y" : "ies"} detected` }));
+    const list = N.el("div", { class: "mt-8" });
+    (r.technologies || []).forEach(t => {
+      const row = N.el("div", { class: "finding-row" });
+      const head = N.el("div");
+      head.appendChild(N.el("strong", { text: t.name }));
+      head.appendChild(document.createTextNode(`  —  ${t.category} · ${t.confidence} confidence`));
+      row.appendChild(head);
+      if (Array.isArray(t.evidence) && t.evidence.length) {
+        row.appendChild(N.el("p", { class: "sub mono small", text: t.evidence.join(" ; ") }));
+      }
+      list.appendChild(row);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  function buildJwtCard(r) {
+    const wrap = N.el("div", { class: "card" });
+    if (!r.ok) {
+      wrap.appendChild(N.el("p", { class: "sub", text: "Not a valid JWT: " + (r.error || "decode failed") }));
+      return wrap;
+    }
+    wrap.appendChild(N.el("p", { class: "sub", text: "alg: " + (r.alg || "?") }));
+    const pre = N.el("pre", { class: "term" });
+    pre.textContent = "header:\n" + JSON.stringify(r.header, null, 2) +
+      "\n\nclaims:\n" + JSON.stringify(r.payload, null, 2);
+    wrap.appendChild(pre);
+    wrap.appendChild(buildFindingList(r.findings));
+    if (r.crack && (r.crack.hashcat || r.crack.john)) {
+      wrap.appendChild(N.el("p", { class: "sub mt-8", text: "Offline crack commands — build-only, never run:" }));
+      [r.crack.hashcat, r.crack.john].forEach(cmd => {
+        if (cmd) { const p = N.el("pre", { class: "term" }); p.textContent = cmd; wrap.appendChild(p); }
+      });
+    }
+    return wrap;
+  }
+
+  async function runTlsAudit() {
+    const target = document.getElementById("tls-audit-target").value.trim();
+    const status = document.getElementById("tls-audit-status");
+    const resultWrap = document.getElementById("tls-audit-result");
+    if (!target) { N.toast("enter a host first", "bad"); return; }
+    if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
+    const btn = document.getElementById("tls-audit-btn");
+    btn.disabled = true;
+    status.textContent = "handshaking TLS 1.0–1.3…";
+    resultWrap.classList.remove("hidden");
+    resultWrap.innerHTML = "";
+    try {
+      const r = await N.post("/api/tls-audit", { host: target, authorized: gateChecked(), lab: labChecked(), proceed_exposed: opsecOverride() });
+      status.textContent = "";
+      resultWrap.appendChild(buildTlsCard(r));
+    } catch (e) {
+      status.textContent = "refused";
+      resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
+        document.createTextNode("refused: " + (e.body && e.body.error ? e.body.error : e.message))]));
+      N.toast("TLS audit refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+    } finally {
+      btn.disabled = !gateChecked();
+    }
+  }
+
+  async function runTechFingerprint() {
+    const target = document.getElementById("techfp-target").value.trim();
+    const status = document.getElementById("techfp-status");
+    const resultWrap = document.getElementById("techfp-result");
+    if (!target) { N.toast("enter a URL first", "bad"); return; }
+    if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
+    const btn = document.getElementById("techfp-btn");
+    btn.disabled = true;
+    status.textContent = "fetching + fingerprinting…";
+    resultWrap.classList.remove("hidden");
+    resultWrap.innerHTML = "";
+    try {
+      const r = await N.post("/api/tech-fingerprint", { url: target, authorized: gateChecked(), lab: labChecked(), proceed_exposed: opsecOverride() });
+      status.textContent = "";
+      resultWrap.appendChild(buildTechCard(r));
+    } catch (e) {
+      status.textContent = "refused";
+      resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
+        document.createTextNode("refused: " + (e.body && e.body.error ? e.body.error : e.message))]));
+      N.toast("fingerprint refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+    } finally {
+      btn.disabled = !gateChecked();
+    }
+  }
+
+  async function runJwtAudit() {
+    const token = document.getElementById("jwt-input").value.trim();
+    const status = document.getElementById("jwt-status");
+    const resultWrap = document.getElementById("jwt-result");
+    if (!token) { N.toast("paste a JWT first", "bad"); return; }
+    const btn = document.getElementById("jwt-btn");
+    btn.disabled = true;
+    status.textContent = "decoding…";
+    resultWrap.classList.remove("hidden");
+    resultWrap.innerHTML = "";
+    try {
+      const r = await N.post("/api/jwt-audit", { token });
+      status.textContent = "";
+      resultWrap.appendChild(buildJwtCard(r));
+    } catch (e) {
+      status.textContent = "error";
+      resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
+        document.createTextNode("error: " + (e.body && e.body.error ? e.body.error : e.message))]));
+    } finally {
+      btn.disabled = false;
     }
   }
 
@@ -999,8 +1204,26 @@
     head.appendChild(N.el("span", { class: "faint small", text: `confidence: ${f.confidence} · entropy ${f.entropy}` }));
     row.appendChild(head);
 
-    row.appendChild(N.el("p", { class: "sub mono small", text: "source: " + f.source }));
+    let sourceText = "source: " + f.source;
+    if (Array.isArray(f.also_in) && f.also_in.length) {
+      sourceText += "  ·  also in " + f.also_in.length + " more location" + (f.also_in.length === 1 ? "" : "s");
+    }
+    const sourceEl = N.el("p", { class: "sub mono small", text: sourceText });
+    if (Array.isArray(f.also_in) && f.also_in.length) sourceEl.title = f.also_in.join("\n");
+    row.appendChild(sourceEl);
     if (f.note) row.appendChild(N.el("p", { class: "sub build-note", text: f.note }));
+
+    // Decoded JWT claims (offline, no network) — issuer/subject/expiry at a glance.
+    if (f.jwt && f.jwt.payload) {
+      const p = f.jwt.payload;
+      const bits = [];
+      if (p.iss) bits.push("iss=" + p.iss);
+      if (p.sub) bits.push("sub=" + p.sub);
+      if (p.aud) bits.push("aud=" + (Array.isArray(p.aud) ? p.aud.join(",") : p.aud));
+      if (p.exp) { const d = new Date(p.exp * 1000); bits.push("exp=" + d.toISOString().slice(0, 19) + (d < new Date() ? " (EXPIRED)" : "")); }
+      if (p.scope || p.scopes) bits.push("scope=" + (p.scope || p.scopes));
+      row.appendChild(N.el("p", { class: "sub mono small", text: "JWT claims: " + (bits.join("  ·  ") || "(no standard claims)") }));
+    }
     // The snippet is context AROUND the match, so the raw secret sits inside it
     // too (that's what makes it useful) -- it would otherwise leak the full
     // value even while `masked` is hidden. Redact every literal occurrence of
@@ -1031,6 +1254,45 @@
     valueRow.appendChild(revealBtn);
     valueRow.appendChild(copyBtn);
     row.appendChild(valueRow);
+
+    // Safe, read-only verification command — BUILT, never run by the tool. It
+    // hits the credential's own provider (not the client site), so the operator
+    // decides whether that's in scope and runs it themselves. Masked by default
+    // (it embeds the secret), same reveal machinery as the value.
+    if (f.verify && f.verify.command) {
+      const v = f.verify;
+      const box = N.el("div", { class: "secret-verify mt-8" });
+      const label = N.el("div", { class: "sub small" });
+      label.appendChild(N.el("strong", { text: "Verify (build-only): " }));
+      label.appendChild(document.createTextNode(v.confirms || "confirms the key is live"));
+      box.appendChild(label);
+      const cmdEl = N.el("pre", { class: "term secret-verify-cmd" });
+      const maskedCmd = redactSnippet(v.command, f.match, f.masked);
+      cmdEl.textContent = maskedCmd;
+      box.appendChild(cmdEl);
+      const ctl = N.el("div", { class: "secret-value-row" });
+      let vShown = false;
+      const vReveal = N.el("button", { type: "button", class: "ghost small", text: "Reveal command" });
+      const vCopy = N.el("button", { type: "button", class: "ghost small hidden", text: "Copy command" });
+      vReveal.addEventListener("click", () => {
+        vShown = !vShown;
+        cmdEl.textContent = vShown ? v.command : maskedCmd;
+        vReveal.textContent = vShown ? "Hide command" : "Reveal command";
+        vCopy.classList.toggle("hidden", !vShown);
+      });
+      vCopy.addEventListener("click", () => {
+        navigator.clipboard.writeText(v.command).then(() => N.toast("command copied", "ok"), () => N.toast("copy failed", "bad"));
+      });
+      ctl.appendChild(vReveal);
+      ctl.appendChild(vCopy);
+      box.appendChild(ctl);
+      if (v.needs_pair) box.appendChild(N.el("p", { class: "sub small warn-text", text: "Fill in <SECRET> — this match is only half the credential." }));
+      if (v.note) box.appendChild(N.el("p", { class: "sub small faint", text: v.note }));
+      box.appendChild(N.el("p", { class: "sub small faint", text: "This request leaves the client's site and hits the key's provider — confirm it's in your engagement scope before running." }));
+      row.appendChild(box);
+    } else if (f.verify_note) {
+      row.appendChild(N.el("p", { class: "sub small faint", text: "No safe live-check: " + f.verify_note }));
+    }
 
     return row;
   }
@@ -1091,20 +1353,34 @@
 
     if (r.truncated) {
       card.appendChild(N.el("p", { class: "sub mt-8", text:
-        "results truncated — this page had more findings than the scan keeps." }));
+        `showing the top ${(r.findings || []).length} of ${r.total_findings} findings (every file was fully scanned — only the display list is trimmed, weakest-first).` }));
+    }
+    if (r.scan_truncated) {
+      card.appendChild(N.el("p", { class: "sub mt-8 warn-text", text:
+        "the scan hit its total-byte CPU budget — some fetched bytes were left unscanned. Findings below are complete up to that point." }));
     }
 
     const scripts = r.scripts_scanned || [];
     const totalKb = (scripts.reduce((s, x) => s + (x.bytes || 0), 0) / 1024).toFixed(1);
     const footer = N.el("div", { class: "secret-footer mt" });
-    footer.appendChild(N.el("p", { class: "sub", text:
-      `scanned ${scripts.length} same-site JS file${scripts.length === 1 ? "" : "s"} (${totalKb}KB)`
-      + (r.scripts_skipped_cross_origin
-          ? ` · skipped ${r.scripts_skipped_cross_origin} third-party script${r.scripts_skipped_cross_origin === 1 ? "" : "s"}`
-          : "") }));
-    if (r.sourcemap_referenced) {
+    const parts = [`scanned ${scripts.length} same-site JS file${scripts.length === 1 ? "" : "s"} (${totalKb}KB)`];
+    if (r.sourcemaps_scanned) parts.push(`${r.sourcemaps_scanned} source map${r.sourcemaps_scanned === 1 ? "" : "s"} recovered`);
+    if (r.wayback_scripts_scanned) parts.push(`${r.wayback_scripts_scanned} historical (Wayback) file${r.wayback_scripts_scanned === 1 ? "" : "s"}`);
+    if (r.scripts_skipped_cross_origin) parts.push(`skipped ${r.scripts_skipped_cross_origin} third-party script${r.scripts_skipped_cross_origin === 1 ? "" : "s"}`);
+    if (r.scripts_skipped_over_cap) parts.push(`${r.scripts_skipped_over_cap} more same-site script${r.scripts_skipped_over_cap === 1 ? "" : "s"} past the fetch cap`);
+    footer.appendChild(N.el("p", { class: "sub", text: parts.join(" · ") }));
+
+    // Deep-mode exposed-file probe results.
+    const probed = r.exposed_files_probed || [];
+    const served = probed.filter(p => p.served);
+    if (probed.length) {
+      footer.appendChild(N.el("p", { class: "sub small", text:
+        `deep: probed ${probed.length} exposed-file path${probed.length === 1 ? "" : "s"}, ${served.length} served`
+        + (served.length ? ": " + served.map(p => p.path).join(", ") : "") }));
+    }
+    if (r.sourcemap_referenced && !r.sourcemaps_scanned) {
       footer.appendChild(N.el("span", { class: "pill warn" }, [N.el("span", { class: "dot" }),
-        document.createTextNode("source maps referenced — may expose original source")]));
+        document.createTextNode("source maps referenced but not recovered — try again or fetch them manually")]));
     }
     card.appendChild(footer);
 
@@ -1512,5 +1788,243 @@
     } catch (e) {
       pre.textContent = "error: " + (e.message || "load failed");
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Resilience tab — DDoS resilience testing. A bounded native probe
+  // (/api/stress-probe, same gate stack as the runners) plus optional
+  // ownership verification and a copy-paste load-test command builder.
+  // Everything renders via N.el/textContent — server strings never touch
+  // innerHTML — so a reflected header value can't inject markup.
+  // ------------------------------------------------------------------
+  let STRESS_TOKEN = "";
+
+  function wireStressTab() {
+    const tokenBtn = document.getElementById("stress-token-btn");
+    if (!tokenBtn) return; // tab not present
+    tokenBtn.addEventListener("click", getStressToken);
+    document.getElementById("stress-verify-btn").addEventListener("click", verifyStressOwnership);
+    const probeBtn = document.getElementById("stress-probe-btn");
+    probeBtn.addEventListener("click", runStressProbe);
+    document.getElementById("stress-probe-target").addEventListener("keydown", e => {
+      if (e.key === "Enter" && !probeBtn.disabled) runStressProbe();
+    });
+    document.getElementById("stress-build-btn").addEventListener("click", buildLoadTest);
+  }
+
+  async function getStressToken() {
+    const target = document.getElementById("stress-verify-target").value.trim();
+    const out = document.getElementById("stress-token-out");
+    try {
+      const r = await N.post("/api/stress-token", { target });
+      STRESS_TOKEN = r.token;
+      out.classList.remove("hidden");
+      out.innerHTML = "";
+      out.appendChild(N.el("p", { class: "sub", text: "Place EITHER of these, then verify:" }));
+      const dns = N.el("div", { class: "mono small mb-8" });
+      dns.appendChild(N.el("b", { text: "DNS TXT  " }));
+      dns.appendChild(document.createTextNode(`${r.dns.name}  →  ${r.dns.value}`));
+      const file = N.el("div", { class: "mono small" });
+      file.appendChild(N.el("b", { text: "File     " }));
+      file.appendChild(document.createTextNode(`${r.file.url}  contains  ${r.file.content}`));
+      out.appendChild(dns);
+      out.appendChild(file);
+      out.appendChild(N.el("p", { class: "faint small mt-8", text: r.note }));
+      document.getElementById("stress-verify-row").classList.remove("hidden");
+    } catch (e) {
+      N.toast("token failed: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+    }
+  }
+
+  async function verifyStressOwnership() {
+    const target = document.getElementById("stress-verify-target").value.trim();
+    const method = document.getElementById("stress-verify-method").value;
+    const status = document.getElementById("stress-verify-status");
+    if (!target) { N.toast("enter a target first", "bad"); return; }
+    if (!STRESS_TOKEN) { N.toast("get a token first", "bad"); return; }
+    if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
+    status.textContent = "checking…";
+    try {
+      const r = await N.post("/api/stress-verify", { target, token: STRESS_TOKEN, method,
+                                                     authorized: gateChecked(), proceed_exposed: opsecOverride() });
+      status.innerHTML = "";
+      const pill = N.el("span", { class: "pill " + (r.verified ? "ok" : "bad") }, [
+        N.el("span", { class: "dot" }),
+        document.createTextNode(r.verified ? "scope verified" : "not verified"),
+      ]);
+      status.appendChild(pill);
+      status.appendChild(N.el("span", { class: "faint small ml-10", text: r.detail || "" }));
+    } catch (e) {
+      status.textContent = "error: " + (e.body && e.body.error ? e.body.error : e.message);
+    }
+  }
+
+  async function runStressProbe() {
+    const target = document.getElementById("stress-probe-target").value.trim();
+    const tier = document.getElementById("stress-probe-tier").value;
+    const status = document.getElementById("stress-probe-status");
+    const resultWrap = document.getElementById("stress-probe-result");
+    if (!target) { N.toast("enter a URL first", "bad"); return; }
+    if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
+    const btn = document.getElementById("stress-probe-btn");
+    btn.disabled = true;
+    const tick = tickerStart("stress-probe-status", "ramping load");
+    resultWrap.classList.remove("hidden");
+    resultWrap.innerHTML = "";
+    const body = { url: target, tier, authorized: gateChecked(), lab: labChecked(),
+                   proceed_exposed: opsecOverride() };
+    // Attach the verified scope stamp if the operator verified this run's target.
+    const vtarget = document.getElementById("stress-verify-target").value.trim();
+    if (STRESS_TOKEN && vtarget && target.indexOf(vtarget) !== -1) {
+      body.verify = { token: STRESS_TOKEN, method: document.getElementById("stress-verify-method").value };
+    }
+    try {
+      const r = await N.post("/api/stress-probe", body);
+      tickerStop(tick);
+      status.textContent = "";
+      resultWrap.appendChild(buildStressCard(r));
+    } catch (e) {
+      tickerStop(tick);
+      status.textContent = "refused";
+      resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
+        document.createTextNode("refused: " + (e.body && e.body.error ? e.body.error : e.message))]));
+      N.toast("resilience test refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+    } finally {
+      btn.disabled = !gateChecked();
+    }
+  }
+
+  function stressStatusClass(s) {
+    if (s === "good") return "ok";
+    if (s === "watch") return "warn";
+    return "bad"; // gap
+  }
+
+  function buildStressCard(r) {
+    const wrap = N.el("div", { class: "stress-result" });
+    if (!r.ok) {
+      wrap.appendChild(N.el("p", { class: "pill bad", text: r.error || "probe failed" }));
+      return wrap;
+    }
+    // Headline: grade + key totals — reuses the analyzer's grade-row look.
+    const head = N.el("div", { class: "grade-row" });
+    head.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade }));
+    const meta = N.el("div", { class: "grade-meta" });
+    meta.appendChild(N.el("div", { class: "grade-score", text: `Resilience ${r.score}/100 · tier ${r.tier}` }));
+    const t = r.totals || {};
+    meta.appendChild(N.el("div", { class: "sub", text:
+      `${t.requests} requests · peak ${t.peak_rps} rps · ${Math.round((t.distress_rate||0)*100)}% failed · ${t.timeouts} timeouts` }));
+    head.appendChild(meta);
+    wrap.appendChild(head);
+
+    if (r.scope_verified && r.scope_verified.verified) {
+      wrap.appendChild(N.el("p", { class: "pill ok mt-8" }, [N.el("span", { class: "dot" }),
+        document.createTextNode("scope verified — " + (r.scope_verified.detail || ""))]));
+    }
+    if (r.aborted) {
+      wrap.appendChild(N.el("p", { class: "faint small mt-8", text: "⛔ " + r.aborted }));
+    }
+
+    // Defense verdicts
+    const vwrap = N.el("div", { class: "mt" });
+    (r.verdicts || []).forEach(v => {
+      const row = N.el("div", { class: "verdict-row" });
+      row.appendChild(N.el("span", { class: "pill " + stressStatusClass(v.status), text: v.status }));
+      const body = N.el("div", {});
+      body.appendChild(N.el("b", { text: v.area }));
+      body.appendChild(N.el("div", { class: "sub", text: v.detail }));
+      row.appendChild(body);
+      vwrap.appendChild(row);
+    });
+    wrap.appendChild(vwrap);
+
+    // Latency + degradation summary
+    const lat = r.latency_overall_ms || {};
+    const latLine = N.el("p", { class: "sub mt", text:
+      `Latency p50/p95/p99: ${lat.p50}/${lat.p95}/${lat.p99} ms` +
+      (r.degradation_p95_ratio != null ? ` · p95 grew ×${r.degradation_p95_ratio} across the ramp` : "") });
+    wrap.appendChild(latLine);
+
+    // Per-step ramp table
+    if ((r.steps || []).length) {
+      const details = N.el("details", { class: "mt" });
+      details.appendChild(N.el("summary", { text: "Ramp steps" }));
+      const tbl = N.el("table", { class: "stress-steps" });
+      const hr = N.el("tr", {});
+      ["conc", "req", "ok", "5xx", "timeout", "429", "rps", "p95 ms"].forEach(h =>
+        hr.appendChild(N.el("th", { text: h })));
+      tbl.appendChild(hr);
+      r.steps.forEach(st => {
+        const tr = N.el("tr", {});
+        [st.concurrency, st.requests, st.ok, st.http_5xx, st.timeouts, st.rate_limited,
+         st.rps, st.latency.p95].forEach(c => tr.appendChild(N.el("td", { text: String(c) })));
+        tbl.appendChild(tr);
+      });
+      details.appendChild(tbl);
+      wrap.appendChild(details);
+    }
+
+    // Remediation
+    if ((r.remediation || []).length) {
+      const rem = N.el("details", { class: "mt" });
+      rem.appendChild(N.el("summary", { text: `Remediation (${r.remediation.length})` }));
+      r.remediation.forEach(item => {
+        const b = N.el("div", { class: "remediation-item" });
+        b.appendChild(N.el("b", { text: item.area }));
+        b.appendChild(N.el("div", { class: "sub", text: item.fix }));
+        if (item.verify) b.appendChild(N.el("div", { class: "faint small", text: "Verify: " + item.verify }));
+        rem.appendChild(b);
+      });
+      wrap.appendChild(rem);
+    }
+
+    // Honesty notes
+    if ((r.notes || []).length) {
+      const notes = N.el("details", { class: "mt" });
+      notes.appendChild(N.el("summary", { text: "Method + limits" }));
+      r.notes.forEach(n => notes.appendChild(N.el("p", { class: "faint small", text: n })));
+      wrap.appendChild(notes);
+    }
+    return wrap;
+  }
+
+  async function buildLoadTest() {
+    const engine = document.getElementById("stress-build-engine").value;
+    const out = document.getElementById("stress-build-out");
+    const params = {
+      url: document.getElementById("stress-build-url").value.trim(),
+      rate: document.getElementById("stress-build-rate").value.trim(),
+      concurrency: document.getElementById("stress-build-concurrency").value.trim(),
+      duration: document.getElementById("stress-build-duration").value.trim(),
+    };
+    try {
+      const r = await N.post("/api/stress-build", { engine, params });
+      out.classList.remove("hidden");
+      out.innerHTML = "";
+      if (r.files && r.files.length) {
+        r.files.forEach(f => {
+          out.appendChild(N.el("div", { class: "small faint", text: f.name }));
+          const pre = N.el("pre", { class: "term", text: f.content });
+          out.appendChild(pre);
+          out.appendChild(mkCopyBtn(f.content));
+        });
+      }
+      if (r.command) {
+        out.appendChild(N.el("pre", { class: "term", text: r.command }));
+        out.appendChild(mkCopyBtn(r.command));
+      }
+      out.appendChild(N.el("p", { class: "faint small mt-8", text: r.note || "" }));
+      out.appendChild(N.el("p", { class: "faint small", text:
+        "Not executed here — copy and run it yourself against an authorized target." }));
+    } catch (e) {
+      N.toast("build failed: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+    }
+  }
+
+  function mkCopyBtn(text) {
+    const btn = N.el("button", { type: "button", class: "secondary small mt-8", text: "Copy" });
+    btn.addEventListener("click", () =>
+      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad")));
+    return btn;
   }
 })();

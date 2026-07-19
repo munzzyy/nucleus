@@ -69,6 +69,10 @@ CATALOG = [
      "get_url": "https://haveibeenpwned.com/API/Key",
      "free": "paid, ~$4/mo (worth it)",
      "unlocks": "Email: the authoritative breach list + pastes. Recon already uses keyless XposedOrNot; HIBP is the gold standard."},
+    {"name": "WPSCAN_API_TOKEN", "label": "WPScan", "provider": "wpscan.com",
+     "get_url": "https://wpscan.com/register",
+     "free": "free, 25 requests/day",
+     "unlocks": "Redcell: unlocks WPScan's live vulnerability database, so WordPress core/plugin/theme scans return known CVEs. Without it wpscan still enumerates but reports no vuln data."},
 ]
 
 CATALOG_BY_NAME = {k["name"]: k for k in CATALOG}

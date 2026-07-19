@@ -208,3 +208,24 @@ button.ghost.small, .ghost.small { padding: 5px 10px; font-size: 12px; }
   padding: 5px 9px; word-break: break-all; }
 .secret-footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   padding-top: 10px; margin-top: 4px; border-top: 1px solid var(--line); }
+.secret-footer p { margin: 0; }
+.warn-text { color: var(--warn); }
+.secret-verify { border-top: 1px dashed var(--line); padding-top: 8px; }
+.secret-verify-cmd { margin: 6px 0; max-height: 110px; font-size: 11.5px; white-space: pre-wrap; word-break: break-all; }
+.secret-verify p { margin: 3px 0 0; }
+
+/* ---- resilience (DDoS) tab ---- */
+.stress-result .verdict-row { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0;
+  border-bottom: 1px solid var(--line); }
+.stress-result .verdict-row:last-child { border-bottom: 0; }
+.stress-result .verdict-row .pill { flex: none; margin-top: 1px; text-transform: capitalize; }
+.stress-result .verdict-row b { font-size: 13px; }
+.stress-steps { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+.stress-steps th, .stress-steps td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums; }
+.stress-steps th { color: var(--txt-faint); font-weight: 600; }
+.stress-steps th:first-child, .stress-steps td:first-child { text-align: left; }
+.remediation-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.remediation-item:last-child { border-bottom: 0; }
+.remediation-item b { font-size: 13px; }
+#stress-token-out .mono { word-break: break-all; }
