@@ -148,14 +148,16 @@ CUSTOM_TIER = "custom"
 
 # Concurrency a custom run ramps up through before holding at the target. Only
 # the entries strictly below the target are used, then the target itself. This is
-# a STRONG ramp: it starts at a real load (10) and takes big multiplicative jumps
-# (~3–4× per rung) so it reaches heavy load fast instead of crawling up through a
-# long tail of tiny steps. The first rung stays low enough to be a clean latency
-# baseline for the degradation ratio; the circuit breaker — which checks after
-# every step — is what protects a weak target from the bigger jumps, aborting the
-# instant one buckles. Each rung fires the full concurrency*REQS_PER_WORKER, and
-# the large request ceiling leaves budget for the ramp AND a sustained hold after.
-_CUSTOM_RAMP_LADDER = (10, 50, 150, 400)
+# a STRONG ramp: it opens at a real load (25) and takes big multiplicative jumps
+# (~3–6× per rung) so it hits heavy load in a handful of steps instead of crawling
+# up a long tail of tiny ones. The first rung stays low enough to be a usable
+# latency baseline for the degradation ratio; the circuit breaker — which checks
+# after every step — is what protects a weak target from the bigger jumps,
+# aborting the instant one buckles. A target concurrency below the opening rung
+# just runs straight at the target with no ramp (nothing meaningful to climb).
+# Each rung fires the full concurrency*REQS_PER_WORKER, and the large request
+# ceiling leaves budget for the ramp AND a sustained hold at the target after it.
+_CUSTOM_RAMP_LADDER = (25, 150, 500)
 
 # Defaults when a custom field is missing/unparseable — a modest, safe run.
 _CUSTOM_DEFAULT_CONCURRENCY = 25
