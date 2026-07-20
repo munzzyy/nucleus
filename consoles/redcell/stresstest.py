@@ -26,10 +26,16 @@ What it is NOT, on purpose:
     gentle and aborts the moment it buckles). For volume beyond what one box can
     push — truly saturating a big CDN/datacenter — use the k6/vegeta/hey/wrk/ab
     command builder, which never executes anything here.
-  * Not a fire-and-forget hammer. A circuit breaker aborts the ramp the moment
-    the target shows sustained distress — the goal is to FIND the point where
-    defenses kick in (or don't), not to keep hitting something that's already
-    hurting.
+  * Not a fire-and-forget hammer — for the gentle preset tiers. There, a circuit
+    breaker aborts the ramp the moment the target shows sustained distress; the
+    goal is to FIND the point where defenses kick in (or don't), not to keep
+    hitting something already hurting. Custom mode is an operator-driven load
+    test, so the breaker defaults OFF there (it can be turned back on): the
+    operator sets the load and usually wants the full ramp, the way k6/vegeta run,
+    and a timeout spike at high concurrency is often the local box saturating
+    rather than the target dying. Distress is still measured and graded either
+    way — the breaker only decides whether the run stops early, never what's
+    reported. The hard caps and every gate below stay in force regardless.
 
 Every native run passes the same gate stack the runners use:
   1. authorized:true (you assert permission to test this target)
@@ -37,7 +43,7 @@ Every native run passes the same gate stack the runners use:
   3. the opsec gate — refused while your real IP is exposed (no VPN), unless
      you override or it's a lab target
   4. the hard caps above, applied to whatever tier was requested
-  5. the circuit breaker, live, during the run
+  5. the circuit breaker during the run — on for the preset tiers, opt-in for custom
 
 Ownership verification (verify_ownership) is an OPTIONAL proof-of-scope feature,
 not a blocker: place a token in DNS TXT or a well-known file on the target and
@@ -49,6 +55,8 @@ stamp can never be faked) — but skipping verification entirely is fine.
 from __future__ import annotations
 
 import http.client
+import socket
+import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -350,12 +358,161 @@ def verify_ownership(host: str, token: str, method: str) -> dict:
 # ==========================================================================
 # The bounded ramp probe
 # ==========================================================================
-def _one_request(url: str) -> dict:
-    """Fire a single timed GET through the SSRF-guarded fetch. Never raises —
-    a failure is a sample with ok=False, so one dead request can't abort a step."""
+# Max body bytes drained per response before a connection is declared unreusable.
+# Keep-alive REQUIRES the full body be consumed before the next request; this caps
+# how much we'll pull off a pathologically large response before just dropping the
+# connection (and reopening) instead — so one huge body can't stall a worker OR
+# quietly move real bandwidth. Kept close to PROBE_MAX_BYTES so the probe stays a
+# "measure, don't move bytes" tool: a target serving bodies bigger than this just
+# loses keep-alive for those requests (reopen each), it doesn't get a 125x download.
+_DRAIN_CAP = 65_536
+
+
+class _KeepAliveConn:
+    """A reusable, SSRF-pinned HTTP(S) connection for the probe. It holds one
+    http.client connection whose socket is pinned to the exact public IP the guard
+    validated, so a burst of requests reuses ONE TCP+TLS handshake instead of
+    paying it per request — that connection reuse is where the throughput comes
+    from (the old per-request `Connection: close` path re-handshook every time).
+    Not thread-safe: one instance per worker thread."""
+    __slots__ = ("conn", "key", "_raw", "_wrapped")
+
+    def __init__(self):
+        self.conn = None       # http.client.HTTPConnection with .sock set to the pinned socket
+        self.key = None        # (scheme, host, port) the held connection is for
+        self._raw = None       # underlying TCP socket
+        self._wrapped = None   # TLS socket for https (holds the real fd)
+
+    def close(self):
+        # Close both the TLS wrapper (holds the fd) and the raw socket; wrap_socket
+        # detaches the raw one, so closing an already-detached socket is a no-op —
+        # same belt-and-suspenders as common.fetch. Idempotent.
+        for s in (self._wrapped, self._raw):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self.conn = self.key = self._raw = self._wrapped = None
+
+
+def _drain(resp, keep_bytes: int) -> tuple:
+    """Consume a response body so its connection can be reused. Returns
+    (kept, reusable): `kept` is up to `keep_bytes` of the body (for header/size
+    work); `reusable` is True only if the WHOLE body was consumed within
+    _DRAIN_CAP — a connection with an unread body must not be reused."""
+    kept = resp.read(keep_bytes) if keep_bytes else b""
+    if resp.isclosed():
+        return kept, True
+    drained = len(kept)
+    while not resp.isclosed():
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        drained += len(chunk)
+        if drained > _DRAIN_CAP:
+            return kept, False   # too big to fully drain — don't reuse this connection
+    return kept, resp.isclosed()
+
+
+def _probe_get(url: str, *, timeout: float = REQ_TIMEOUT, max_bytes: int = PROBE_MAX_BYTES,
+               keepalive: Optional["_KeepAliveConn"] = None) -> tuple:
+    """SSRF-safe GET that REUSES a keep-alive connection when `keepalive` holds one
+    for the same origin, returning (status, body, headers) — the SAME contract as
+    common.fetch, and raising the SAME exceptions (ValueError for a blocked host or
+    bad scheme, OSError, http.client.HTTPException). That keeps _one_request's
+    handling unchanged.
+
+    SSRF: resolves + pins via common._resolve_public and connects to THAT IP only
+    (the hostname is kept for TLS SNI / cert check / Host header) — identical to
+    common.fetch's pin. A reused connection stays on its pinned IP for its whole
+    life, so reuse adds no rebinding surface; opening a new connection re-resolves
+    and re-pins. Unlike common.fetch it does NOT follow redirects: a load probe
+    records the status returned at the URL it's aimed at (keep-alive and manual
+    redirect chains don't mix, and testing the given endpoint is the intent)."""
+    u = urlparse(url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError(f"scheme not allowed: {u.scheme}")
+    host = u.hostname or ""
+    if not host:
+        raise ValueError("no host in url")
+    port = u.port or (443 if u.scheme == "https" else 80)
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+    key = (u.scheme, host, port)
+
+    own = keepalive is None
+    ka = _KeepAliveConn() if own else keepalive
+    try:
+        # Drop any held connection that's for a different origin than this URL.
+        if ka.conn is not None and ka.key != key:
+            ka.close()
+        if ka.conn is None:
+            ip, _family = common._resolve_public(host)   # validates public + pins; raises on non-public
+            open_deadline = time.monotonic() + timeout   # bounds connect + TLS handshake
+            raw = socket.create_connection((ip, port), timeout=timeout)
+            # TCP_NODELAY: we set conn.sock ourselves, which bypasses http.client's
+            # own connect() that would normally set this — without it, Nagle's
+            # algorithm stalls the request/response ping-pong on a reused keep-alive
+            # connection by ~40ms each, which would make keep-alive SLOWER than
+            # close-per-request. Every load generator disables Nagle; so do we.
+            try:
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            wrapped = None
+            try:
+                if u.scheme == "https":
+                    common._arm_deadline(raw, open_deadline)   # bound the handshake, like fetch()
+                    ctx = ssl.create_default_context()
+                    wrapped = ctx.wrap_socket(raw, server_hostname=host)
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            except BaseException:
+                for s in (wrapped, raw):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                raise
+            ka.conn, ka.key, ka._raw, ka._wrapped = conn, key, raw, wrapped
+
+        # Bound the WHOLE request (send through final body byte) by ONE fresh
+        # monotonic deadline, re-armed before every socket op by _DeadlineSock — a
+        # single settimeout() only bounds one recv(), which a slow-trickle body
+        # rides far past (measured ~7.5x). Reuses fetch()'s exact mechanism; a new
+        # _DeadlineSock per request just resets the deadline on the same pinned fd.
+        underlying = ka._wrapped if ka._wrapped is not None else ka._raw
+        ka.conn.sock = common._DeadlineSock(underlying, time.monotonic() + timeout)
+        ka.conn.request("GET", path, headers={
+            "Host": host, "User-Agent": common._UA,
+            "Accept-Encoding": "identity", "Connection": "keep-alive"})
+        resp = ka.conn.getresponse()
+        status = resp.status
+        headers = {k: v for k, v in resp.getheaders()}
+        body, reusable = _drain(resp, max_bytes)
+        # Drop the connection if the server won't keep it open, we couldn't fully
+        # drain it, or nobody's holding it for reuse.
+        if own or resp.will_close or not reusable:
+            ka.close()
+        return status, body, headers
+    except (OSError, http.client.HTTPException):
+        ka.close()   # connection is in an unknown state — never reuse it
+        raise
+    finally:
+        if own:
+            ka.close()   # transient connection: always release the fd
+
+
+def _one_request(url: str, keepalive: Optional["_KeepAliveConn"] = None) -> dict:
+    """Fire a single timed GET (reusing `keepalive`'s connection when given).
+    Never raises — a failure is a sample with ok=False, so one dead request can't
+    abort a step; the next call transparently reopens a dropped connection."""
     t0 = time.monotonic()
     try:
-        status, _body, headers = common.fetch(url, timeout=REQ_TIMEOUT, max_bytes=PROBE_MAX_BYTES)
+        status, _body, headers = _probe_get(url, timeout=REQ_TIMEOUT,
+                                            max_bytes=PROBE_MAX_BYTES, keepalive=keepalive)
         ms = (time.monotonic() - t0) * 1000.0
         return {"ok": True, "status": status, "ms": ms, "headers": headers, "timeout": False}
     except ValueError as e:
@@ -369,27 +526,57 @@ def _one_request(url: str) -> dict:
         return {"ok": False, "status": 0, "ms": ms, "err": type(e).__name__, "timeout": is_to}
 
 
-def _run_step(url: str, concurrency: int, n_requests: int, deadline: float) -> dict:
-    """Fire `n_requests` GETs with up to `concurrency` in flight, timed as a
-    block, but never past `deadline` (monotonic). Returns the step's aggregate
-    sample. The deadline makes MAX_DURATION_S a real wall-clock ceiling *within*
-    a step, not just between steps — a slow target (or a long redirect chain,
-    each hop getting its own timeout) can't stretch one step past the cap. When
-    the deadline hits we stop collecting and cancel anything not yet started;
-    in-flight requests are each already bounded by REQ_TIMEOUT."""
-    workers = max(1, min(concurrency, MAX_CONCURRENCY))
-    t0 = time.monotonic()
-    samples: list = []
-    pool = ThreadPoolExecutor(max_workers=workers)
+def _keepalive_burst(url: str, count: int, deadline: float) -> list:
+    """Fire up to `count` GETs over ONE reused keep-alive connection, honoring the
+    per-request timeout and the step `deadline`. Never raises: each request becomes
+    a sample, and _probe_get transparently reopens a connection that dropped, so a
+    single failure doesn't end the burst. The connection is always closed at the end."""
+    ka = _KeepAliveConn()
+    out: list = []
     try:
-        futures = [pool.submit(_one_request, url) for _ in range(n_requests)]
-        for fut in as_completed(futures):
-            samples.append(fut.result())
+        for _ in range(count):
             if time.monotonic() >= deadline:
                 break
+            out.append(_one_request(url, ka))
+    finally:
+        ka.close()
+    return out
+
+
+def _run_step(url: str, concurrency: int, n_requests: int, deadline: float) -> dict:
+    """Fire `n_requests` GETs across up to `concurrency` persistent connections,
+    timed as a block, but never past `deadline` (monotonic). Each connection is a
+    keep-alive worker that fires its share sequentially, reusing one TCP+TLS
+    handshake — that's the high-RPS path (the closed-model per-request-connection
+    approach re-handshook every request). `concurrency` connections stay in flight;
+    the deadline keeps MAX_DURATION_S a real wall-clock ceiling within a step, and
+    each request is bounded by REQ_TIMEOUT."""
+    workers = max(1, min(concurrency, MAX_CONCURRENCY))
+    # Split the step across `workers` connections; the remainder is spread so the
+    # counts differ by at most one and still sum to exactly n_requests.
+    per, extra = divmod(n_requests, workers)
+    sizes = [per + (1 if i < extra else 0) for i in range(workers)]
+    sizes = [s for s in sizes if s > 0]
+    t0 = time.monotonic()
+    samples: list = []
+    pool = ThreadPoolExecutor(max_workers=len(sizes) or 1)
+    try:
+        futures = [pool.submit(_keepalive_burst, url, s, deadline) for s in sizes]
+        # A worker stops firing at `deadline` and each in-flight request is bounded
+        # by REQ_TIMEOUT, so every burst returns within a bounded window past the
+        # deadline. Cap the collection wait at exactly that so one wedged worker
+        # can't hold the step (and thus the whole probe) open past its ceiling.
+        collect_timeout = max(0.0, deadline - time.monotonic()) + REQ_TIMEOUT + 5.0
+        try:
+            for fut in as_completed(futures, timeout=collect_timeout):
+                samples.extend(fut.result())
+        except TimeoutError:
+            # A straggler blew the bound — take what finished and move on; the
+            # cancel in `finally` drops the rest.
+            samples.extend(f.result() for f in futures if f.done() and not f.cancelled())
     finally:
         # Don't block on stragglers past the deadline: drop queued work and
-        # return; the few in-flight requests drain on their own REQ_TIMEOUT.
+        # return; in-flight requests are each already bounded by REQ_TIMEOUT.
         pool.shutdown(wait=False, cancel_futures=True)
     wall = max(1e-6, time.monotonic() - t0)
 
@@ -443,7 +630,8 @@ def _custom_levels(target_conc: int) -> list:
     return [c for c in _CUSTOM_RAMP_LADDER if c < target_conc] + [target_conc]
 
 
-def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None) -> dict:
+def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None,
+          breaker: bool = True) -> dict:
     """Ramp a bounded L7 load probe against `url` and return a defensive
     read-out. Assumes the caller already validated the URL, confirmed scope,
     and passed the opsec gate — this only does the (capped) HTTP work. Never
@@ -454,6 +642,14 @@ def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None) -> 
       * custom (pass a spec from parse_custom_spec) — the operator's own request
         count, duration, and concurrency, for testing a client in detail. Both
         obey the SAME hard caps; custom just lets you dial the load within them.
+
+    `breaker` controls the distress-based auto-abort (5xx/connection errors or
+    timeouts past their thresholds). ON is right for the gentle preset tiers.
+    Off lets a deliberate operator-driven load test run its full ramp — the way
+    k6/vegeta do — and is the norm for custom mode, where high-concurrency
+    timeouts are often the operator's own box saturating, not the target dying.
+    Distress is still MEASURED and GRADED either way; `breaker` only decides
+    whether the run stops early. The SSRF mid-ramp guard is separate and always on.
     """
     if custom:
         # Custom: climb gently to the operator's concurrency, then hold there.
@@ -542,9 +738,12 @@ def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None) -> 
                        "(SSRF guard blocked it mid-ramp) — stopped")
             break
 
-        # Circuit breaker — stop the moment the target is clearly failing.
-        # Origin errors OR timeouts sustained past their thresholds both trip it.
-        if step["requests"] >= CB_MIN_SAMPLE and (
+        # Circuit breaker — stop the moment the target is clearly failing, IF the
+        # caller left it on. Origin errors OR timeouts sustained past their
+        # thresholds trip it. Off (the custom-mode default) means the operator is
+        # deliberately driving the load and wants the full ramp; distress still
+        # gets measured and graded below, it just doesn't abort the run.
+        if breaker and step["requests"] >= CB_MIN_SAMPLE and (
                 step["distress_rate"] >= CB_ERROR_RATE or step["timeout_rate"] >= CB_TIMEOUT_RATE):
             why = (f"{int(step['distress_rate'] * 100)}% 5xx/connection errors"
                    if step["distress_rate"] >= CB_ERROR_RATE
@@ -562,7 +761,7 @@ def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None) -> 
     return _assemble(url, run_tier, steps, total, aborted, edge_headers_seen,
                      ratelimit_headers_seen, challenge_seen, server_header,
                      graceful=graceful, requested=(custom or {}).get("requested"),
-                     effective=effective)
+                     effective=effective, breaker=breaker)
 
 
 def _norm(headers: dict) -> dict:
@@ -606,7 +805,7 @@ def _harvest_headers(samples: list, edge_seen: dict, ratelimit_seen: list,
 # ==========================================================================
 def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
               challenge_seen, server_header, graceful=None, requested=None,
-              effective=None) -> dict:
+              effective=None, breaker=True) -> dict:
     all_lat = [v for st in steps for v in _step_latencies(st)]
     overall = _summarize_latencies(all_lat)
 
@@ -651,6 +850,7 @@ def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
         "score": score,
         "aborted": aborted,
         "graceful_stop": graceful,
+        "breaker_enabled": breaker,
         "requested": requested,
         "effective": effective,
         "totals": {
@@ -681,20 +881,30 @@ def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
         "notes": ([
             f"Custom run: you asked for up to {effective['requests']} requests over "
             f"{effective['duration_s']:.0f}s at concurrency {effective['concurrency']}; the run climbed a "
-            "short safety ramp to that concurrency, then held there until the request or duration budget "
-            "(whichever came first) was reached — or the circuit breaker tripped. Your values are clamped "
+            "strong ramp to that concurrency, then held there until the request or duration budget "
+            "(whichever came first) was reached"
+            + (" — or the circuit breaker tripped" if breaker else "") + ". Your values are clamped "
             f"to the caps below ({MAX_CONCURRENCY} / {MAX_TOTAL_REQUESTS} / {MAX_DURATION_S:.0f}s)."
-        ] if effective else []) + [
+        ] if effective else []) + ([
+            "Circuit-breaker auto-abort was OFF for this run — it completed the full ramp instead of "
+            "stopping at the first sign of distress, the way a real load test (k6/vegeta) does. Any 5xx, "
+            "connection errors, and timeouts are still counted and folded into the grade below; the run just "
+            "wasn't cut short. (At high concurrency from one box, a timeout spike is often your own machine "
+            "saturating its connections rather than the target failing — which is why it's off by default here.)"
+        ] if not breaker else []) + [
             "Native probe is a bounded diagnostic — a closed concurrency model, hard-capped at "
             f"{MAX_CONCURRENCY} in flight / {MAX_TOTAL_REQUESTS} counted requests / {MAX_DURATION_S:.0f}s wall "
             "clock (enforced during a step, not just between). Probes are serialized and per-host "
             "cooldown-paced so looping the endpoint can't aggregate past this. It locates whether defenses "
             "engage; it cannot and is not meant to overwhelm a healthy target.",
-            "Requests follow up to a few redirects through the shared fetch, so a target on a redirect "
-            "chain can see somewhat more wire requests than the counted figure — the wall-clock cap bounds "
-            "the delivered load regardless of hop count.",
-            "Latency is wall-clock per request (connect through full read of up to "
-            f"{PROBE_MAX_BYTES} bytes) on a Connection: close client — state it when comparing to other tools.",
+            "The native probe does NOT follow redirects — it records the status returned at the URL you "
+            "aimed it at (a 3xx counts as one request with that status). Point it at the final URL if the "
+            "site redirects. Every counted request is exactly one request on the wire.",
+            "Latency is wall-clock per request (send through full read of up to "
+            f"{PROBE_MAX_BYTES} bytes) on a keep-alive client: each worker holds ONE pinned connection and "
+            "reuses it, so only the first request per connection pays the TCP/TLS handshake — that's what "
+            "lifts throughput over a connection-per-request tool, but it also means most requests' latency "
+            "excludes the handshake. State that when comparing to other tools.",
             "For true high-rate stress with an open arrival-rate model (correct tail latency, no "
             "coordinated omission) and a sustained hold long enough to observe autoscaling, use the "
             "load-test command builder (k6/vegeta) against a target you're authorized to test.",
@@ -1102,6 +1312,17 @@ def handle_stress_probe(req) -> "common.Response":
         return common.Response.error(400,
             f"invalid tier: must be one of {sorted(_TIERS)} or '{CUSTOM_TIER}'")
 
+    # Circuit-breaker auto-abort. The preset tiers are gentle diagnostics and keep
+    # it ON. Custom mode is an operator-driven load test — the operator sets the
+    # load and usually wants the full ramp (a 5xx/timeout spike at high concurrency
+    # is often the local box saturating, not the target dying), so it defaults OFF
+    # there and can be turned back on with breaker:true. Distress is graded either
+    # way — the flag only decides whether the run stops early.
+    if tier == CUSTOM_TIER:
+        breaker = body.get("breaker") is True
+    else:
+        breaker = body.get("breaker") is not False   # tiers default on; explicit false honored
+
     if not authorized:
         return common.Response.error(403,
             "authorized:true is required — confirm you have permission to load-test this target.")
@@ -1179,7 +1400,7 @@ def handle_stress_probe(req) -> "common.Response":
                     "error": f"cooling down after the last probe of this origin — retry in {wait}s. "
                              "(Paces back-to-back runs so a loop can't aggregate into real load.)",
                     "status": 429, "retry_after_s": wait}, status=429)
-        result = probe(cleaned, tier, custom=custom_spec)
+        result = probe(cleaned, tier, custom=custom_spec, breaker=breaker)
         stamp = time.monotonic()
         for k in cd_keys:
             _LAST_PROBE_END[k] = stamp

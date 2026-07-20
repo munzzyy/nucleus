@@ -1809,10 +1809,16 @@
     document.getElementById("stress-probe-target").addEventListener("keydown", e => {
       if (e.key === "Enter" && !probeBtn.disabled) runStressProbe();
     });
-    // Custom intensity reveals the request-count / duration / concurrency inputs.
+    // Custom intensity reveals the request-count / duration / concurrency inputs
+    // and the circuit-breaker opt-in.
     const tierSel = document.getElementById("stress-probe-tier");
     const customRow = document.getElementById("stress-custom-row");
-    const syncCustomRow = () => customRow.classList.toggle("hidden", tierSel.value !== "custom");
+    const breakerLine = document.getElementById("stress-custom-breaker-line");
+    const syncCustomRow = () => {
+      const isCustom = tierSel.value === "custom";
+      customRow.classList.toggle("hidden", !isCustom);
+      if (breakerLine) breakerLine.classList.toggle("hidden", !isCustom);
+    };
     tierSel.addEventListener("change", syncCustomRow);
     syncCustomRow();
     document.getElementById("stress-build-btn").addEventListener("click", buildLoadTest);
@@ -1885,6 +1891,8 @@
       body.requests = document.getElementById("stress-custom-requests").value.trim();
       body.duration = document.getElementById("stress-custom-duration").value.trim();
       body.concurrency = document.getElementById("stress-custom-concurrency").value.trim();
+      // Circuit breaker is off for custom unless the operator opts back in.
+      body.breaker = document.getElementById("stress-custom-breaker").checked;
     }
     // Attach the verified scope stamp if the operator verified this run's target.
     const vtarget = document.getElementById("stress-verify-target").value.trim();
@@ -1978,6 +1986,10 @@
     }
     if (r.aborted) {
       wrap.appendChild(N.el("p", { class: "faint small mt-8", text: "⛔ " + r.aborted }));
+    }
+    if (r.breaker_enabled === false) {
+      wrap.appendChild(N.el("p", { class: "faint small mt-8", text:
+        "circuit breaker off — ran the full ramp; distress is graded, not aborted" }));
     }
 
     // Defense verdicts

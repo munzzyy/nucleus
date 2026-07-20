@@ -375,11 +375,16 @@
         </div>
         <div class="field grow-2">
           <label>&nbsp;</label>
-          <span class="faint small">Runs a short safety ramp, then holds at your concurrency until the
+          <span class="faint small">Runs a strong ramp, then holds at your concurrency until the
             request count or the duration is reached — whichever comes first. Values above the caps are
             clamped. For longer/bigger runs, use the command builder below.</span>
         </div>
       </div>
+      <label class="checkline mt-8 hidden" id="stress-custom-breaker-line"
+             title="When on, the run auto-aborts if the target starts returning sustained 5xx/timeouts. Off (the custom default) runs the full ramp like k6/vegeta — distress is still measured and graded, the run just isn't cut short. High-concurrency timeouts are often your own box saturating, not the target failing.">
+        <input type="checkbox" id="stress-custom-breaker">
+        <span>Auto-abort if the target starts failing (circuit breaker) — off by default for custom runs</span>
+      </label>
       <span id="stress-probe-status" class="sub"></span>
       <div id="stress-probe-result" class="mt hidden"></div>
     </div>

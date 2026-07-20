@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import http.server
 import json
 import os
 import socket
 import ssl
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1679,7 +1682,7 @@ class StressCapTests(unittest.TestCase):
         huge = {"smoke": {"ramp": [1], "hold": 0}, "huge": {"ramp": [10], "hold": 200}}
         with mock.patch.object(stresstest, "_TIERS", huge), \
              mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 500), \
-             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+             mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch()):
             r = stresstest.probe("https://cap.example", "huge")
         self.assertLessEqual(r["totals"]["requests"], 500)
         self.assertIn("request cap", r["aborted"])
@@ -1693,7 +1696,7 @@ class StressCapTests(unittest.TestCase):
         self.assertGreater(spec["hold"], 0)
         # Cap the run small so the test is fast; the hold behavior is the same.
         with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 6000), \
-             mock.patch.object(stresstest.common, "fetch",
+             mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a"})):
             r = stresstest.probe("https://big.example", "stress")
         peak = max(spec["ramp"])
@@ -1703,7 +1706,7 @@ class StressCapTests(unittest.TestCase):
 
     def test_probe_respects_wall_clock_cap(self):
         with mock.patch.object(stresstest, "MAX_DURATION_S", 0.0), \
-             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+             mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch()):
             r = stresstest.probe("https://t.example", "smoke")
         self.assertTrue(r["ok"])
         self.assertIn("time cap", r["aborted"])
@@ -1742,7 +1745,7 @@ class StressCustomModeTests(unittest.TestCase):
     def test_custom_run_stops_on_the_request_budget(self):
         spec = stresstest.parse_custom_spec(
             {"concurrency": 50, "requests": 300, "duration": "120s"})
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a"})):
             r = stresstest.probe("https://c.example", "custom", custom=spec)
         self.assertTrue(r["ok"])
@@ -1756,7 +1759,7 @@ class StressCustomModeTests(unittest.TestCase):
         # A tiny effective duration ends the run gracefully (the operator's choice),
         # not as an abort.
         with mock.patch.object(stresstest, "MAX_DURATION_S", 0.2), \
-             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+             mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch()):
             spec = stresstest.parse_custom_spec(
                 {"concurrency": 10, "requests": 50_000, "duration": "0.2"})
             r = stresstest.probe("https://d.example", "custom", custom=spec)
@@ -1768,7 +1771,7 @@ class StressCustomModeTests(unittest.TestCase):
         # The safety invariant: even asking for far more than the cap, a custom
         # run can't push past MAX_TOTAL_REQUESTS. (Cap patched small for speed.)
         with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 500), \
-             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+             mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch()):
             spec = stresstest.parse_custom_spec(
                 {"concurrency": 20, "requests": 9_999_999, "duration": "120s"})
             r = stresstest.probe("https://cap.example", "custom", custom=spec)
@@ -1781,7 +1784,7 @@ class StressCustomModeTests(unittest.TestCase):
         # kept modest here so the suite doesn't spin a thousand threads; the ramp+
         # sustain logic is identical at any target. (Cap patched fast-but-roomy.)
         with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 40_000), \
-             mock.patch.object(stresstest.common, "fetch",
+             mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a"})):
             spec = stresstest.parse_custom_spec(
                 {"concurrency": 200, "requests": 40_000, "duration": "120s"})
@@ -1803,16 +1806,35 @@ class StressCustomModeTests(unittest.TestCase):
         self.assertGreater(len(peak_steps), 1)
         self.assertGreater(peak_reqs, r["totals"]["requests"] * 0.5)
 
-    def test_custom_run_still_trips_the_circuit_breaker(self):
-        # A failing origin must still abort a custom run — the operator's numbers
-        # don't disable the breaker.
-        with mock.patch.object(stresstest.common, "fetch",
+    def test_custom_run_trips_the_breaker_when_it_is_on(self):
+        # With the breaker ON (probe default), a failing origin still aborts.
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(500, {"Server": "nginx"})):
             spec = stresstest.parse_custom_spec(
                 {"concurrency": 50, "requests": 5000, "duration": "120s"})
-            r = stresstest.probe("https://z.example", "custom", custom=spec)
+            r = stresstest.probe("https://z.example", "custom", custom=spec, breaker=True)
         self.assertIn("circuit breaker", r["aborted"] or "")
         self.assertEqual(r["grade"], "F")
+        self.assertTrue(r["breaker_enabled"])
+
+    def test_breaker_off_runs_full_ramp_but_still_grades_distress(self):
+        # breaker=False: a failing origin does NOT abort — the run completes its
+        # budget — but the distress is still measured and the grade is still F.
+        # The custom-mode default is breaker off, which is what the operator wants
+        # for a deliberate load test.
+        with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 4000), \
+             mock.patch.object(stresstest, "_probe_get",
+                               side_effect=_stress_fetch(500, {"Server": "nginx"})):
+            spec = stresstest.parse_custom_spec(
+                {"concurrency": 100, "requests": 4000, "duration": "120s"})
+            r = stresstest.probe("https://z.example", "custom", custom=spec, breaker=False)
+        self.assertNotIn("circuit breaker", r["aborted"] or "")
+        self.assertFalse(r["breaker_enabled"])
+        self.assertEqual(r["grade"], "F")            # distress still graded honestly
+        self.assertTrue(r["graceful_stop"])          # it finished the budget instead of aborting
+        # It actually climbed past where the breaker would have stopped it.
+        self.assertTrue(any(s["concurrency"] == r["effective"]["concurrency"] for s in r["steps"]))
+        self.assertGreater(r["totals"]["http_5xx"], 0)  # the failures ARE in the read-out
 
 
 class StressPercentileTests(unittest.TestCase):
@@ -1831,7 +1853,7 @@ class StressPercentileTests(unittest.TestCase):
 class StressProbeBehaviorTests(unittest.TestCase):
     def test_defended_target_grades_well(self):
         hdr = {"Server": "cloudflare", "CF-Ray": "abc-LAX", "X-RateLimit-Limit": "100"}
-        with mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch(200, hdr)):
+        with mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch(200, hdr)):
             r = stresstest.probe("https://x.example", "smoke")
         self.assertTrue(r["ok"])
         self.assertIn(r["grade"], ("A", "B"))
@@ -1839,7 +1861,7 @@ class StressProbeBehaviorTests(unittest.TestCase):
         self.assertIn("Cloudflare", r["defenses"]["edge"]["providers"])
 
     def test_naked_origin_grades_poorly_with_high_findings(self):
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "nginx/1.18.0"})):
             r = stresstest.probe("https://y.example", "smoke")
         self.assertIn(r["grade"], ("D", "F"))
@@ -1847,7 +1869,7 @@ class StressProbeBehaviorTests(unittest.TestCase):
 
     def test_circuit_breaker_trips_on_5xx_and_stops_early(self):
         # Failing origin: the breaker must abort the ramp, not grind all steps.
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(500, {"Server": "nginx"})):
             r = stresstest.probe("https://z.example", "thorough")
         self.assertIn("circuit breaker", r["aborted"])
@@ -1857,7 +1879,7 @@ class StressProbeBehaviorTests(unittest.TestCase):
     def test_edge_challenge_is_defended_not_failed(self):
         # 503 behind Cloudflare = the edge shedding load. Grade-by-origin must
         # read this as "found the ceiling" (D), never a naked-origin F.
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(503, {"Server": "cloudflare", "CF-Ray": "z-LAX"})):
             r = stresstest.probe("https://c.example", "smoke")
         self.assertTrue(r["defenses"]["challenge"]["detected"])
@@ -1866,7 +1888,7 @@ class StressProbeBehaviorTests(unittest.TestCase):
     def test_unreachable_target_is_clean_error(self):
         def boom(url, **kw):
             raise OSError("connection refused")
-        with mock.patch.object(stresstest.common, "fetch", side_effect=boom):
+        with mock.patch.object(stresstest, "_probe_get", side_effect=boom):
             r = stresstest.probe("https://u.example", "smoke")
         self.assertFalse(r["ok"])
         self.assertIn("unreachable", r["error"])
@@ -1874,7 +1896,7 @@ class StressProbeBehaviorTests(unittest.TestCase):
     def test_blocked_target_is_flagged_not_ramped(self):
         def blocked(url, **kw):
             raise ValueError("host resolves to non-public address")
-        with mock.patch.object(stresstest.common, "fetch", side_effect=blocked):
+        with mock.patch.object(stresstest, "_probe_get", side_effect=blocked):
             r = stresstest.probe("https://b.example", "smoke")
         self.assertFalse(r["ok"])
         self.assertIn("blocked", r["error"])
@@ -1882,23 +1904,114 @@ class StressProbeBehaviorTests(unittest.TestCase):
 
 class StressDetectionTests(unittest.TestCase):
     def test_rate_limit_via_429(self):
-        with mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch(429, {})):
+        with mock.patch.object(stresstest, "_probe_get", side_effect=_stress_fetch(429, {})):
             r = stresstest.probe("https://rl.example", "smoke")
         self.assertTrue(r["defenses"]["rate_limiting"]["detected"])
         self.assertGreater(r["totals"]["rate_limited_429"], 0)
 
     def test_edge_via_server_header_marker(self):
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "AkamaiGHost"})):
             r = stresstest.probe("https://ak.example", "smoke")
         self.assertTrue(r["defenses"]["edge"]["present"])
         self.assertIn("Akamai", r["defenses"]["edge"]["providers"])
 
     def test_cf_mitigated_challenge_detected(self):
-        with mock.patch.object(stresstest.common, "fetch",
+        with mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(403, {"cf-mitigated": "challenge", "Server": "cloudflare"})):
             r = stresstest.probe("https://ch.example", "smoke")
         self.assertTrue(r["defenses"]["challenge"]["detected"])
+
+
+class _KAHandler(http.server.BaseHTTPRequestHandler):
+    """A minimal keep-alive loopback server for the keep-alive probe tests."""
+    protocol_version = "HTTP/1.1"   # keep-alive by default when Content-Length is set
+
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Server", "nginx")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class StressKeepAliveTests(unittest.TestCase):
+    """The high-RPS path reuses one SSRF-pinned connection per worker. These lock
+    down the two things that matters: the SSRF guard still refuses private/loopback
+    targets in the new path, and a connection is genuinely reused across requests."""
+
+    def test_probe_get_refuses_private_loopback_metadata_and_bad_scheme(self):
+        # The whole point: reusing common._resolve_public means the keep-alive path
+        # inherits the SAME SSRF guard. Every one of these must be refused BEFORE a
+        # socket is opened — a ValueError, never a real connection.
+        for bad in ("http://127.0.0.1/", "http://10.0.0.1/", "http://192.168.1.1/",
+                    "http://169.254.169.254/latest/meta-data/", "http://[::1]/",
+                    "http://localhost/", "ftp://example.com/", "http:///nohost"):
+            with self.assertRaises(ValueError, msg=bad):
+                stresstest._probe_get(bad, timeout=1.0)
+
+    def test_keepalive_reuses_one_connection(self):
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _KAHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/"
+            # Allow loopback ONLY for this test by pinning the resolver.
+            with mock.patch.object(stresstest.common, "_resolve_public",
+                                   return_value=("127.0.0.1", socket.AF_INET)):
+                ka = stresstest._KeepAliveConn()
+                s1, _b1, h1 = stresstest._probe_get(url, keepalive=ka)
+                first_conn = ka.conn
+                s2, _b2, _h2 = stresstest._probe_get(url, keepalive=ka)
+                second_conn = ka.conn
+                ka.close()
+            self.assertEqual((s1, s2), (200, 200))
+            self.assertIsNotNone(first_conn)
+            self.assertIs(first_conn, second_conn)   # the SAME connection was reused
+            self.assertEqual(h1.get("Server"), "nginx")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_run_step_over_real_loopback_keepalive(self):
+        # End-to-end through the real keep-alive _run_step (no mocked fetch) against
+        # a live server: every request lands, none error, and the reuse means far
+        # fewer connections than requests. Threaded server so N keep-alive
+        # connections are served concurrently, the way a real target would.
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _KAHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/"
+            with mock.patch.object(stresstest.common, "_resolve_public",
+                                   return_value=("127.0.0.1", socket.AF_INET)):
+                step = stresstest._run_step(url, concurrency=4, n_requests=40,
+                                            deadline=time.monotonic() + 15)
+            self.assertEqual(step["requests"], 40)
+            self.assertEqual(step["ok"], 40)
+            self.assertEqual(step["http_5xx"], 0)
+            self.assertEqual(step["conn_errors"], 0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_transient_get_closes_its_connection(self):
+        # A _probe_get with no keepalive (the baseline path) must not leak the fd —
+        # it opens, uses, and closes a transient connection.
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _KAHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/"
+            with mock.patch.object(stresstest.common, "_resolve_public",
+                                   return_value=("127.0.0.1", socket.AF_INET)):
+                status, body, _h = stresstest._probe_get(url)   # keepalive=None
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"ok")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class StressOwnershipTests(unittest.TestCase):
@@ -1909,6 +2022,8 @@ class StressOwnershipTests(unittest.TestCase):
             self.assertFalse(stresstest.verify_ownership("x.example", "WRONG", "dns")["verified"])
 
     def test_file_verify_match(self):
+        # verify_ownership fetches the well-known file through common.fetch (not the
+        # probe's keep-alive path), so this one stays mocked at common.fetch.
         with mock.patch.object(stresstest.common, "fetch",
                                side_effect=lambda url, **kw: (200, b"nucleus-loadtest-XYZ", {})):
             self.assertTrue(stresstest.verify_ownership("x.example", "nucleus-loadtest-XYZ", "file")["verified"])
@@ -2007,7 +2122,7 @@ class StressHandlerGateTests(unittest.TestCase):
         with mock.patch.object(stresstest.runners.common, "opsec_status", return_value={"exposed": False}), \
              mock.patch.object(stresstest.runners, "_resolve_public_ips_safe", return_value=["93.184.216.34"]), \
              mock.patch.object(stresstest.common, "dns_query", return_value=answers), \
-             mock.patch.object(stresstest.common, "fetch",
+             mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a-LAX"})):
             resp = stresstest.handle_stress_probe(_StressReq(body))
         self.assertEqual(resp.status, 200)
@@ -2069,7 +2184,7 @@ class StressHandlerGateTests(unittest.TestCase):
         body = {"url": "http://93.184.216.34", "authorized": True, "tier": "smoke"}
         with mock.patch.object(stresstest.runners.common, "opsec_status", return_value={"exposed": False}), \
              mock.patch.object(stresstest.runners, "_resolve_public_ips_safe", return_value=["93.184.216.34"]), \
-             mock.patch.object(stresstest.common, "fetch",
+             mock.patch.object(stresstest, "_probe_get",
                                side_effect=_stress_fetch(200, {"Server": "nginx"})):
             first = stresstest.handle_stress_probe(_StressReq(body))
             second = stresstest.handle_stress_probe(_StressReq(body))
