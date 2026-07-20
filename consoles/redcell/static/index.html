@@ -268,8 +268,8 @@
         <p>This tests whether a target's <b>DDoS defenses hold</b>: does rate limiting kick in, is there a
           CDN/WAF absorbing the edge, does latency stay flat under load, where's the breaking point. You get
           a graded read-out with concrete fixes to hand the client.</p>
-        <p>The native probe runs a real, bounded load test — hard-capped in code at <b id="cap-conc">100</b>
-          requests in flight, <b id="cap-req">50,000</b> total, over <b id="cap-dur">180</b>s, and it holds at
+        <p>The native probe runs a real, bounded load test — hard-capped in code at <b id="cap-conc">1,000</b>
+          requests in flight, <b id="cap-req">350,000</b> total, over <b id="cap-dur">180</b>s, and it holds at
           peak so a well-provisioned target actually gets exercised (a few hundred requests won't touch a site
           with datacenter capacity). Pick the tier to match the target — <b>Stress</b> is for real CDN/datacenter
           clients and can hurt a small origin, so use the lighter tiers there. Or pick <b>Custom</b> to set the
@@ -362,16 +362,16 @@
       </div>
       <div class="row mt hidden" id="stress-custom-row">
         <div class="field fit">
-          <label for="stress-custom-requests">Requests <span class="faint small">(max 50,000)</span></label>
-          <input type="text" id="stress-custom-requests" placeholder="1000" value="1000" inputmode="numeric">
+          <label for="stress-custom-requests">Requests <span class="faint small">(max 350,000)</span></label>
+          <input type="text" id="stress-custom-requests" placeholder="5000" value="5000" inputmode="numeric">
         </div>
         <div class="field fit">
           <label for="stress-custom-duration">Duration <span class="faint small">(max 180s)</span></label>
           <input type="text" id="stress-custom-duration" placeholder="60s" value="60s">
         </div>
         <div class="field fit">
-          <label for="stress-custom-concurrency">Concurrency <span class="faint small">(max 100)</span></label>
-          <input type="text" id="stress-custom-concurrency" placeholder="25" value="25" inputmode="numeric">
+          <label for="stress-custom-concurrency">Concurrency <span class="faint small">(max 1,000)</span></label>
+          <input type="text" id="stress-custom-concurrency" placeholder="100" value="100" inputmode="numeric">
         </div>
         <div class="field grow-2">
           <label>&nbsp;</label>

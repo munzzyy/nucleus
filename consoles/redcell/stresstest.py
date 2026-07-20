@@ -70,20 +70,31 @@ _FETCH_ERRORS = (ValueError, OSError, http.client.HTTPException)
 # asks for and what these allow. They're sized to be a REAL load test — enough
 # to actually exercise a well-provisioned target (a client with real datacenter
 # capacity won't even notice a few hundred requests, so the low tiers would
-# report "no defenses seen" on a site that's actually fine) — while staying far
-# under genuine-weapon territory: the research pins the "ordinary authorized
-# load test" line well below ~1000 RPS / 500 connections, and these sit under
-# that. The ramp-up + circuit breaker are what protect a WEAK target: load
-# climbs from gentle, and the breaker aborts the moment a target buckles, so a
-# small origin trips out early instead of getting buried. Match the tier to the
-# target — the high tiers deliver sustained load and can stress a small origin.
+# report "no defenses seen" on a site that's actually fine).
+#
+# NOTE on the concurrency ceiling: it was deliberately raised to 1000 (from the
+# original 100) so an operator can throw a genuinely heavy, high-fan-out load at
+# a well-provisioned client on an AUTHORIZED engagement. Be honest about what
+# that means — 1000 simultaneous connections is ABOVE the ~500-connection line
+# the load-testing literature treats as "get explicit written authorization /
+# cloud-provider sign-off first," so this is no longer a casual diagnostic at the
+# top of its range. What still keeps it from being a weapon: the request and time
+# ceilings below (350k requests, 180s) bound total volume — still under the ~1M-
+# requests / 30-min line that needs a provider's sign-off — and the authorization
+# gate + opsec gate (won't fire from an exposed IP) + SSRF guard (public targets
+# only) + ownership verification gate every run. And two things protect a WEAK
+# target specifically — the run climbs a gentle ramp (so a small origin's knee is
+# found before full load) and the circuit breaker aborts the instant it buckles.
+# Also practical: one box rarely sustains 1000 clean concurrent connections; you
+# bottleneck on local CPU/NIC/ephemeral ports first. For real distributed volume,
+# use the k6/vegeta/wrk command builder, not this.
 # --------------------------------------------------------------------------
-MAX_CONCURRENCY = 100          # absolute ceiling on simultaneous in-flight requests
-MAX_TOTAL_REQUESTS = 50_000    # absolute ceiling on requests across the whole probe
+MAX_CONCURRENCY = 1000          # absolute ceiling on simultaneous in-flight requests
+MAX_TOTAL_REQUESTS = 350_000   # absolute ceiling on requests across the whole probe
 MAX_DURATION_S = 180.0         # absolute wall-clock ceiling; the probe stops here no matter what
 REQ_TIMEOUT = 8.0              # per-request timeout (connect through read)
 PROBE_MAX_BYTES = 8192         # read just enough to time the server, not to move bandwidth
-REQS_PER_WORKER = 10           # requests fired per concurrency-unit per ramp/hold step
+REQS_PER_WORKER = 25           # requests fired per concurrency-unit per PEAK/hold step
 
 # Circuit breaker: if a ramp step's origin-error rate (5xx + connection errors)
 # hits CB_ERROR_RATE, OR its timeout rate hits CB_TIMEOUT_RATE, with a
@@ -138,7 +149,12 @@ CUSTOM_TIER = "custom"
 # Concurrency a custom run ramps up through before holding at the target. Only
 # the entries strictly below the target are used, then the target itself — so a
 # weak origin's knee is still found gently before full load, exactly like a tier.
-_CUSTOM_RAMP_LADDER = (2, 5, 10, 25, 50)
+# Extended up to 500 so a run climbing to the 1000 ceiling doesn't leap straight
+# from 50 to 1000 — the extra rungs keep the climb gentle for a weak target.
+# Each rung fires the full concurrency*REQS_PER_WORKER (a normal, progressive
+# load ramp); the large request ceiling leaves plenty of budget for the ramp AND
+# a sustained hold at the target concurrency after it.
+_CUSTOM_RAMP_LADDER = (2, 5, 10, 25, 50, 100, 250, 500)
 
 # Defaults when a custom field is missing/unparseable — a modest, safe run.
 _CUSTOM_DEFAULT_CONCURRENCY = 25

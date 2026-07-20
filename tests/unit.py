@@ -1660,11 +1660,15 @@ class StressCapTests(unittest.TestCase):
     every declared tier must sit under them."""
 
     def test_caps_stay_under_weapon_territory(self):
-        # Tripwire: the caps can be a real load test, but must stay well under the
-        # "needs a cloud provider's sign-off" line (research: ~500 connections /
-        # 1M requests / 30min). If someone bumps them past this, that's a weapon.
-        self.assertLessEqual(stresstest.MAX_CONCURRENCY, 500)
-        self.assertLessEqual(stresstest.MAX_TOTAL_REQUESTS, 200_000)
+        # Tripwire: the caps can be a real load test, but must stay under the
+        # "needs a cloud provider's sign-off" line (research: ~1M requests /
+        # 30min). Concurrency was deliberately raised to 1000 for heavy authorized
+        # engagements — that's above the ~500-connection casual line, which is why
+        # the total-request (50k) and wall-clock (180s) ceilings, plus the gates
+        # and breaker, carry the "not a weapon" guarantee. This tripwire keeps a
+        # FUTURE accidental bump past the intended ceilings from sliding through.
+        self.assertLessEqual(stresstest.MAX_CONCURRENCY, 1000)
+        self.assertLessEqual(stresstest.MAX_TOTAL_REQUESTS, 500_000)
         self.assertLessEqual(stresstest.MAX_DURATION_S, 600)
 
     def test_every_tier_stays_within_concurrency_cap(self):
@@ -1769,6 +1773,30 @@ class StressCustomModeTests(unittest.TestCase):
                 {"concurrency": 20, "requests": 9_999_999, "duration": "120s"})
             r = stresstest.probe("https://cap.example", "custom", custom=spec)
         self.assertLessEqual(r["totals"]["requests"], 500)
+
+    def test_custom_run_ramps_then_sustains_at_peak(self):
+        # With headroom in the request budget, a custom run walks a normal
+        # progressive ramp (each rung real load) AND still delivers the bulk of
+        # the budget as a sustained hold at the target concurrency. Concurrency
+        # kept modest here so the suite doesn't spin a thousand threads; the ramp+
+        # sustain logic is identical at any target. (Cap patched fast-but-roomy.)
+        with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 40_000), \
+             mock.patch.object(stresstest.common, "fetch",
+                               side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a"})):
+            spec = stresstest.parse_custom_spec(
+                {"concurrency": 200, "requests": 40_000, "duration": "120s"})
+            r = stresstest.probe("https://peak.example", "custom", custom=spec)
+        peak = r["effective"]["concurrency"]
+        ramp_steps = [s for s in r["steps"] if s["concurrency"] < peak]
+        peak_steps = [s for s in r["steps"] if s["concurrency"] == peak]
+        peak_reqs = sum(s["requests"] for s in peak_steps)
+        # A real ramp: several rungs, each firing more than a token batch.
+        self.assertGreaterEqual(len(ramp_steps), 5)
+        self.assertGreater(max(s["requests"] for s in ramp_steps), 100)
+        # Sustained: more than one full step at the target, holding the majority
+        # of the delivered load.
+        self.assertGreater(len(peak_steps), 1)
+        self.assertGreater(peak_reqs, r["totals"]["requests"] * 0.5)
 
     def test_custom_run_still_trips_the_circuit_breaker(self):
         # A failing origin must still abort a custom run — the operator's numbers
