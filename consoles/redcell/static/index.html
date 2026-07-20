@@ -272,7 +272,9 @@
           requests in flight, <b id="cap-req">50,000</b> total, over <b id="cap-dur">180</b>s, and it holds at
           peak so a well-provisioned target actually gets exercised (a few hundred requests won't touch a site
           with datacenter capacity). Pick the tier to match the target — <b>Stress</b> is for real CDN/datacenter
-          clients and can hurt a small origin, so use the lighter tiers there. Load climbs from gentle and a
+          clients and can hurt a small origin, so use the lighter tiers there. Or pick <b>Custom</b> to set the
+          exact request count, duration, and concurrency yourself for a detailed client test (still clamped to
+          the caps). Load climbs from gentle and a
           circuit breaker stops the moment a target buckles, so a weak target trips out early. It speaks real HTTP
           over real TCP from your own IP; no packet flood, no spoofing, no amplification. For volume beyond one
           box, the <b>command builder</b> below emits a k6/vegeta/wrk command you run yourself.</p>
@@ -350,11 +352,32 @@
             <option value="standard">Standard — modest sustained load</option>
             <option value="thorough">Thorough — real sustained load</option>
             <option value="stress">Stress — datacenter-scale (can hurt a small origin)</option>
+            <option value="custom">Custom — you set requests, duration &amp; concurrency</option>
           </select>
         </div>
         <div class="field fit">
           <label>&nbsp;</label>
           <button type="button" id="stress-probe-btn">Run resilience test</button>
+        </div>
+      </div>
+      <div class="row mt hidden" id="stress-custom-row">
+        <div class="field fit">
+          <label for="stress-custom-requests">Requests <span class="faint small">(max 50,000)</span></label>
+          <input type="text" id="stress-custom-requests" placeholder="1000" value="1000" inputmode="numeric">
+        </div>
+        <div class="field fit">
+          <label for="stress-custom-duration">Duration <span class="faint small">(max 180s)</span></label>
+          <input type="text" id="stress-custom-duration" placeholder="60s" value="60s">
+        </div>
+        <div class="field fit">
+          <label for="stress-custom-concurrency">Concurrency <span class="faint small">(max 100)</span></label>
+          <input type="text" id="stress-custom-concurrency" placeholder="25" value="25" inputmode="numeric">
+        </div>
+        <div class="field grow-2">
+          <label>&nbsp;</label>
+          <span class="faint small">Runs a short safety ramp, then holds at your concurrency until the
+            request count or the duration is reached — whichever comes first. Values above the caps are
+            clamped. For longer/bigger runs, use the command builder below.</span>
         </div>
       </div>
       <span id="stress-probe-status" class="sub"></span>

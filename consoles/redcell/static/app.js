@@ -1809,6 +1809,12 @@
     document.getElementById("stress-probe-target").addEventListener("keydown", e => {
       if (e.key === "Enter" && !probeBtn.disabled) runStressProbe();
     });
+    // Custom intensity reveals the request-count / duration / concurrency inputs.
+    const tierSel = document.getElementById("stress-probe-tier");
+    const customRow = document.getElementById("stress-custom-row");
+    const syncCustomRow = () => customRow.classList.toggle("hidden", tierSel.value !== "custom");
+    tierSel.addEventListener("change", syncCustomRow);
+    syncCustomRow();
     document.getElementById("stress-build-btn").addEventListener("click", buildLoadTest);
   }
 
@@ -1873,6 +1879,13 @@
     resultWrap.innerHTML = "";
     const body = { url: target, tier, authorized: gateChecked(), lab: labChecked(),
                    proceed_exposed: opsecOverride() };
+    // Custom intensity: send the operator's request count / duration / concurrency.
+    // The server clamps each to the hard caps, so raw text is safe to pass through.
+    if (tier === "custom") {
+      body.requests = document.getElementById("stress-custom-requests").value.trim();
+      body.duration = document.getElementById("stress-custom-duration").value.trim();
+      body.concurrency = document.getElementById("stress-custom-concurrency").value.trim();
+    }
     // Attach the verified scope stamp if the operator verified this run's target.
     const vtarget = document.getElementById("stress-verify-target").value.trim();
     if (STRESS_TOKEN && vtarget && target.indexOf(vtarget) !== -1) {
@@ -1900,6 +1913,33 @@
     return "bad"; // gap
   }
 
+  // Seconds from a "90s" / "2m" / "1h" / bare-number string — mirrors the
+  // server's parse so the clamp note below can compare like-for-like. Returns
+  // null when the value can't be read as a duration.
+  function parseDurationSecs(v) {
+    if (v == null) return null;
+    const s = String(v).trim().toLowerCase();
+    const num = parseFloat(s.replace(/[^0-9.]/g, ""));
+    if (isNaN(num)) return null;
+    if (s.endsWith("m")) return num * 60;
+    if (s.endsWith("h")) return num * 3600;
+    return num;
+  }
+
+  // If a custom run asked for more than a cap allows, the server clamped it —
+  // surface exactly what was trimmed so the operator isn't misled about the load.
+  function customClampNote(r) {
+    if (r.tier !== "custom" || !r.effective || !r.requested) return "";
+    const eff = r.effective, req = r.requested, parts = [];
+    const reqN = parseInt(String(req.requests).replace(/[^0-9]/g, ""), 10);
+    if (!isNaN(reqN) && reqN > eff.requests) parts.push(`requests ${reqN}→${eff.requests}`);
+    const concN = parseInt(String(req.concurrency).replace(/[^0-9]/g, ""), 10);
+    if (!isNaN(concN) && concN > eff.concurrency) parts.push(`concurrency ${concN}→${eff.concurrency}`);
+    const durS = parseDurationSecs(req.duration);
+    if (durS != null && durS > eff.duration_s) parts.push(`duration ${durS}s→${eff.duration_s}s`);
+    return parts.length ? "clamped to the caps: " + parts.join(", ") : "";
+  }
+
   function buildStressCard(r) {
     const wrap = N.el("div", { class: "stress-result" });
     if (!r.ok) {
@@ -1910,7 +1950,13 @@
     const head = N.el("div", { class: "grade-row" });
     head.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade }));
     const meta = N.el("div", { class: "grade-meta" });
-    meta.appendChild(N.el("div", { class: "grade-score", text: `Resilience ${r.score}/100 · tier ${r.tier}` }));
+    // For a custom run, name the load the operator dialed in; else the tier.
+    let intensity = "tier " + r.tier;
+    if (r.tier === "custom" && r.effective) {
+      const e = r.effective;
+      intensity = `custom · ${e.requests} req · ${e.duration_s}s · ${e.concurrency} concurrent`;
+    }
+    meta.appendChild(N.el("div", { class: "grade-score", text: `Resilience ${r.score}/100 · ${intensity}` }));
     const t = r.totals || {};
     meta.appendChild(N.el("div", { class: "sub", text:
       `${t.requests} requests · peak ${t.peak_rps} rps · ${Math.round((t.distress_rate||0)*100)}% failed · ${t.timeouts} timeouts` }));
@@ -1920,6 +1966,15 @@
     if (r.scope_verified && r.scope_verified.verified) {
       wrap.appendChild(N.el("p", { class: "pill ok mt-8" }, [N.el("span", { class: "dot" }),
         document.createTextNode("scope verified — " + (r.scope_verified.detail || ""))]));
+    }
+    // A custom run whose values got clamped to the caps — tell the operator so
+    // "1000 requests" isn't silently trimmed without a word.
+    const clampMsg = customClampNote(r);
+    if (clampMsg) {
+      wrap.appendChild(N.el("p", { class: "faint small mt-8", text: "ℹ︎ " + clampMsg }));
+    }
+    if (r.graceful_stop) {
+      wrap.appendChild(N.el("p", { class: "faint small mt-8", text: "✓ " + r.graceful_stop }));
     }
     if (r.aborted) {
       wrap.appendChild(N.el("p", { class: "faint small mt-8", text: "⛔ " + r.aborted }));

@@ -197,6 +197,13 @@ def main():
         st, j = jget(port, "/api/stress-probe", method="POST",
                      body={"url": "http://10.0.0.1", "authorized": True})  # private, no lab
         check("redcell stress-probe refuses private out of scope", st == 403, f"got {st}")
+        # Custom tier is accepted by validation (clamps its own params) — it must
+        # reach the scope gate, not be rejected as an invalid tier. Private target
+        # → 403 scope, proving the tier passed.
+        st, j = jget(port, "/api/stress-probe", method="POST",
+                     body={"url": "http://10.0.0.1", "authorized": True, "tier": "custom",
+                           "requests": 500, "duration": "30s", "concurrency": 20})
+        check("redcell stress-probe accepts custom tier (reaches scope gate)", st == 403, f"got {st}")
         st, j = jget(port, "/api/stress-build", method="POST",
                      body={"engine": "k6", "params": {"url": "https://example.com"}})
         check("redcell stress-build assembles a command, unexecuted",

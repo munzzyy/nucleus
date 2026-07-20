@@ -125,6 +125,83 @@ _TIERS = {
 }
 DEFAULT_TIER = "smoke"
 
+# Custom mode. Instead of a preset tier, the operator dials in the exact volume:
+# how many requests, over how long, at what concurrency. This is for testing a
+# specific client in detail — you set the shape of the load. It is NOT an escape
+# hatch from the caps: every value is clamped to the SAME hard ceilings above
+# (MAX_CONCURRENCY / MAX_TOTAL_REQUESTS / MAX_DURATION_S), the run still climbs a
+# short safety ramp before holding at your concurrency, and the circuit breaker
+# is still live. A custom run stops at whichever of your two budgets — request
+# count or wall-clock — is reached first, or when the breaker trips.
+CUSTOM_TIER = "custom"
+
+# Concurrency a custom run ramps up through before holding at the target. Only
+# the entries strictly below the target are used, then the target itself — so a
+# weak origin's knee is still found gently before full load, exactly like a tier.
+_CUSTOM_RAMP_LADDER = (2, 5, 10, 25, 50)
+
+# Defaults when a custom field is missing/unparseable — a modest, safe run.
+_CUSTOM_DEFAULT_CONCURRENCY = 25
+_CUSTOM_DEFAULT_REQUESTS = 1000
+_CUSTOM_DEFAULT_DURATION_S = 60.0
+
+
+def _clamp_int(v, lo: int, hi: int, default: int) -> int:
+    """A bounded integer from arbitrary client input. Anything unparseable
+    becomes `default`; the result is always within [lo, hi]. Used for the custom
+    concurrency/request fields — the clamp is what keeps the caps a hard ceiling
+    no matter what the UI sends."""
+    try:
+        n = int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _parse_duration_s(v, cap: float, default: float) -> float:
+    """Seconds from an int/float, or a '90s' / '2m' / '1h' string, clamped to
+    [1, cap]. A bare number is seconds. Unparseable input becomes `default`
+    (then clamped). This is how the operator picks 'for how long' — but the cap
+    keeps it under the wall-clock ceiling regardless."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        secs = default
+    elif isinstance(v, (int, float)):
+        secs = float(v)
+    else:
+        s = str(v).strip().lower()
+        num = "".join(ch for ch in s if ch.isdigit() or ch == ".")
+        try:
+            secs = float(num) if num else default
+        except ValueError:
+            secs = default
+        if s.endswith("m"):
+            secs *= 60.0
+        elif s.endswith("h"):
+            secs *= 3600.0
+    if secs != secs or secs <= 0:  # NaN or non-positive → fall back
+        secs = default
+    return max(1.0, min(cap, float(secs)))
+
+
+def parse_custom_spec(body: dict) -> dict:
+    """Turn a request body's custom fields into a validated spec for probe().
+    Returns the clamped values used to drive the run PLUS the raw values the
+    operator asked for, so the read-out can show exactly what was requested vs
+    what the caps allowed. Every field is clamped here — probe() trusts this."""
+    body = body or {}
+    raw_conc = body.get("concurrency")
+    raw_reqs = body.get("requests")
+    raw_dur = body.get("duration")
+    conc = _clamp_int(raw_conc, 1, MAX_CONCURRENCY, _CUSTOM_DEFAULT_CONCURRENCY)
+    reqs = _clamp_int(raw_reqs, 1, MAX_TOTAL_REQUESTS, _CUSTOM_DEFAULT_REQUESTS)
+    dur = _parse_duration_s(raw_dur, MAX_DURATION_S, _CUSTOM_DEFAULT_DURATION_S)
+    return {
+        "concurrency": conc,
+        "requests": reqs,
+        "duration_s": dur,
+        "requested": {"concurrency": raw_conc, "requests": raw_reqs, "duration": raw_dur},
+    }
+
 # CDN / WAF / edge fingerprints. Presence of any of these in the response
 # headers means there's an edge in front of the origin absorbing traffic — the
 # single biggest DDoS-resilience win a site can have. Maps a header (or a
@@ -339,18 +416,54 @@ def _run_step(url: str, concurrency: int, n_requests: int, deadline: float) -> d
     }
 
 
-def probe(url: str, tier: str = DEFAULT_TIER) -> dict:
+def _custom_levels(target_conc: int) -> list:
+    """The concurrency ladder a custom run walks: a short gentle climb through
+    _CUSTOM_RAMP_LADDER (entries below the target), then the target itself. The
+    caller appends however many peak-holds the request/duration budget allows —
+    this only defines the ramp shape so a weak origin's knee is found first."""
+    return [c for c in _CUSTOM_RAMP_LADDER if c < target_conc] + [target_conc]
+
+
+def probe(url: str, tier: str = DEFAULT_TIER, custom: Optional[dict] = None) -> dict:
     """Ramp a bounded L7 load probe against `url` and return a defensive
     read-out. Assumes the caller already validated the URL, confirmed scope,
     and passed the opsec gate — this only does the (capped) HTTP work. Never
     raises: an unreachable target becomes a clean 'unreachable' result.
+
+    Two shapes of run:
+      * preset tier (default) — a fixed ramp + peak-hold from _TIERS.
+      * custom (pass a spec from parse_custom_spec) — the operator's own request
+        count, duration, and concurrency, for testing a client in detail. Both
+        obey the SAME hard caps; custom just lets you dial the load within them.
     """
-    spec = _TIERS.get(tier, _TIERS[DEFAULT_TIER])
-    ramp = spec["ramp"]
-    # levels = the ramp-up, then `hold` more steps AT PEAK to sustain the load.
-    # The caps + circuit breaker end it; the trailing peak-holds only ever run if
-    # the target is still healthy after the ramp.
-    levels = list(ramp) + [ramp[-1]] * spec.get("hold", 0)
+    if custom:
+        # Custom: climb gently to the operator's concurrency, then hold there.
+        # The effective ceilings are the MINIMUM of the operator's budget and the
+        # hard caps — so a request/duration they pick can only ever be smaller
+        # than the cap, never larger. We size enough peak-hold steps to burn
+        # through the request budget; the request or duration ceiling (or the
+        # breaker) is what actually ends the run.
+        run_tier = CUSTOM_TIER
+        target_conc = max(1, min(int(custom["concurrency"]), MAX_CONCURRENCY))
+        eff_max_requests = min(MAX_TOTAL_REQUESTS, max(1, int(custom["requests"])))
+        eff_max_duration = min(MAX_DURATION_S, max(1.0, float(custom["duration_s"])))
+        ramp = _custom_levels(target_conc)
+        per_step = max(1, target_conc * REQS_PER_WORKER)
+        hold_steps = eff_max_requests // per_step + 2   # +buffer; the caps end it
+        levels = list(ramp) + [target_conc] * hold_steps
+        effective = {"concurrency": target_conc, "requests": eff_max_requests,
+                     "duration_s": eff_max_duration}
+    else:
+        spec = _TIERS.get(tier, _TIERS[DEFAULT_TIER])
+        ramp = spec["ramp"]
+        # levels = the ramp-up, then `hold` more steps AT PEAK to sustain the
+        # load. The caps + circuit breaker end it; the trailing peak-holds only
+        # ever run if the target is still healthy after the ramp.
+        levels = list(ramp) + [ramp[-1]] * spec.get("hold", 0)
+        run_tier = tier
+        eff_max_requests = MAX_TOTAL_REQUESTS
+        eff_max_duration = MAX_DURATION_S
+        effective = None
 
     # Baseline sanity: one request at concurrency 1. If we can't get a single
     # response, there's nothing to ramp — report unreachable instead of firing
@@ -365,8 +478,9 @@ def probe(url: str, tier: str = DEFAULT_TIER) -> dict:
     steps: list = []
     total = 0
     started = time.monotonic()
-    deadline = started + MAX_DURATION_S
+    deadline = started + eff_max_duration
     aborted = None
+    graceful = None   # a clean stop on a budget the operator chose (custom mode)
     edge_headers_seen: dict = {}
     ratelimit_headers_seen: list = []
     challenge_seen: list = []
@@ -377,14 +491,20 @@ def probe(url: str, tier: str = DEFAULT_TIER) -> dict:
     server_header = _norm(base.get("headers", {})).get("server", server_header)
 
     for concurrency in levels:
-        if time.monotonic() - started > MAX_DURATION_S:
-            aborted = f"time cap reached ({MAX_DURATION_S:.0f}s) at concurrency {concurrency}"
+        if time.monotonic() - started > eff_max_duration:
+            if custom:
+                graceful = f"ran the full {eff_max_duration:.0f}s you set"
+            else:
+                aborted = f"time cap reached ({eff_max_duration:.0f}s) at concurrency {concurrency}"
             break
         n = concurrency * REQS_PER_WORKER
-        if total + n > MAX_TOTAL_REQUESTS:
-            n = MAX_TOTAL_REQUESTS - total
+        if total + n > eff_max_requests:
+            n = eff_max_requests - total
         if n <= 0:
-            aborted = f"request cap reached ({MAX_TOTAL_REQUESTS}) before concurrency {concurrency}"
+            if custom:
+                graceful = f"delivered the {eff_max_requests} requests you set"
+            else:
+                aborted = f"request cap reached ({eff_max_requests}) before concurrency {concurrency}"
             break
 
         step = _run_step(url, concurrency, n, deadline)
@@ -413,12 +533,17 @@ def probe(url: str, tier: str = DEFAULT_TIER) -> dict:
             aborted = (f"circuit breaker: {why} at concurrency {concurrency} "
                        "— stopped to avoid piling on a struggling target")
             break
-        if total >= MAX_TOTAL_REQUESTS:
-            aborted = f"request cap reached ({MAX_TOTAL_REQUESTS})"
+        if total >= eff_max_requests:
+            if custom:
+                graceful = f"delivered the {eff_max_requests} requests you set"
+            else:
+                aborted = f"request cap reached ({eff_max_requests})"
             break
 
-    return _assemble(url, tier, steps, total, aborted, edge_headers_seen,
-                     ratelimit_headers_seen, challenge_seen, server_header)
+    return _assemble(url, run_tier, steps, total, aborted, edge_headers_seen,
+                     ratelimit_headers_seen, challenge_seen, server_header,
+                     graceful=graceful, requested=(custom or {}).get("requested"),
+                     effective=effective)
 
 
 def _norm(headers: dict) -> dict:
@@ -461,7 +586,8 @@ def _harvest_headers(samples: list, edge_seen: dict, ratelimit_seen: list,
 # Read-out: detection verdicts + grade + remediation
 # ==========================================================================
 def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
-              challenge_seen, server_header) -> dict:
+              challenge_seen, server_header, graceful=None, requested=None,
+              effective=None) -> dict:
     all_lat = [v for st in steps for v in _step_latencies(st)]
     overall = _summarize_latencies(all_lat)
 
@@ -505,6 +631,9 @@ def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
         "grade": letter,
         "score": score,
         "aborted": aborted,
+        "graceful_stop": graceful,
+        "requested": requested,
+        "effective": effective,
         "totals": {
             "requests": total, "ok": total_ok, "http_5xx": total_5xx,
             "conn_errors": total_conn, "timeouts": total_timeouts,
@@ -530,7 +659,13 @@ def _assemble(url, tier, steps, total, aborted, edge_seen, ratelimit_seen,
                                     distress_rate, total_timeouts),
         "caps": {"max_concurrency": MAX_CONCURRENCY, "max_requests": MAX_TOTAL_REQUESTS,
                  "max_duration_s": MAX_DURATION_S},
-        "notes": [
+        "notes": ([
+            f"Custom run: you asked for up to {effective['requests']} requests over "
+            f"{effective['duration_s']:.0f}s at concurrency {effective['concurrency']}; the run climbed a "
+            "short safety ramp to that concurrency, then held there until the request or duration budget "
+            "(whichever came first) was reached — or the circuit breaker tripped. Your values are clamped "
+            f"to the caps below ({MAX_CONCURRENCY} / {MAX_TOTAL_REQUESTS} / {MAX_DURATION_S:.0f}s)."
+        ] if effective else []) + [
             "Native probe is a bounded diagnostic — a closed concurrency model, hard-capped at "
             f"{MAX_CONCURRENCY} in flight / {MAX_TOTAL_REQUESTS} counted requests / {MAX_DURATION_S:.0f}s wall "
             "clock (enforced during a step, not just between). Probes are serialized and per-host "
@@ -938,8 +1073,15 @@ def handle_stress_probe(req) -> "common.Response":
     authorized = body.get("authorized") is True
     lab = body.get("lab") is True
     tier = str(body.get("tier") or DEFAULT_TIER)
-    if tier not in _TIERS:
-        return common.Response.error(400, f"invalid tier: must be one of {sorted(_TIERS)}")
+    # Custom mode lets the operator set request count / duration / concurrency
+    # directly (clamped to the same caps as any tier). Any other unknown tier is
+    # a client error.
+    custom_spec = None
+    if tier == CUSTOM_TIER:
+        custom_spec = parse_custom_spec(body)
+    elif tier not in _TIERS:
+        return common.Response.error(400,
+            f"invalid tier: must be one of {sorted(_TIERS)} or '{CUSTOM_TIER}'")
 
     if not authorized:
         return common.Response.error(403,
@@ -1018,7 +1160,7 @@ def handle_stress_probe(req) -> "common.Response":
                     "error": f"cooling down after the last probe of this origin — retry in {wait}s. "
                              "(Paces back-to-back runs so a loop can't aggregate into real load.)",
                     "status": 429, "retry_after_s": wait}, status=429)
-        result = probe(cleaned, tier)
+        result = probe(cleaned, tier, custom=custom_spec)
         stamp = time.monotonic()
         for k in cd_keys:
             _LAST_PROBE_END[k] = stamp
@@ -1036,6 +1178,7 @@ def handle_stress_probe(req) -> "common.Response":
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "tool": "stress-probe", "target": f"{p.scheme}://{p.netloc}{p.path}",
             "authorized": authorized, "lab": lab, "tier": tier,
+            "custom": result.get("effective"),
             "grade": result.get("grade"), "totals": result.get("totals", {}),
             "scope_verified": bool(verify_result and verify_result.get("verified")),
         })

@@ -1705,6 +1705,83 @@ class StressCapTests(unittest.TestCase):
         self.assertIn("time cap", r["aborted"])
 
 
+class StressCustomModeTests(unittest.TestCase):
+    """Custom mode lets the operator pick request count / duration / concurrency
+    for a detailed client test — but it must obey the SAME hard caps as a tier.
+    These lock down the clamp (so it can't be an escape hatch) and that the run
+    actually stops on the budget the operator set."""
+
+    def test_parse_clamps_every_field_to_the_caps(self):
+        spec = stresstest.parse_custom_spec(
+            {"concurrency": 10_000, "requests": 9_999_999, "duration": "10m"})
+        self.assertEqual(spec["concurrency"], stresstest.MAX_CONCURRENCY)
+        self.assertEqual(spec["requests"], stresstest.MAX_TOTAL_REQUESTS)
+        self.assertEqual(spec["duration_s"], stresstest.MAX_DURATION_S)
+        # The raw request is preserved for the read-out's "you asked for" line.
+        self.assertEqual(spec["requested"]["requests"], 9_999_999)
+
+    def test_parse_junk_and_missing_fall_back_to_safe_defaults(self):
+        spec = stresstest.parse_custom_spec({"concurrency": "abc", "requests": None})
+        self.assertEqual(spec["concurrency"], stresstest._CUSTOM_DEFAULT_CONCURRENCY)
+        self.assertEqual(spec["requests"], stresstest._CUSTOM_DEFAULT_REQUESTS)
+        self.assertEqual(spec["duration_s"], stresstest._CUSTOM_DEFAULT_DURATION_S)
+
+    def test_duration_units_and_floor(self):
+        self.assertEqual(stresstest._parse_duration_s("90s", 180.0, 60.0), 90.0)
+        self.assertEqual(stresstest._parse_duration_s("2m", 180.0, 60.0), 120.0)
+        self.assertEqual(stresstest._parse_duration_s("1h", 180.0, 60.0), 180.0)  # clamped
+        self.assertEqual(stresstest._parse_duration_s(45, 180.0, 60.0), 45.0)     # bare seconds
+        self.assertEqual(stresstest._parse_duration_s(0, 180.0, 60.0), 60.0)      # 0 is meaningless → default
+        self.assertEqual(stresstest._parse_duration_s(-5, 180.0, 60.0), 60.0)     # negative → default
+        self.assertEqual(stresstest._parse_duration_s(0.5, 180.0, 60.0), 1.0)     # sub-second floored to >=1
+
+    def test_custom_run_stops_on_the_request_budget(self):
+        spec = stresstest.parse_custom_spec(
+            {"concurrency": 50, "requests": 300, "duration": "120s"})
+        with mock.patch.object(stresstest.common, "fetch",
+                               side_effect=_stress_fetch(200, {"Server": "cloudflare", "CF-Ray": "a"})):
+            r = stresstest.probe("https://c.example", "custom", custom=spec)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["tier"], "custom")
+        self.assertLessEqual(r["totals"]["requests"], 300)
+        self.assertIsNone(r["aborted"])          # a clean, expected stop, not an abort
+        self.assertTrue(r["graceful_stop"])
+        self.assertEqual(r["effective"]["requests"], 300)
+
+    def test_custom_run_stops_on_the_duration_budget(self):
+        # A tiny effective duration ends the run gracefully (the operator's choice),
+        # not as an abort.
+        with mock.patch.object(stresstest, "MAX_DURATION_S", 0.2), \
+             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+            spec = stresstest.parse_custom_spec(
+                {"concurrency": 10, "requests": 50_000, "duration": "0.2"})
+            r = stresstest.probe("https://d.example", "custom", custom=spec)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(r["aborted"])
+        self.assertTrue(r["graceful_stop"])
+
+    def test_custom_run_never_exceeds_the_hard_request_cap(self):
+        # The safety invariant: even asking for far more than the cap, a custom
+        # run can't push past MAX_TOTAL_REQUESTS. (Cap patched small for speed.)
+        with mock.patch.object(stresstest, "MAX_TOTAL_REQUESTS", 500), \
+             mock.patch.object(stresstest.common, "fetch", side_effect=_stress_fetch()):
+            spec = stresstest.parse_custom_spec(
+                {"concurrency": 20, "requests": 9_999_999, "duration": "120s"})
+            r = stresstest.probe("https://cap.example", "custom", custom=spec)
+        self.assertLessEqual(r["totals"]["requests"], 500)
+
+    def test_custom_run_still_trips_the_circuit_breaker(self):
+        # A failing origin must still abort a custom run — the operator's numbers
+        # don't disable the breaker.
+        with mock.patch.object(stresstest.common, "fetch",
+                               side_effect=_stress_fetch(500, {"Server": "nginx"})):
+            spec = stresstest.parse_custom_spec(
+                {"concurrency": 50, "requests": 5000, "duration": "120s"})
+            r = stresstest.probe("https://z.example", "custom", custom=spec)
+        self.assertIn("circuit breaker", r["aborted"] or "")
+        self.assertEqual(r["grade"], "F")
+
+
 class StressPercentileTests(unittest.TestCase):
     def test_pct_basic(self):
         self.assertEqual(stresstest._pct([10, 20, 30, 40, 50], 50), 30.0)
