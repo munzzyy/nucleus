@@ -1790,9 +1790,14 @@ class StressCustomModeTests(unittest.TestCase):
         ramp_steps = [s for s in r["steps"] if s["concurrency"] < peak]
         peak_steps = [s for s in r["steps"] if s["concurrency"] == peak]
         peak_reqs = sum(s["requests"] for s in peak_steps)
-        # A real ramp: several rungs, each firing more than a token batch.
-        self.assertGreaterEqual(len(ramp_steps), 5)
+        # A real ramp: it climbs through more than one rung, each firing real load
+        # (not a token batch). The strong ladder is short by design.
+        self.assertGreaterEqual(len(ramp_steps), 2)
         self.assertGreater(max(s["requests"] for s in ramp_steps), 100)
+        # The ramp climbs (concurrency strictly increases up to the target).
+        ramp_conc = [s["concurrency"] for s in ramp_steps]
+        self.assertEqual(ramp_conc, sorted(ramp_conc))
+        self.assertTrue(all(b > a for a, b in zip(ramp_conc, ramp_conc[1:])))
         # Sustained: more than one full step at the target, holding the majority
         # of the delivered load.
         self.assertGreater(len(peak_steps), 1)

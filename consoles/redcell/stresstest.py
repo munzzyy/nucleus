@@ -147,14 +147,15 @@ DEFAULT_TIER = "smoke"
 CUSTOM_TIER = "custom"
 
 # Concurrency a custom run ramps up through before holding at the target. Only
-# the entries strictly below the target are used, then the target itself — so a
-# weak origin's knee is still found gently before full load, exactly like a tier.
-# Extended up to 500 so a run climbing to the 1000 ceiling doesn't leap straight
-# from 50 to 1000 — the extra rungs keep the climb gentle for a weak target.
-# Each rung fires the full concurrency*REQS_PER_WORKER (a normal, progressive
-# load ramp); the large request ceiling leaves plenty of budget for the ramp AND
-# a sustained hold at the target concurrency after it.
-_CUSTOM_RAMP_LADDER = (2, 5, 10, 25, 50, 100, 250, 500)
+# the entries strictly below the target are used, then the target itself. This is
+# a STRONG ramp: it starts at a real load (10) and takes big multiplicative jumps
+# (~3–4× per rung) so it reaches heavy load fast instead of crawling up through a
+# long tail of tiny steps. The first rung stays low enough to be a clean latency
+# baseline for the degradation ratio; the circuit breaker — which checks after
+# every step — is what protects a weak target from the bigger jumps, aborting the
+# instant one buckles. Each rung fires the full concurrency*REQS_PER_WORKER, and
+# the large request ceiling leaves budget for the ramp AND a sustained hold after.
+_CUSTOM_RAMP_LADDER = (10, 50, 150, 400)
 
 # Defaults when a custom field is missing/unparseable — a modest, safe run.
 _CUSTOM_DEFAULT_CONCURRENCY = 25
