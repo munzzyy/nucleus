@@ -630,6 +630,22 @@ class ValidateUrlTests(unittest.TestCase):
         ok, _reason, _cleaned = runners.validate_url("ftp://host.com/")
         self.assertFalse(ok)
 
+    def test_allow_any_scheme_accepts_non_http(self):
+        # The stress probe passes allow_any_scheme=True so an operator can load-test
+        # whatever scheme they aim at; the host is still validated and returned.
+        ok, host, cleaned = runners.validate_url("ftp://host.com/x", allow_any_scheme=True)
+        self.assertTrue(ok)
+        self.assertEqual(host, "host.com")
+        self.assertEqual(cleaned, "ftp://host.com/x")
+
+    def test_allow_any_scheme_still_enforces_everything_else(self):
+        # Loosening the scheme must not loosen the other checks: embedded creds and
+        # host-less URLs are still rejected even with allow_any_scheme=True.
+        ok, _r, _c = runners.validate_url("ftp://user:pass@host.com/", allow_any_scheme=True)
+        self.assertFalse(ok)
+        ok2, _r2, _c2 = runners.validate_url("javascript:alert(1)", allow_any_scheme=True)
+        self.assertFalse(ok2)
+
     def test_rejects_leading_dash(self):
         ok, reason, _cleaned = runners.validate_url("-http://evil.com")
         self.assertFalse(ok)
@@ -1944,13 +1960,17 @@ class StressKeepAliveTests(unittest.TestCase):
     down the two things that matters: the SSRF guard still refuses private/loopback
     targets in the new path, and a connection is genuinely reused across requests."""
 
-    def test_probe_get_refuses_private_loopback_metadata_and_bad_scheme(self):
+    def test_probe_get_ssrf_guard_holds_for_any_scheme(self):
         # The whole point: reusing common._resolve_public means the keep-alive path
-        # inherits the SAME SSRF guard. Every one of these must be refused BEFORE a
-        # socket is opened — a ValueError, never a real connection.
+        # inherits the SAME SSRF guard. The scheme allowlist is gone (an operator can
+        # aim the probe at any scheme), so that guard now has to hold for ANY scheme,
+        # not just http — every one of these must be refused BEFORE a socket is opened:
+        # a ValueError, never a real connection. The ftp:// and gopher:// entries prove
+        # dropping the scheme filter didn't open an SSRF hole.
         for bad in ("http://127.0.0.1/", "http://10.0.0.1/", "http://192.168.1.1/",
                     "http://169.254.169.254/latest/meta-data/", "http://[::1]/",
-                    "http://localhost/", "ftp://example.com/", "http:///nohost"):
+                    "http://localhost/", "ftp://127.0.0.1/",
+                    "gopher://169.254.169.254/", "http:///nohost"):
             with self.assertRaises(ValueError, msg=bad):
                 stresstest._probe_get(bad, timeout=1.0)
 
