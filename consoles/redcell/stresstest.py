@@ -1330,7 +1330,7 @@ def handle_stress_probe(req) -> "common.Response":
     if not isinstance(target_raw, str):
         return common.Response.error(400, "url must be a string")
 
-    ok, host_or_reason, cleaned = runners.validate_url(target_raw)
+    ok, host_or_reason, cleaned = runners.validate_url(target_raw, allow_any_scheme=True)
     if not ok:
         return common.Response.error(400, f"invalid target: {host_or_reason}")
 

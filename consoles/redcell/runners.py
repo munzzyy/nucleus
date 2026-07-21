@@ -119,9 +119,16 @@ def validate_host(raw: str) -> tuple[bool, str]:
     return False, "not a valid hostname or IP literal"
 
 
-def validate_url(raw: str) -> tuple[bool, str, str]:
+def validate_url(raw: str, allow_any_scheme: bool = False) -> tuple[bool, str, str]:
     """Accept an http(s) URL with a validated host and no embedded credentials.
     Returns (ok, host_or_reason, cleaned_url).
+
+    `allow_any_scheme` drops only the http/https requirement (the stress probe
+    passes this — the operator load-tests whatever scheme they aim at). Every
+    other check still applies: host validation, no embedded credentials, no
+    argument injection, and the caller's own SSRF/scope gate downstream. Leave
+    it False for the CLI runners — passing an odd scheme to sqlmap/nuclei/etc.
+    has no legitimate use there.
 
     Query strings ARE allowed (the URL charset is validated against _URL_CHARS,
     not the strict host bad-char set), so real GET-parameter targets like
@@ -139,7 +146,7 @@ def validate_url(raw: str) -> tuple[bool, str, str]:
         u = urlparse(raw)
     except ValueError:
         return False, "target is not a parseable URL", ""
-    if u.scheme not in ("http", "https"):
+    if not allow_any_scheme and u.scheme not in ("http", "https"):
         return False, "only http:// and https:// URLs are allowed", ""
     if not u.hostname:
         return False, "URL has no host", ""
