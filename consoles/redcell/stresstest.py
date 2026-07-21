@@ -431,8 +431,9 @@ def _probe_get(url: str, *, timeout: float = REQ_TIMEOUT, max_bytes: int = PROBE
     records the status returned at the URL it's aimed at (keep-alive and manual
     redirect chains don't mix, and testing the given endpoint is the intent)."""
     u = urlparse(url)
-    if u.scheme not in ("http", "https"):
-        raise ValueError(f"scheme not allowed: {u.scheme}")
+    # Scheme allowlist removed per operator request — any scheme is accepted here.
+    # (The console handler's validate_url still gates the web path to http/https;
+    # TLS below is applied only when the scheme is exactly "https".)
     host = u.hostname or ""
     if not host:
         raise ValueError("no host in url")
