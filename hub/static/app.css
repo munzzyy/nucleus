@@ -7,6 +7,8 @@
 .accent-recon   { --accent: var(--recon); }
 .accent-redcell { --accent: var(--redcell); }
 .accent-bastion { --accent: var(--bastion); }
+.accent-devkit  { --accent: var(--devkit); }
+.accent-systems { --accent: var(--systems); }
 .accent-hub     { --accent: var(--accent); }
 .dotbig { width: 9px; height: 9px; border-radius: 50%; background: var(--txt-faint); flex: none; }
 .dotbig.up { background: var(--ok); box-shadow: 0 0 10px var(--ok); }

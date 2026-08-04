@@ -35,6 +35,8 @@ APPS = {
     "recon": "consoles.recon.app",
     "redcell": "consoles.redcell.app",
     "bastion": "consoles.bastion.app",
+    "devkit": "consoles.devkit.app",
+    "systems": "consoles.systems.app",
 }
 BASE_PORT = {c["slug"]: c["port"] for c in common.CONSOLES}
 
@@ -74,6 +76,21 @@ def jget(port, path, **kw):
         return st, json.loads(body)
     except Exception:
         return st, {"_raw": body[:200].decode("utf-8", "replace")}
+
+
+def field(j, key):
+    """Pull `key` from a JSON response whether the console returns it at the top
+    level (the {ok:true, ...result} shape) or nested under a conventional
+    wrapper — so a smoke check pins the value, not the envelope."""
+    if not isinstance(j, dict):
+        return None
+    if key in j:
+        return j[key]
+    for wrap in ("result", "results", "data", "overview", "memory"):
+        w = j.get(wrap)
+        if isinstance(w, dict) and key in w:
+            return w[key]
+    return None
 
 
 def scrub_png():
@@ -325,6 +342,43 @@ def main():
             check("bastion scrub delete ok", st == 200 and j.get("ok") is True, str(j)[:120])
         else:
             skip("bastion scrub round-trip", "mat2 not installed")
+
+    # ---- devkit (pure-logic dev toolbelt; POSTs carry a same-origin Origin) ----
+    if "devkit" in servers:
+        print("\nDevkit:")
+        port = servers["devkit"][1]
+        want = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        st, j = jget(port, "/api/devkit/hash", method="POST", body={"text": "abc"})
+        check("devkit hash sha256(abc)", st == 200 and field(j, "sha256") == want, str(j)[:120])
+        st, j = jget(port, "/api/devkit/cidr", method="POST", body={"cidr": "192.168.1.0/24"})
+        check("devkit cidr /24 -> 254 usable hosts",
+              st == 200 and field(j, "num_usable_hosts") == 254, str(j)[:120])
+        # a mutating POST route still enforces the CSRF Origin check
+        noorigin = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/devkit/cidr", method="POST",
+            data=b'{"cidr":"192.168.1.0/24"}',
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(noorigin, timeout=5) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("devkit POST without Origin refused", code == 403, f"got {code}")
+
+    # ---- systems (read-only local health; GETs need no Origin) ----
+    if "systems" in servers:
+        print("\nSystems:")
+        port = servers["systems"][1]
+        st, j = jget(port, "/api/systems/overview")
+        check("systems overview has hostname", st == 200 and bool(field(j, "hostname")), str(j)[:120])
+        st, j = jget(port, "/api/systems/memory")
+        tot = field(j, "total")
+        if isinstance(tot, dict):
+            tot = tot.get("bytes")
+        check("systems memory total > 0",
+              st == 200 and isinstance(tot, (int, float)) and tot > 0, str(j)[:120])
+        st, j = jget(port, "/api/systems/disks")
+        check("systems disks reachable", st == 200, str(j)[:120])
 
     for srv, _ in servers.values():
         try:

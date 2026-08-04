@@ -1,6 +1,6 @@
 # Nucleus
 
-One local command center for the whole security kit — recon, offense, and defense — plus the apps you already run and the tools you've shipped. It's **one app** made of **three consoles**, each of which can also run on its own machine.
+One local command center for your machine — recon, offense, defense, a developer toolbelt, and a live view of the box you're on, in one loopback app. The whole security kit is still here; now it sits next to the tools you reach for the rest of the day. It's **one app** made of **five consoles**, each of which can also run on its own machine.
 
 Everything binds to `127.0.0.1` only. Pure stdlib Python, zero dependencies. Nothing phones home.
 
@@ -8,7 +8,9 @@ Everything binds to `127.0.0.1` only. Pure stdlib Python, zero dependencies. Not
 ┌─ Nucleus hub  :8890 ─ the command center. links + live status of everything.
 ├─ Recon        :8900 ─ OSINT. paste a username / email / domain / IP / phone, get live passive recon.
 ├─ Redcell      :8910 ─ the pentest kit. safe runners + web analyzer + hash ID + one-click assessments.
-└─ Bastion      :8920 ─ opsec posture of this box + the OSINT report engine (graded domain assessments).
+├─ Bastion      :8920 ─ opsec posture of this box + the OSINT report engine (graded domain assessments).
+├─ Devkit       :8930 ─ dev toolbelt. hashes, encoders, JWT, JSON, generators, time, regex, CIDR.
+└─ Systems      :8940 ─ live local machine health: CPU, memory, disk, network, processes, sensors.
 ```
 
 ## Run it
@@ -31,6 +33,8 @@ Install puts `nucleus` on your PATH (`~/.local/bin`), adds a **Nucleus** app-men
 
 The app starts every console — and your coleos-hub, if it's there — in the background, then opens the hub. The switcher at the top moves between consoles inside the same window. Set your API keys from the hub's **Settings** panel; no file editing.
 
+Hit **Ctrl-K** (Cmd-K on a Mac) anywhere and you get a command palette: type a few letters to jump to another console or straight to any tool section on the page you're on. It reads the page's own headings, so it works the same on every console with nothing to configure.
+
 ### Headless / power use
 
 ```bash
@@ -49,9 +53,9 @@ Each console is standalone. Copy the repo to another box and run just one:
 python3 consoles/recon/app.py     # only Recon, on :8900
 ```
 
-The switcher at the top of every console lights up whichever siblings it can reach on loopback, so a single machine running all three feels like one app — and three machines each running one still cross-link.
+The switcher at the top of every console lights up whichever siblings it can reach on loopback, so a single machine running all five feels like one app — and five machines each running one still cross-link.
 
-## The three consoles
+## The consoles
 
 **Recon (OSINT).** A rebuild of the old osint-console. Auto-detects what you paste and runs live, passive, keyless lookups: username presence across ~30 sites, email breach exposure + Gravatar + MX, full domain workup (DNS, whois, subdomains via crt.sh, SPF/DMARC, security headers, hosting/ports/CVEs), IP intel (open ports, CVEs, geo, reverse DNS, Tor relay check), and phone validation (optional API key). Anything without a live module falls back to curated pivot links and a Google-dork builder. Every outbound request goes through one SSRF-guarded fetch; DNS rides encrypted DNS-over-HTTPS.
 
@@ -68,6 +72,10 @@ Authorized / lab / CTF use only.
 
 **Bastion (defensive).** Three parts. A read-only posture dashboard that tells you whether this machine is actually hardened — kernel sysctls, auditd, encrypted Quad9 DNS, Tor, WireGuard, MAC randomization, firewall, CVE audit — and shows the exact command to fix anything that isn't. The **OSINT report engine**: give it a domain and it produces a graded (A–F) passive security assessment with prioritized findings, rendered to Markdown and HTML. And the **scrub panel**: drop files on it, see exactly what metadata they're carrying, and clean them with one click — mat2 does the stripping in sandboxed parsers, then the file is re-checked to prove nothing is left. Cleaned files stay on loopback, and uploads auto-purge after 24 hours.
 
+**Devkit (developer toolbelt).** The everyday dev stuff you'd otherwise paste into some sketchy website. Hashing (md5 through blake2b), encoders and decoders (base64/base64url/base32/hex/url/html/rot13), a JWT decoder that can verify an HS256 signature with your own secret, JSON pretty-print/minify/validate with the exact line and column on a syntax error, generators for UUIDs, passwords, random bytes and secret keys built on `secrets`, time and timezone conversion plus a cron "when does this next fire" preview, base and color conversion, byte humanizing, a pile of text transforms, a unified diff, a CIDR calculator, and a regex tester. Every tool computes in Python on loopback — nothing you paste in leaves the box. The regex tester runs each match in a short-lived subprocess with a hard timeout, so a catastrophic-backtracking pattern times out cleanly instead of hanging the server. Devkit does no network or filesystem I/O at all.
+
+**Systems (live machine health).** A read-only look at the box you're on: an overview (host, kernel, OS, uptime, load, RAM), per-core and overall CPU use, memory and swap, disk usage per real mount, network interfaces with their traffic counters and addresses, listening TCP/UDP ports mapped back to a process where it's resolvable, the top processes by CPU and memory, temperatures and battery, and your running/failed `--user` systemd services. It only ever reads `/proc`, `/sys`, and a short allow-list of read-only commands — no writes, no killing processes, no config changes, nothing off the machine. The cheap panels refresh on their own; the heavier ones refresh on demand.
+
 ## Security model
 
 - **Loopback only.** Every server binds `127.0.0.1`. Not a config knob.
@@ -75,7 +83,7 @@ Authorized / lab / CTF use only.
 - **Strict CSP.** `default-src 'none'`; no external scripts, styles, fonts, or images. The UI only ever calls its own origin — cross-console data is aggregated server-side.
 - **SSRF guard.** Recon's only door to the internet is one `fetch()` that refuses loopback, RFC1918, link-local, and reserved addresses.
 - **No shell, ever.** Redcell executes only allow-listed binaries with an argv list (never a string), only after the authorization gate, and logs every run. Aggressive tools are never auto-run.
-- **Read-only on the system.** Bastion inspects and reports; it never runs sudo or changes system state.
+- **Read-only on the system.** Bastion and Systems inspect and report; they never run sudo or change system state. Systems reads `/proc` and `/sys` and a short allow-list of read-only commands, nothing more.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it all fits together.
 
@@ -105,6 +113,8 @@ hub/                    the command center
 consoles/recon/         OSINT
 consoles/redcell/       offensive
 consoles/bastion/       defensive / opsec
+consoles/devkit/        developer toolbelt
+consoles/systems/       live local machine health
 engine/osint_report.py  the graded domain-assessment engine (also a CLI)
 bin/                    launcher, installer, desktop + systemd files
 ```

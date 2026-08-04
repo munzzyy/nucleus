@@ -63,6 +63,10 @@ CONSOLES: list[dict] = [
      "tag": "offensive",      "desc": "The pentest kit — inventory + authorized runners."},
     {"slug": "bastion", "name": "Bastion",  "port": 8920,
      "tag": "defensive",      "desc": "Hardening, opsec posture, metadata scrubbing, and the report engine."},
+    {"slug": "devkit",  "name": "Devkit",   "port": 8930,
+     "tag": "developer",      "desc": "Encoders, hashes, JWT, JSON, generators, time, regex, CIDR — the everyday dev toolbelt."},
+    {"slug": "systems", "name": "Systems",  "port": 8940,
+     "tag": "systems",        "desc": "Live local machine health — CPU, memory, disk, network, processes, sensors."},
 ]
 # Other local apps Nucleus knows how to point at (not part of this repo).
 EXTERNAL_APPS: list[dict] = [

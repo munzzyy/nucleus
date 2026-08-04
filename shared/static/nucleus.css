@@ -15,6 +15,8 @@
   --recon: #7c5cff;       /* osint violet */
   --redcell: #ff5c72;     /* offensive red */
   --bastion: #38d39f;     /* defensive green */
+  --devkit: #f2a541;      /* developer amber */
+  --systems: #31c8d6;     /* systems cyan */
   --warn: #ffb454;
   --ok: #38d39f;
   --bad: #ff5c72;
@@ -44,6 +46,8 @@ code, kbd, pre { font-family: var(--mono); }
 body[data-accent="recon"]   { --accent: var(--recon); }
 body[data-accent="redcell"] { --accent: var(--redcell); }
 body[data-accent="bastion"] { --accent: var(--bastion); }
+body[data-accent="devkit"]  { --accent: var(--devkit); }
+body[data-accent="systems"] { --accent: var(--systems); }
 
 /* ---- topbar + opsec bar wrapper ----
    Both sit inside one sticky wrapper, stacked in normal document flow
@@ -223,6 +227,32 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 .shortcuts-list { display: grid; grid-template-columns: max-content 1fr; gap: 9px 14px; margin: 0; }
 .shortcuts-list dt { margin: 0; }
 .shortcuts-list dd { margin: 0; color: var(--txt-dim); font-size: 13px; align-self: center; }
+
+/* ---- command palette (Ctrl-K / Cmd-K, any console) ----
+   Same overlay pattern as the shortcuts help, but top-aligned so the results
+   list has room to grow downward and the input sits where the eye already is. */
+.cmd-overlay { position: fixed; inset: 0; z-index: 210;
+  background: rgba(4,7,12,.72); display: flex; align-items: flex-start;
+  justify-content: center; padding: 15vh 20px 20px; }
+.cmd-overlay.hidden { display: none; }
+.cmd-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
+  border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: var(--shadow);
+  width: 100%; max-width: 560px; overflow: hidden; }
+.cmd-input { width: 100%; padding: 15px 18px; background: var(--bg-2); color: var(--txt);
+  border: none; border-bottom: 1px solid var(--line); border-radius: 0;
+  font-size: 15px; font-family: inherit; }
+.cmd-input:focus { outline: none; box-shadow: none; border-bottom-color: var(--accent); }
+.cmd-results { list-style: none; margin: 0; padding: 6px; max-height: 50vh; overflow-y: auto; }
+.cmd-results:empty { display: none; }
+.cmd-item { padding: 9px 12px; border-radius: 8px; font-size: 14px; color: var(--txt);
+  cursor: pointer; display: flex; align-items: center; gap: 10px; }
+.cmd-item .cmd-kind { color: var(--txt-faint); font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; margin-left: auto; flex: none; }
+.cmd-item.active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--txt); }
+.cmd-item.active .cmd-kind { color: var(--accent); }
+.cmd-empty { padding: 14px 18px; color: var(--txt-dim); font-size: 13px; }
+.cmd-hint { padding: 8px 14px; border-top: 1px solid var(--line); color: var(--txt-faint);
+  font-size: 12px; display: flex; gap: 6px; align-items: center; }
 
 /* ---- print (Bastion report -> Save as PDF via window.print()) ---- */
 @media print {

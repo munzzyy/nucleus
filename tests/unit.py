@@ -16,7 +16,10 @@ don't "fix" it by loosening the assertion.
 """
 from __future__ import annotations
 
+import base64
+import datetime
 import hashlib
+import hmac
 import http.client
 import http.server
 import json
@@ -31,6 +34,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 import zlib
 from pathlib import Path
 from unittest import mock
@@ -59,6 +63,9 @@ from consoles.bastion import scrub
 from consoles.redcell.app import build_app as _redcell_build_app
 from consoles.recon.app import build_app as _recon_build_app
 from consoles.bastion.app import build_app as _bastion_build_app
+from consoles.devkit import tools as devkit_tools
+from consoles.devkit.app import build_app as _devkit_build_app
+from consoles.systems import sysinfo
 
 # tests/ on path so the labeled-corpus benchmark is importable as a CI floor
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -3290,6 +3297,565 @@ class TestScrub(unittest.TestCase):
             resp = self._upload_handler()(self._upload_req({"X-Filename": "shot.png"}, b"data"))
         self.assertEqual(resp.status, 503)
         self.assertIn("pacman -S mat2", json.loads(resp.body)["error"])
+
+
+# ==========================================================================
+# 21. consoles/devkit/tools.py — the pure-logic dev toolbelt
+# ==========================================================================
+class TestDevkit(unittest.TestCase):
+    """Known-answer vectors for the devkit engine. Every function here is
+    import-and-call with no server, so a wrong hash, a broken encode round-trip,
+    a mis-verified JWT, or a cron miscount fails offline — before the thin POST
+    wrappers ever see it. Devkit does no network or filesystem I/O; the ONE
+    subprocess (the ReDoS-guarded regex worker) runs our own python, and the
+    catastrophic-pattern case below asserts that guard returns an error dict
+    instead of hanging a worker thread.
+
+    The contract fixes the answer of each tool but deliberately leaves the
+    result *wrapper* open (a value may come back bare or under result/value/...).
+    The helpers below peel that one layer so a vector assertion pins the answer,
+    not the wrapper the console author happened to pick, and the error helper
+    accepts either a raised ValueError or an {'error': ...} dict as a clean
+    rejection — what it never tolerates is bad input yielding a normal result."""
+
+    # --- shape tolerance helpers -----------------------------------------
+    @staticmethod
+    def _unwrap(out):
+        if isinstance(out, dict):
+            for k in ("result", "value", "output", "bytes"):
+                if k in out:
+                    return out[k]
+        return out
+
+    @staticmethod
+    def _as_list(out):
+        """Normalize a generator's one-or-many output to a plain list."""
+        if isinstance(out, dict):
+            for k in ("results", "values", "passwords", "uuids", "ids", "result"):
+                if k in out:
+                    v = out[k]
+                    return v if isinstance(v, list) else [v]
+            for k in ("password", "uuid", "value"):
+                if k in out:
+                    return [out[k]]
+        if isinstance(out, list):
+            return out
+        if isinstance(out, (str, int)):
+            return [out]
+        return []
+
+    @staticmethod
+    def _nums(v):
+        """Pull the numeric components out of a color channel value however it
+        is represented — 'rgb(255, 136, 0)', [255,136,0], {'r':255,...}, and
+        decimals like 'hsl(32.0, 100.0%, 50.0%)' all come out as ints."""
+        if isinstance(v, str):
+            return [int(round(float(x))) for x in re.findall(r"-?\d+(?:\.\d+)?", v)]
+        if isinstance(v, (list, tuple)):
+            return [int(round(x)) for x in v if isinstance(x, (int, float))]
+        if isinstance(v, dict):
+            return [int(round(x)) for x in v.values() if isinstance(x, (int, float))]
+        return []
+
+    @staticmethod
+    def _dt(s):
+        s = s.strip()
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.datetime.fromisoformat(s)
+
+    def _assert_signals_error(self, fn, *args, **kwargs):
+        """Bad input is a clean rejection, never a 500-shaped blow-up: the tool
+        either raises ValueError or returns a dict carrying an 'error' key."""
+        try:
+            out = fn(*args, **kwargs)
+        except ValueError:
+            return
+        self.assertIsInstance(out, dict,
+                              f"{getattr(fn, '__name__', fn)} did not reject bad input: {out!r}")
+        self.assertIn("error", out,
+                      f"{getattr(fn, '__name__', fn)} returned no error for bad input: {out!r}")
+
+    @staticmethod
+    def _b64url(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    def _make_jwt(self, payload, secret, alg="HS256"):
+        header = {"alg": alg, "typ": "JWT"}
+        signing = (self._b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+                   + "." + self._b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8")))
+        if alg == "none":
+            return signing + "."
+        mac = hmac.new(secret.encode("utf-8"), signing.encode("ascii"), hashlib.sha256).digest()
+        return signing + "." + self._b64url(mac)
+
+    # --- hashing ----------------------------------------------------------
+    def test_hash_known_vectors(self):
+        out = devkit_tools.hash_text("abc")
+        self.assertEqual(out["md5"], "900150983cd24fb0d6963f7d28e17f72")
+        self.assertEqual(out["sha1"], "a9993e364706816aba3e25717850c26c9cd0d89d")
+        self.assertEqual(out["sha256"],
+                         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        self.assertEqual(out["sha3_256"],
+                         "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532")
+        self.assertEqual(len(out["sha512"]), 128)
+
+    def test_hash_blake2b_default_digest(self):
+        out = devkit_tools.hash_text("abc")
+        self.assertEqual(len(out["blake2b"]), 128)  # 64-byte digest as hex
+        self.assertTrue(all(c in "0123456789abcdef" for c in out["blake2b"]))
+
+    # --- encode / decode --------------------------------------------------
+    def test_encode_decode_roundtrips(self):
+        text = "The quick brown fox! <a>&'\" 1+2=3"
+        for scheme in ("base64", "base64url", "base32", "hex", "url", "html", "rot13"):
+            with self.subTest(scheme=scheme):
+                enc = self._unwrap(devkit_tools.encode(text, scheme))
+                self.assertIsInstance(enc, str)
+                dec = self._unwrap(devkit_tools.decode(enc, scheme))
+                self.assertEqual(dec, text)
+
+    def test_base64_known_and_padless_decode(self):
+        self.assertEqual(self._unwrap(devkit_tools.encode("hello", "base64")), "aGVsbG8=")
+        # base64 decode must tolerate the stripped padding
+        self.assertEqual(self._unwrap(devkit_tools.decode("aGVsbG8", "base64")), "hello")
+
+    def test_hex_and_rot13_known_vectors(self):
+        self.assertEqual(self._unwrap(devkit_tools.encode("hello", "hex")), "68656c6c6f")
+        self.assertEqual(self._unwrap(devkit_tools.decode("68656c6c6f", "hex")), "hello")
+        self.assertEqual(self._unwrap(devkit_tools.encode("hello", "rot13")), "uryyb")
+
+    def test_decode_bad_input_errors(self):
+        self._assert_signals_error(devkit_tools.decode, "!!!not-hex!!!", "hex")
+
+    # --- JWT --------------------------------------------------------------
+    def test_jwt_reads_header_and_payload(self):
+        out = devkit_tools.jwt_decode(self._make_jwt({"sub": "42", "name": "Cole"}, "topsecret"))
+        self.assertEqual(out["header"]["alg"], "HS256")
+        self.assertEqual(out["alg"], "HS256")
+        self.assertEqual(out["payload"]["sub"], "42")
+        self.assertEqual(out["payload"]["name"], "Cole")
+
+    def test_jwt_verify_with_right_and_wrong_secret(self):
+        tok = self._make_jwt({"sub": "42"}, "topsecret")
+        self.assertIs(devkit_tools.jwt_decode(tok, secret="topsecret", verify=True)["verified"], True)
+        self.assertIs(devkit_tools.jwt_decode(tok, secret="wrong", verify=True)["verified"], False)
+
+    def test_jwt_alg_none_warns(self):
+        out = devkit_tools.jwt_decode(self._make_jwt({"sub": "42"}, "", alg="none"))
+        self.assertTrue(out.get("warnings"))
+        self.assertIn("none", " ".join(out["warnings"]).lower())
+
+    def test_jwt_expiry_flag(self):
+        past = self._make_jwt({"exp": int(time.time()) - 3600}, "s")
+        future = self._make_jwt({"exp": int(time.time()) + 3600}, "s")
+        out_past = devkit_tools.jwt_decode(past)
+        self.assertIs(out_past["expired"], True)
+        self.assertTrue(out_past.get("exp_human"))
+        self.assertIn(devkit_tools.jwt_decode(future)["expired"], (False, None))
+
+    def test_jwt_malformed_errors(self):
+        self._assert_signals_error(devkit_tools.jwt_decode, "not-a-jwt")
+
+    # --- JSON tool --------------------------------------------------------
+    def test_json_pretty_and_minify(self):
+        pretty = self._unwrap(devkit_tools.json_tool('{"b":1,"a":2}', "pretty"))
+        self.assertIn("\n", pretty)
+        self.assertEqual(json.loads(pretty), {"b": 1, "a": 2})
+        mini = self._unwrap(devkit_tools.json_tool('{ "a" : 1 , "b" : 2 }', "minify"))
+        self.assertEqual(mini, '{"a":1,"b":2}')
+
+    def test_json_validate_accepts_valid(self):
+        out = devkit_tools.json_tool('{"a":1}', "validate")
+        if isinstance(out, dict):
+            self.assertNotIn("error", out)
+
+    def test_json_invalid_returns_error(self):
+        try:
+            out = devkit_tools.json_tool('{"a": }', "pretty")
+        except ValueError:
+            return
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    # --- generators -------------------------------------------------------
+    def test_gen_password_length_and_classes(self):
+        pw = self._as_list(devkit_tools.gen_password(length=24))[0]
+        self.assertEqual(len(pw), 24)
+        self.assertTrue(any(c.islower() for c in pw))
+        self.assertTrue(any(c.isupper() for c in pw))
+        self.assertTrue(any(c.isdigit() for c in pw))
+
+    def test_gen_password_count(self):
+        pws = self._as_list(devkit_tools.gen_password(length=12, count=3))
+        self.assertEqual(len(pws), 3)
+        self.assertTrue(all(len(p) == 12 for p in pws))
+
+    def test_gen_password_rejects_too_short(self):
+        self._assert_signals_error(devkit_tools.gen_password, length=2)
+
+    def test_gen_password_rejects_no_class(self):
+        self._assert_signals_error(devkit_tools.gen_password, length=12,
+                                   upper=False, lower=False, digits=False, symbols=False)
+
+    def test_gen_uuid_version_and_count(self):
+        ids = self._as_list(devkit_tools.gen_uuid(version=4, count=3))
+        self.assertEqual(len(ids), 3)
+        for u in ids:
+            self.assertEqual(uuid.UUID(str(u)).version, 4)
+
+    # --- numbers & color --------------------------------------------------
+    def test_base_convert_known_and_roundtrip(self):
+        self.assertEqual(self._unwrap(devkit_tools.base_convert("ff", 16, 2)), "11111111")
+        self.assertEqual(self._unwrap(devkit_tools.base_convert("11111111", 2, 16)), "ff")
+        self.assertEqual(self._unwrap(devkit_tools.base_convert("255", 10, 16)), "ff")
+
+    def test_base_convert_bad_digit_errors(self):
+        self._assert_signals_error(devkit_tools.base_convert, "xyz", 10, 2)
+
+    def test_color_hex_to_rgb(self):
+        out = devkit_tools.color_convert("#ff8800")
+        self.assertEqual(self._nums(out["rgb"])[:3], [255, 136, 0])
+
+    def test_color_hsl_within_tolerance(self):
+        # #ff8800 is hsl(32, 100%, 50%) — the round-trip must land within a
+        # rounding tolerance of that.
+        hue, sat, lum = self._nums(devkit_tools.color_convert("#ff8800")["hsl"])[:3]
+        self.assertLessEqual(abs(hue - 32), 2)
+        self.assertEqual(sat, 100)
+        self.assertLessEqual(abs(lum - 50), 2)
+
+    def test_color_bad_errors(self):
+        self._assert_signals_error(devkit_tools.color_convert, "not-a-color")
+
+    def test_bytes_roundtrip(self):
+        for n in (1024, 1048576, 1610612736):  # 1 KiB, 1 MiB, 1.5 GiB
+            with self.subTest(n=n):
+                human = self._unwrap(devkit_tools.humanize_bytes(n, binary=True))
+                self.assertIsInstance(human, str)
+                self.assertEqual(int(self._unwrap(devkit_tools.parse_bytes(human))), n)
+
+    # --- text -------------------------------------------------------------
+    def test_text_transforms(self):
+        self.assertEqual(self._unwrap(devkit_tools.text_tools("Hello World!", "slugify")),
+                         "hello-world")
+        self.assertEqual(self._unwrap(devkit_tools.text_tools("hello world", "upper")),
+                         "HELLO WORLD")
+
+    def test_text_sort_unique(self):
+        out = self._unwrap(devkit_tools.text_tools(
+            "banana\napple\nbanana\ncherry", "sort", unique=True))
+        self.assertEqual(out.splitlines(), ["apple", "banana", "cherry"])
+
+    def test_text_dedup_keeps_order(self):
+        out = self._unwrap(devkit_tools.text_tools("b\na\nb\nc\na", "dedup"))
+        self.assertEqual(out.splitlines(), ["b", "a", "c"])
+
+    def test_text_count(self):
+        out = devkit_tools.text_tools("one two three\nfour five", "count")
+        counts = out["counts"] if isinstance(out, dict) and "counts" in out else self._unwrap(out)
+        self.assertEqual(counts["words"], 5)
+        self.assertEqual(counts["lines"], 2)
+
+    def test_text_diff_detects_changes(self):
+        out = devkit_tools.text_diff("alpha\nbeta\ngamma", "alpha\nBETA\ngamma")
+        self.assertTrue(out["changed"])
+        self.assertTrue(out.get("added"))
+        self.assertTrue(out.get("removed"))
+        self.assertIn("beta", out["diff"])
+
+    def test_text_diff_identical(self):
+        self.assertFalse(devkit_tools.text_diff("same\ntext", "same\ntext")["changed"])
+
+    # --- cron -------------------------------------------------------------
+    def test_cron_every_15_min_spacing(self):
+        out = devkit_tools.cron_next("*/15 * * * *", count=5, base_iso="2026-01-01T00:07:00")
+        times = [self._dt(s) for s in out["next"]]
+        self.assertEqual(len(times), 5)
+        for earlier, later in zip(times, times[1:]):
+            self.assertEqual((later - earlier).total_seconds(), 900)
+        self.assertEqual((times[0].hour, times[0].minute), (0, 15))
+
+    def test_cron_mondays_at_nine(self):
+        out = devkit_tools.cron_next("0 9 * * 1", count=4, base_iso="2026-01-01T00:00:00")
+        for dt in (self._dt(s) for s in out["next"]):
+            self.assertEqual(dt.weekday(), 0)  # Monday
+            self.assertEqual((dt.hour, dt.minute), (9, 0))
+
+    def test_cron_month_starts(self):
+        out = devkit_tools.cron_next("0 0 1 * *", count=3, base_iso="2026-01-15T00:00:00")
+        for dt in (self._dt(s) for s in out["next"]):
+            self.assertEqual(dt.day, 1)
+            self.assertEqual((dt.hour, dt.minute), (0, 0))
+
+    def test_cron_count_is_capped(self):
+        out = devkit_tools.cron_next("* * * * *", count=100, base_iso="2026-01-01T00:00:00")
+        self.assertLessEqual(len(out["next"]), 20)
+
+    def test_cron_bad_field_errors(self):
+        self._assert_signals_error(devkit_tools.cron_next, "99 * * * *",
+                                   count=5, base_iso="2026-01-01T00:00:00")
+
+    # --- regex (ReDoS-guarded subprocess) ---------------------------------
+    def test_regex_normal_matches(self):
+        out = devkit_tools.regex_test(r"(\d+)", "abc123def456")
+        self.assertNotIn("error", out)
+        self.assertEqual(out.get("count", len(out.get("matches", []))), 2)
+        self.assertIn("123", json.dumps(out.get("matches")))
+
+    def test_regex_invalid_pattern_errors(self):
+        out = devkit_tools.regex_test("(unclosed", "text")
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    def test_regex_catastrophic_backtracking_guarded(self):
+        # The subprocess guard must kill this within its hard timeout and hand
+        # back an error dict, never hang the caller. Input kept small so the
+        # test finishes at the guard's timeout, not later.
+        out = devkit_tools.regex_test(r"(a+)+$", "a" * 30 + "!")
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    # --- network (CIDR) ---------------------------------------------------
+    def test_cidr_info_slash24(self):
+        out = devkit_tools.cidr_info("192.168.1.0/24")
+        self.assertEqual(out["num_usable_hosts"], 254)
+        self.assertEqual(out["num_addresses"], 256)
+        self.assertEqual(out["prefixlen"], 24)
+        self.assertEqual(out["version"], 4)
+        self.assertTrue(out["is_private"])
+        self.assertEqual(out["first_host"], "192.168.1.1")
+        self.assertEqual(out["last_host"], "192.168.1.254")
+
+    def test_cidr_contains(self):
+        self.assertTrue(devkit_tools.cidr_contains("192.168.1.0/24", "192.168.1.50")["contains"])
+        self.assertFalse(devkit_tools.cidr_contains("192.168.1.0/24", "10.0.0.1")["contains"])
+
+    def test_cidr_bad_errors(self):
+        self._assert_signals_error(devkit_tools.cidr_info, "999.1.1.0/24")
+
+
+# ==========================================================================
+# 21b. consoles/devkit — hostile-input hardening (no tool may exhaust a
+# worker or 500 on pathological input). Regression cover for the four
+# robustness fixes: deeply nested JSON (RecursionError), non-finite/oversized
+# numbers (OverflowError), an unbounded password length, and an oversized
+# base_convert value whose bignum would blow the int->str digit limit.
+# ==========================================================================
+class TestDevkitHardening(unittest.TestCase):
+    def _assert_raises_value(self, fn, *args, **kwargs):
+        with self.assertRaises(ValueError):
+            fn(*args, **kwargs)
+
+    def test_nested_json_is_clean_error(self):
+        # json.loads blows its parser stack on this; the tool must translate
+        # that into a ValueError, not let RecursionError escape.
+        self._assert_raises_value(devkit_tools.json_tool, "[" * 60000 + "]" * 60000, "validate")
+
+    def test_humanize_bytes_rejects_non_finite_and_oversized(self):
+        self._assert_raises_value(devkit_tools.humanize_bytes, float("inf"))
+        self._assert_raises_value(devkit_tools.humanize_bytes, float("nan"))
+        self._assert_raises_value(devkit_tools.humanize_bytes, 10 ** 400)
+
+    def test_humanize_duration_rejects_non_finite(self):
+        self._assert_raises_value(devkit_tools.humanize_duration, float("inf"))
+        self._assert_raises_value(devkit_tools.humanize_duration, 10 ** 400)
+
+    def test_gen_password_length_is_capped(self):
+        # An unbounded length is a memory/CPU exhaustion vector from a tiny
+        # request; it must be rejected, not attempted.
+        self._assert_raises_value(devkit_tools.gen_password, length=10 ** 8)
+
+    def test_base_convert_value_length_is_capped(self):
+        self._assert_raises_value(devkit_tools.base_convert, "f" * 5000, 16, 36)
+
+
+# ==========================================================================
+# 22. consoles/systems/sysinfo.py — read-only local machine collectors
+# ==========================================================================
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "systems collectors read Linux /proc and /sys")
+class TestSystems(unittest.TestCase):
+    """Shape + invariant checks for the read-only health collectors. They read
+    /proc, /sys and stdlib only, so on any Linux box each returns a JSON-able
+    dict without raising and the physical laws hold (used<=total, 0<=percent<=100,
+    lo is always present, ...). Values are live, so nothing here pins an exact
+    number — only the shape and the invariants that can't be violated. Key
+    names the contract left loose are read tolerantly so a naming choice by the
+    console author doesn't read as a failure."""
+
+    @staticmethod
+    def _num(v):
+        """A byte-valued field may be a bare number or a {'bytes':N,'human':..}
+        pair — return the numeric part, or None if there isn't one."""
+        if isinstance(v, dict):
+            for k in ("bytes", "value", "raw", "b"):
+                if isinstance(v.get(k), (int, float)):
+                    return v[k]
+            return None
+        return v if isinstance(v, (int, float)) else None
+
+    @staticmethod
+    def _rows(out, *keys):
+        """Pull a list of rows whether the collector returns it bare or wraps
+        it under a key (disks/network/processes)."""
+        if isinstance(out, list):
+            return out
+        if isinstance(out, dict):
+            for k in keys:
+                if isinstance(out.get(k), list):
+                    return out[k]
+            for v in out.values():
+                if isinstance(v, list):
+                    return v
+        return []
+
+    def test_overview_has_hostname(self):
+        out = sysinfo.overview()
+        self.assertIsInstance(out, dict)
+        self.assertTrue(out.get("hostname"))
+        up = self._num(out.get("uptime", out.get("uptime_seconds")))
+        if up is not None:
+            self.assertGreaterEqual(up, 0)
+
+    def test_cpu_percentages_in_range(self):
+        out = sysinfo.cpu()
+        self.assertIsInstance(out, dict)
+        cores = self._rows(out, "per_core", "cores", "per_cpu", "percpu",
+                           "core_percent", "per_core_percent")
+        self.assertTrue(cores)  # at least one core reported
+        overall = None
+        for k in ("overall", "percent", "total", "usage", "utilization"):
+            v = out.get(k)
+            v = v.get("percent") if isinstance(v, dict) else v
+            if isinstance(v, (int, float)):
+                overall = v
+                break
+        if overall is not None:
+            self.assertGreaterEqual(overall, 0)
+            self.assertLessEqual(overall, 100)
+
+    def test_memory_invariants(self):
+        out = sysinfo.memory()
+        total = self._num(out.get("total")) or self._num(out.get("total_bytes"))
+        used = self._num(out.get("used"))
+        if used is None:
+            used = self._num(out.get("used_bytes"))
+        self.assertIsNotNone(total)
+        self.assertGreater(total, 0)
+        if used is not None:
+            self.assertLessEqual(used, total)
+        pct = out.get("percent")
+        pct = pct.get("percent") if isinstance(pct, dict) else pct
+        if isinstance(pct, (int, float)):
+            self.assertGreaterEqual(pct, 0)
+            self.assertLessEqual(pct, 100)
+
+    def test_disks_include_root_mount(self):
+        rows = self._rows(sysinfo.disks(), "disks", "mounts", "filesystems")
+        self.assertTrue(rows)
+        self.assertTrue(any(isinstance(d, dict) and (self._num(d.get("total")) or 0) > 0
+                            for d in rows))
+        mounts = [d.get("mount") or d.get("mountpoint")
+                  for d in rows if isinstance(d, dict)]
+        self.assertIn("/", mounts)
+
+    def test_network_lists_loopback(self):
+        rows = self._rows(sysinfo.network(), "interfaces", "ifaces", "nics")
+        names = [n.get("name") or n.get("iface") for n in rows if isinstance(n, dict)]
+        self.assertIn("lo", names)
+
+    def test_listening_returns_a_container(self):
+        self.assertIsInstance(sysinfo.listening(), (dict, list))
+
+    def test_processes_returns_two_nonempty_lists(self):
+        out = sysinfo.processes(limit=10)
+        lists = []
+        if isinstance(out, dict):
+            for v in out.values():
+                if isinstance(v, list):
+                    lists.append(v)
+                elif isinstance(v, dict):
+                    lists.extend(vv for vv in v.values() if isinstance(vv, list))
+        elif isinstance(out, (list, tuple)):
+            lists = [x for x in out if isinstance(x, list)]
+        self.assertGreaterEqual(len(lists), 2)          # top-by-cpu and top-by-mem
+        self.assertTrue(any(len(x) > 0 for x in lists))  # a running box has processes
+
+    def test_sensors_shape(self):
+        out = sysinfo.sensors()
+        self.assertIsInstance(out, dict)
+        for key in ("temps", "batteries", "ac"):
+            self.assertIn(key, out)
+        self.assertIsInstance(out["temps"], list)
+        self.assertIsInstance(out["batteries"], list)
+
+    def test_services_returns_dict(self):
+        self.assertIsInstance(sysinfo.services(), dict)
+
+
+# ==========================================================================
+# 23. consoles/devkit/app.py — POST route contract (live loopback)
+# ==========================================================================
+class DevkitHandlerContractTests(unittest.TestCase):
+    """One live-server proof that devkit's POST routes wear the framework's two
+    guarantees: a malformed body comes back 400 (validated, never a 500 from an
+    unhandled raise), and a POST without a same-origin Origin is refused 403 by
+    the shared CSRF guard before the handler runs. Binds 127.0.0.1 on an
+    OS-assigned ephemeral port and shuts back down; no network."""
+
+    def _free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def setUp(self):
+        app = _devkit_build_app()
+        self.httpd = None
+        last_error = None
+        for _attempt in range(3):
+            port = self._free_port()
+            try:
+                self.httpd = common.serve(app, port=port, block=False)
+                self.port = port
+                break
+            except OSError as e:
+                last_error = e
+                continue
+        if self.httpd is None:
+            self.skipTest(f"could not bind a loopback test port: {last_error}")
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _post(self, path: str, body: bytes, headers: dict) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status
+        finally:
+            conn.close()
+
+    def test_bad_body_returns_400_not_500(self):
+        # Same-origin so CSRF passes; an unparseable CIDR must validate into a
+        # clean 400, not raise into a 500.
+        headers = {"Origin": f"http://127.0.0.1:{self.port}",
+                   "Content-Type": "application/json"}
+        self.assertEqual(self._post("/api/devkit/cidr", b'{"cidr":"not-a-cidr"}', headers), 400)
+
+    def test_post_without_origin_refused_403(self):
+        self.assertEqual(
+            self._post("/api/devkit/cidr", b'{"cidr":"192.168.1.0/24"}',
+                       {"Content-Type": "application/json"}), 403)
+
+    def test_post_with_foreign_origin_refused_403(self):
+        self.assertEqual(
+            self._post("/api/devkit/cidr", b'{"cidr":"192.168.1.0/24"}',
+                       {"Origin": "http://evil.example:1234",
+                        "Content-Type": "application/json"}), 403)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nucleus — launch and manage the whole command center.
 
-  nucleus up            start the hub + all three consoles (Ctrl-C stops all)
+  nucleus up            start the hub + all consoles (Ctrl-C stops all)
   nucleus up --open     ...and open the hub in your browser
   nucleus up --only recon,bastion   start just those
   nucleus status        show what's online
@@ -31,8 +31,10 @@ MODULES = {
     "recon": "consoles.recon.app",
     "redcell": "consoles.redcell.app",
     "bastion": "consoles.bastion.app",
+    "devkit": "consoles.devkit.app",
+    "systems": "consoles.systems.app",
 }
-ORDER = ["hub", "recon", "redcell", "bastion"]
+ORDER = ["hub", "recon", "redcell", "bastion", "devkit", "systems"]
 PORT = {c["slug"]: c["port"] for c in common.CONSOLES}
 
 
@@ -184,14 +186,14 @@ def main():
 
     up = sub.add_parser("up", help="start the hub + consoles (headless, no window)")
     up.add_argument("--open", action="store_true", help="open the hub in a browser")
-    up.add_argument("--only", default="", help="comma list: recon,redcell,bastion,hub")
+    up.add_argument("--only", default="", help="comma list: recon,redcell,bastion,devkit,systems,hub")
     up.set_defaults(func=cmd_up)
 
     st = sub.add_parser("status", help="show what's online")
     st.set_defaults(func=cmd_status)
 
     op = sub.add_parser("open", help="open a console in the browser")
-    op.add_argument("name", nargs="?", help="hub|recon|redcell|bastion")
+    op.add_argument("name", nargs="?", help="hub|recon|redcell|bastion|devkit|systems")
     op.set_defaults(func=cmd_open)
 
     dr = sub.add_parser("doctor", help="environment sanity check")

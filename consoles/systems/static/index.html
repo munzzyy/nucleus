@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Systems — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/systems.css">
+</head>
+<body data-app="systems" data-auto-shell data-accent="systems">
+  <div class="wrap">
+    <div class="page-head">
+      <h1>Systems <span class="tag">systems</span></h1>
+      <p>Live local machine health — CPU, memory, disk, network, processes, sensors. Read straight from /proc and /sys, loopback-bound, read-only.</p>
+    </div>
+
+    <div class="sys-controls">
+      <button id="sys-refresh" class="ghost" type="button">Refresh all</button>
+      <span class="faint small" id="sys-refresh-note">auto-refreshing</span>
+    </div>
+
+    <div id="sys-headline" class="grid cols-3 mb"></div>
+
+    <div class="section-title">Overview</div>
+    <div id="sys-overview" class="card"></div>
+
+    <div class="section-title">CPU</div>
+    <div id="sys-cpu"></div>
+
+    <div class="section-title">Memory</div>
+    <div id="sys-memory"></div>
+
+    <div class="section-title">Disks</div>
+    <div id="sys-disks"></div>
+
+    <div class="section-title">Network</div>
+    <div id="sys-network"></div>
+
+    <div class="section-title">Listening ports</div>
+    <p class="muted pull-up">TCP sockets in LISTEN plus open UDP. Process names resolve for sockets this user owns; others show as unattributed.</p>
+    <div id="sys-listening"></div>
+
+    <div class="section-title">Processes</div>
+    <div id="sys-processes"></div>
+
+    <div class="section-title">Sensors</div>
+    <div id="sys-sensors"></div>
+
+    <div class="section-title">Services</div>
+    <p class="muted pull-up">Your <code>systemctl --user</code> units. Read-only — Systems never starts, stops, or edits anything.</p>
+    <div id="sys-services"></div>
+  </div>
+
+  <script src="/shared/nucleus.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

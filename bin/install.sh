@@ -39,8 +39,8 @@ Exec=/usr/bin/env python3 $REPO/bin/nucleus_app.py
 Icon=nucleus
 Terminal=false
 StartupWMClass=Nucleus
-Categories=Security;Network;Development;
-Keywords=osint;pentest;security;opsec;recon;
+Categories=Security;Network;Development;Utility;System;
+Keywords=osint;pentest;security;opsec;recon;devtools;encode;hash;jwt;system;monitor;
 EOF
 echo "   • menu entry: Nucleus (native app, one click)"
 

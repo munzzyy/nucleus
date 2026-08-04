@@ -4,7 +4,7 @@
   const N = window.Nucleus;
   const url = (port) => location.protocol + "//" + location.hostname + ":" + port;
 
-  const CONSOLE_ORDER = ["recon", "redcell", "bastion"];
+  const CONSOLE_ORDER = ["recon", "redcell", "bastion", "devkit", "systems"];
 
   async function load() {
     let data;

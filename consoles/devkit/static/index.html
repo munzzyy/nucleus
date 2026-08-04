@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Devkit — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/devkit.css">
+</head>
+<body data-app="devkit" data-auto-shell data-accent="devkit">
+  <div class="wrap">
+    <div class="page-head">
+      <h1>Devkit <span class="tag">developer</span></h1>
+      <p>The everyday dev toolbelt — hashes, encoders, JWT, JSON, generators, time, cron, regex, CIDR. Everything is computed locally; nothing you type ever leaves this machine.</p>
+    </div>
+
+    <!-- Hashing -->
+    <div class="section-title">Hashing</div>
+    <div class="card">
+      <h2>Hash text</h2>
+      <div class="field">
+        <label for="dk-input">Text</label>
+        <textarea id="dk-input" rows="3" spellcheck="false" placeholder="anything — hashed locally as UTF-8"></textarea>
+      </div>
+      <div class="row">
+        <div class="field fit"><button id="dk-hash-run" type="button">Hash</button></div>
+      </div>
+      <div id="dk-hash-out" class="dk-result"></div>
+    </div>
+
+    <!-- Encode / decode -->
+    <div class="section-title">Encode / decode</div>
+    <div class="card">
+      <h2>Encode &amp; decode</h2>
+      <div class="field">
+        <label for="dk-enc-input">Text</label>
+        <textarea id="dk-enc-input" rows="3" spellcheck="false"></textarea>
+      </div>
+      <div class="row">
+        <div class="field grow">
+          <label for="dk-enc-scheme">Scheme</label>
+          <select id="dk-enc-scheme">
+            <option value="base64">base64</option>
+            <option value="base64url">base64url</option>
+            <option value="base32">base32</option>
+            <option value="hex">hex</option>
+            <option value="url">url</option>
+            <option value="html">html</option>
+            <option value="rot13">rot13</option>
+          </select>
+        </div>
+        <div class="field fit"><button id="dk-enc-encode" type="button">Encode</button></div>
+        <div class="field fit"><button id="dk-enc-decode" type="button" class="ghost">Decode</button></div>
+      </div>
+      <div id="dk-enc-out" class="dk-result"></div>
+    </div>
+
+    <!-- JWT -->
+    <div class="section-title">JWT</div>
+    <div class="card">
+      <h2>Decode a JWT</h2>
+      <div class="field">
+        <label for="dk-jwt-input">Token</label>
+        <textarea id="dk-jwt-input" rows="3" spellcheck="false" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."></textarea>
+      </div>
+      <div class="row">
+        <div class="field grow">
+          <label for="dk-jwt-secret">Secret (HS256/384/512 verify)</label>
+          <input type="text" id="dk-jwt-secret" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field fit">
+          <label class="checkline"><input type="checkbox" id="dk-jwt-verify"> <span>verify signature</span></label>
+        </div>
+        <div class="field fit"><button id="dk-jwt-run" type="button">Decode</button></div>
+      </div>
+      <p class="faint m0">Verification is HMAC-only and local — Devkit never fetches a key. An <code>alg: none</code> token is flagged, never trusted.</p>
+      <div id="dk-jwt-out" class="dk-result"></div>
+    </div>
+
+    <!-- JSON -->
+    <div class="section-title">JSON</div>
+    <div class="card">
+      <h2>Format &amp; validate</h2>
+      <div class="field">
+        <label for="dk-json-input">JSON</label>
+        <textarea id="dk-json-input" rows="5" spellcheck="false"></textarea>
+      </div>
+      <div class="row">
+        <div class="field fit"><button id="dk-json-pretty" type="button">Pretty</button></div>
+        <div class="field fit"><button id="dk-json-minify" type="button" class="ghost">Minify</button></div>
+        <div class="field fit"><button id="dk-json-validate" type="button" class="ghost">Validate</button></div>
+        <div class="field fit"><label class="checkline"><input type="checkbox" id="dk-json-sort"> <span>sort keys</span></label></div>
+      </div>
+      <div id="dk-json-out" class="dk-result"></div>
+    </div>
+
+    <!-- Generators -->
+    <div class="section-title">Generators</div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>UUID</h3>
+        <div class="row">
+          <div class="field"><label for="dk-uuid-version">Version</label>
+            <select id="dk-uuid-version"><option value="4">v4 (random)</option><option value="1">v1 (time)</option></select>
+          </div>
+          <div class="field"><label for="dk-uuid-count">Count</label><input type="number" id="dk-uuid-count" value="1" min="1" max="100"></div>
+          <div class="field fit"><button id="dk-uuid-run" type="button">Generate</button></div>
+        </div>
+        <div id="dk-uuid-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Password</h3>
+        <div class="row">
+          <div class="field"><label for="dk-pw-length">Length</label><input type="number" id="dk-pw-length" value="20" min="4" max="256"></div>
+          <div class="field"><label for="dk-pw-count">Count</label><input type="number" id="dk-pw-count" value="1" min="1" max="100"></div>
+          <div class="field fit"><button id="dk-pw-run" type="button">Generate</button></div>
+        </div>
+        <div class="dk-checks">
+          <label class="checkline"><input type="checkbox" id="dk-pw-upper" checked> <span>A-Z</span></label>
+          <label class="checkline"><input type="checkbox" id="dk-pw-lower" checked> <span>a-z</span></label>
+          <label class="checkline"><input type="checkbox" id="dk-pw-digits" checked> <span>0-9</span></label>
+          <label class="checkline"><input type="checkbox" id="dk-pw-symbols" checked> <span>!@#</span></label>
+        </div>
+        <div id="dk-pw-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Random bytes</h3>
+        <div class="row">
+          <div class="field"><label for="dk-rand-nbytes">Bytes</label><input type="number" id="dk-rand-nbytes" value="32" min="1" max="4096"></div>
+          <div class="field"><label for="dk-rand-enc">Encoding</label>
+            <select id="dk-rand-enc"><option value="hex">hex</option><option value="base64">base64</option><option value="base64url">base64url</option></select>
+          </div>
+          <div class="field fit"><button id="dk-rand-run" type="button">Generate</button></div>
+        </div>
+        <div id="dk-rand-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Secret key (URL-safe)</h3>
+        <div class="row">
+          <div class="field"><label for="dk-secret-nbytes">Bytes</label><input type="number" id="dk-secret-nbytes" value="32" min="1" max="4096"></div>
+          <div class="field fit"><button id="dk-secret-run" type="button">Generate</button></div>
+        </div>
+        <div id="dk-secret-out" class="dk-result"></div>
+      </div>
+    </div>
+
+    <!-- Time -->
+    <div class="section-title">Time</div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Now</h3>
+        <div class="row"><div class="field fit"><button id="dk-now-run" type="button">Get current time</button></div></div>
+        <div id="dk-now-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Unix &harr; ISO</h3>
+        <div class="row">
+          <div class="field grow"><label for="dk-u2i">Unix timestamp</label><input type="text" id="dk-u2i" placeholder="1735689600" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-u2i-run" type="button">To ISO</button></div>
+        </div>
+        <div class="row">
+          <div class="field grow"><label for="dk-i2u">ISO 8601</label><input type="text" id="dk-i2u" placeholder="2026-01-01T00:00:00Z" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-i2u-run" type="button">To Unix</button></div>
+        </div>
+        <div id="dk-time-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Timezone convert</h3>
+        <div class="field"><label for="dk-tz-iso">Datetime (ISO)</label><input type="text" id="dk-tz-iso" placeholder="2026-01-01T12:00:00" spellcheck="false"></div>
+        <div class="row">
+          <div class="field grow"><label for="dk-tz-from">From (IANA)</label><input type="text" id="dk-tz-from" value="UTC" spellcheck="false"></div>
+          <div class="field grow"><label for="dk-tz-to">To (IANA)</label><input type="text" id="dk-tz-to" placeholder="America/New_York" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-tz-run" type="button">Convert</button></div>
+        </div>
+        <div id="dk-tz-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Humanize duration</h3>
+        <div class="row">
+          <div class="field grow"><label for="dk-dur">Seconds</label><input type="text" id="dk-dur" placeholder="93784" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-dur-run" type="button">Humanize</button></div>
+        </div>
+        <div id="dk-dur-out" class="dk-result"></div>
+      </div>
+    </div>
+
+    <!-- Cron -->
+    <div class="section-title">Cron</div>
+    <div class="card">
+      <h2>Next fire times</h2>
+      <div class="row">
+        <div class="field grow"><label for="dk-cron-expr">Expression (min hour dom mon dow)</label><input type="text" id="dk-cron-expr" placeholder="*/15 * * * *" spellcheck="false"></div>
+        <div class="field"><label for="dk-cron-count">Count</label><input type="number" id="dk-cron-count" value="5" min="1" max="20"></div>
+        <div class="field fit"><button id="dk-cron-run" type="button">Compute</button></div>
+      </div>
+      <div id="dk-cron-out" class="dk-result"></div>
+    </div>
+
+    <!-- Numbers & color -->
+    <div class="section-title">Numbers &amp; color</div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Base convert</h3>
+        <div class="row">
+          <div class="field grow"><label for="dk-base-value">Value</label><input type="text" id="dk-base-value" placeholder="ff" spellcheck="false"></div>
+          <div class="field"><label for="dk-base-from">From</label><input type="number" id="dk-base-from" value="16" min="2" max="36"></div>
+          <div class="field"><label for="dk-base-to">To</label><input type="number" id="dk-base-to" value="2" min="2" max="36"></div>
+          <div class="field fit"><button id="dk-base-run" type="button">Convert</button></div>
+        </div>
+        <div id="dk-base-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Color</h3>
+        <div class="row">
+          <div class="field grow"><label for="dk-color-value">Color</label><input type="text" id="dk-color-value" placeholder="#ff8800 / rgb(255,136,0) / hsl(32,100%,50%)" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-color-run" type="button">Convert</button></div>
+        </div>
+        <div id="dk-color-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Byte sizes</h3>
+        <div class="row">
+          <div class="field grow"><label for="dk-bytes-n">Bytes &rarr; human</label><input type="text" id="dk-bytes-n" placeholder="1610612736" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-bytes-h-run" type="button">Humanize</button></div>
+        </div>
+        <div class="row">
+          <div class="field grow"><label for="dk-bytes-text">Human &rarr; bytes</label><input type="text" id="dk-bytes-text" placeholder="1.5 GiB" spellcheck="false"></div>
+          <div class="field fit"><button id="dk-bytes-p-run" type="button">Parse</button></div>
+        </div>
+        <div id="dk-bytes-out" class="dk-result"></div>
+      </div>
+    </div>
+
+    <!-- Text -->
+    <div class="section-title">Text</div>
+    <div class="card">
+      <h2>Transform text</h2>
+      <div class="field"><label for="dk-text-input">Text</label><textarea id="dk-text-input" rows="4" spellcheck="false"></textarea></div>
+      <div class="row">
+        <div class="field grow">
+          <label for="dk-text-op">Operation</label>
+          <select id="dk-text-op">
+            <option value="upper">UPPERCASE</option>
+            <option value="lower">lowercase</option>
+            <option value="title">Title Case</option>
+            <option value="camel">camelCase</option>
+            <option value="snake">snake_case</option>
+            <option value="kebab">kebab-case</option>
+            <option value="slugify">slugify</option>
+            <option value="sort">sort lines</option>
+            <option value="dedup">dedup lines (keep order)</option>
+            <option value="reverse_lines">reverse lines</option>
+            <option value="trim">trim each line</option>
+            <option value="count">count</option>
+          </select>
+        </div>
+        <div class="field fit"><button id="dk-text-run" type="button">Run</button></div>
+      </div>
+      <div class="dk-checks">
+        <label class="checkline"><input type="checkbox" id="dk-text-reverse"> <span>reverse</span></label>
+        <label class="checkline"><input type="checkbox" id="dk-text-unique"> <span>unique</span></label>
+        <label class="checkline"><input type="checkbox" id="dk-text-numeric"> <span>numeric</span></label>
+        <label class="checkline"><input type="checkbox" id="dk-text-casefold"> <span>casefold</span></label>
+        <span class="faint small">sort options</span>
+      </div>
+      <div id="dk-text-out" class="dk-result"></div>
+    </div>
+
+    <div class="card">
+      <h3>Diff two texts</h3>
+      <div class="grid cols-2">
+        <div class="field"><label for="dk-diff-a">A</label><textarea id="dk-diff-a" rows="5" spellcheck="false"></textarea></div>
+        <div class="field"><label for="dk-diff-b">B</label><textarea id="dk-diff-b" rows="5" spellcheck="false"></textarea></div>
+      </div>
+      <div class="row">
+        <div class="field grow"><label for="dk-diff-mode">Mode</label>
+          <select id="dk-diff-mode"><option value="unified">unified</option><option value="ndiff">ndiff</option></select>
+        </div>
+        <div class="field fit"><button id="dk-diff-run" type="button">Diff</button></div>
+      </div>
+      <div id="dk-diff-out" class="dk-result"></div>
+    </div>
+
+    <!-- Regex -->
+    <div class="section-title">Regex</div>
+    <div class="card">
+      <h2>Test a pattern</h2>
+      <p class="faint pull-up m0">Evaluated in a sandboxed subprocess with a 3-second timeout — a catastrophic pattern can't hang the app.</p>
+      <div class="row">
+        <div class="field grow"><label for="dk-regex-pattern">Pattern</label><input type="text" id="dk-regex-pattern" placeholder="(\d+)-(\w+)" spellcheck="false"></div>
+        <div class="field"><label for="dk-regex-flags">Flags</label><input type="text" id="dk-regex-flags" placeholder="imsxa" spellcheck="false"></div>
+        <div class="field fit"><button id="dk-regex-run" type="button">Test</button></div>
+      </div>
+      <div class="field"><label for="dk-regex-text">Test string</label><textarea id="dk-regex-text" rows="4" spellcheck="false"></textarea></div>
+      <div id="dk-regex-out" class="dk-result"></div>
+    </div>
+
+    <!-- Network (CIDR) -->
+    <div class="section-title">Network (CIDR)</div>
+    <div class="card">
+      <h2>CIDR calculator</h2>
+      <div class="row">
+        <div class="field grow"><label for="dk-cidr-value">CIDR</label><input type="text" id="dk-cidr-value" placeholder="192.168.1.0/24" spellcheck="false"></div>
+        <div class="field grow"><label for="dk-cidr-ip">Contains IP (optional)</label><input type="text" id="dk-cidr-ip" placeholder="192.168.1.42" spellcheck="false"></div>
+        <div class="field fit"><button id="dk-cidr-run" type="button">Compute</button></div>
+      </div>
+      <div id="dk-cidr-out" class="dk-result"></div>
+    </div>
+  </div>
+
+  <script src="/shared/nucleus.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

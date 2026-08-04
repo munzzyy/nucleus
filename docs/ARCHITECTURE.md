@@ -6,7 +6,7 @@ You had three piles of security work that never talked to each other: the OSINT 
 
 The design constraint was to match how the rest of your stack already works: a small stdlib-only Python server bound to loopback, serving a hardened local web UI, with zero dependencies to audit. Same shape as coleos-hub and the old osint-console. That keeps the security surface tiny and means there's nothing to `pip install` and vet.
 
-"One app, but it can be three" is solved by making one shared server core and three thin consoles on top of it. Run them together on one box and the launcher + switcher make it feel like a single app. Copy the repo to two more machines and run one console on each; they still cross-link over loopback.
+"One app, but it can be many" is solved by making one shared server core and thin consoles on top of it. It started as three security consoles; it's now five — the same two toolbelt consoles most machines want (a developer kit and a live system monitor) ride the exact same core. Run them together on one box and the launcher + switcher make it feel like a single app. Copy the repo to more machines and run one console on each; they still cross-link over loopback.
 
 ## Pieces
 
@@ -16,11 +16,9 @@ The design constraint was to match how the rest of your stack already works: a s
                        │  strict CSP, same-origin only │
                        └──────────────┬──────────────┘
                                       │ each tab talks ONLY to its own origin
-        ┌───────────────┬────────────┼─────────────┬───────────────┐
-        │               │            │             │               │
-   hub :8890       recon :8900   redcell :8910  bastion :8920   coleos-hub :4747
-        │               │            │             │               (external)
-        └──── all import shared/common.py ─────────┘
+   hub :8890   recon :8900   redcell :8910   bastion :8920   devkit :8930   systems :8940   coleos-hub :4747
+        │           │             │               │              │              │            (external)
+        └──────────── all import shared/common.py ──────────────────────────────┘
                         (one server core, one set of guards)
 ```
 
@@ -76,6 +74,30 @@ Four things Redcell does itself, so they work on a box with nothing installed. N
 ## Bastion (defensive)
 
 Read-only. Posture checks inspect this machine (sysctls, auditd, Quad9 DoT via `resolvectl`, Tor, WireGuard, MAC randomization, firewall, `arch-audit` CVEs) and report ok/warn/bad/unknown with the exact fix command — Bastion never runs sudo or changes anything. The **report engine** (`engine/osint_report.py`) takes a domain and produces a graded passive assessment (DNS, SPF/DMARC, TLS + security headers, crt.sh attack surface, InternetDB ports/CVEs) rendered to Markdown/HTML. It's importable and has a CLI, so the old income-machine skills that shell out to a `report.py` can point at it again.
+
+## Devkit (developer toolbelt)
+
+Does no I/O of any kind — no network, no filesystem — which is the whole point: whatever you paste in stays in the process. It follows the same shape as the security consoles but inverts one thing: instead of read-only GETs, every tool is a `POST /api/devkit/<tool>` that takes JSON and returns JSON, so nothing you're encoding or hashing ends up in a URL or a log.
+
+All the real work lives in `consoles/devkit/tools.py` as small pure functions — `hash_text`, `encode`/`decode`, `jwt_decode`, `json_tool`, the `gen_*` generators, `time_convert`, `cron_next`, `base_convert`, `color_convert`, `humanize_bytes`/`parse_bytes`, `text_tools`, `text_diff`, `regex_test`, `cidr_info`/`cidr_contains`. Keeping them pure means each one is unit-testable by import with no server, and `app.py` handlers stay thin: parse the body, validate it's present, call the function, wrap the result in `Response.json` or a clean `Response.error(400, …)`. A tool never raises to the client.
+
+Routes: `POST /api/devkit/{hash, encode, decode, jwt, json, gen, time, cron, base, color, bytes, text, diff, regex, cidr}`, plus a `GET /api/devkit/manifest` so the UI can render its sections without hardcoding them.
+
+The one subprocess in the whole console is the regex tester. A user pattern can catastrophically backtrack, and re has no timeout, so `regex_test` runs the match in a short-lived `sys.executable -c <worker>` through `run_tool` with a hard timeout — our own Python, an argv list, no shell, trusted-shape JSON on stdin. A pathological pattern times out cleanly instead of pinning a server thread forever.
+
+## Systems (live machine health)
+
+Read-only and local-only, in the same spirit as Bastion's posture checks. Collectors live in `consoles/systems/sysinfo.py`; each reads `/proc`, `/sys`, or stdlib (`os`, `platform`, `shutil`, `socket`) and returns a JSON-able dict, wrapping file reads in try/except so a missing path degrades to partial data or `{available: false, reason}` instead of raising. The only subprocess calls are a short allow-list of read-only commands (`ip -o -j addr show`, `systemctl --user list-units …`) run through `run_tool` with an argv list and guarded by `which()` — missing tools fail soft to "n/a", never faked data. No writes, no killing processes, no config changes, nothing off the box.
+
+Collectors: `overview`, `cpu` (per-core + overall by sampling `/proc/stat` twice), `memory`, `disks`, `network`, `listening` (parses `/proc/net/{tcp,tcp6,udp,udp6}` and best-effort maps inode→pid→name), `processes` (top by CPU and by memory, sampled), `sensors` (thermal/hwmon temps + battery), and `services`.
+
+Routes are all GET — reads are safe cross-origin, so no POST or Origin check is needed: `GET /api/systems/{overview, cpu, memory, disks, network, listening, processes, sensors, services}`, plus a combined `GET /api/systems/all` for first paint.
+
+## Shared frontend and the command palette
+
+Every console's UI is a plain IIFE over `window.Nucleus` (`N.el`/`N.get`/`N.post`/`N.esc`/`N.toast`/`N.safeUrl`), styled by the shared design system in `shared/static/`, under the same strict CSP — no inline JS or CSS, DOM built with `N.el`/`textContent` so any echoed value (a JWT payload, a regex input, a process name) renders as inert text, never `innerHTML`.
+
+`shared/static/nucleus.js` also holds the cross-console furniture: the switcher (with live sibling health dots), the keyboard shortcuts (`g` + a letter to jump, `/` to focus a console's main input, `1`–`6` for the six pages), and the **command palette**. Ctrl-K / Cmd-K opens a fuzzy launcher whose entries are computed at open time from two sources: one "Go to <console>" per sibling, and one entry per `.section-title` and card heading on the current page (scroll-into-view). Because it discovers sections from the DOM, it works on every console with zero per-console registration — a new tool that adds a heading is reachable from the palette for free. It's exposed as `N.openCommandPalette()` / `N.closeCommandPalette()`.
 
 ## Extending it
 
