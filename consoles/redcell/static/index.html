@@ -117,7 +117,7 @@
       <button id="run-btn" type="button" disabled>Run</button>
       <span id="run-status" class="sub ml-10"></span>
       <pre class="term mt hidden" id="run-output"></pre>
-      <button class="ghost mt hidden" id="run-copy" type="button">Copy output</button>
+      <div class="hidden" id="run-actions"></div>
     </div>
   </div>
 
@@ -476,7 +476,7 @@
       <div class="mt hidden" id="pw-build-result-wrap">
         <label>Command (run this yourself in a terminal)</label>
         <pre class="term" id="pw-build-result"></pre>
-        <button class="ghost mt" type="button" id="pw-build-copy">Copy to clipboard</button>
+        <div id="pw-build-actions"></div>
       </div>
 
       <hr>
@@ -546,7 +546,7 @@
       <div class="mt hidden" id="build-result-wrap">
         <label>Command (run this yourself in a terminal)</label>
         <pre class="term" id="build-result"></pre>
-        <button class="ghost mt" id="build-copy" type="button">Copy to clipboard</button>
+        <div id="build-actions"></div>
       </div>
     </div>
   </div>
@@ -572,7 +572,7 @@
         <thead><tr><th>Time</th><th>Tool</th><th>Target</th><th>Authorized</th><th>Lab</th><th>Exit</th><th>Duration</th></tr></thead>
         <tbody></tbody>
       </table>
-      <p class="sub" id="hist-empty">No runs logged yet.</p>
+      <div class="mt hidden" id="hist-empty"></div>
     </div>
 
     <div id="outputs-wrap" class="hidden">
@@ -582,7 +582,7 @@
           <button class="ghost" id="outputs-refresh" type="button">Refresh</button>
         </div>
         <div id="outputs-list"></div>
-        <p class="sub hidden" id="outputs-empty">No saved outputs yet.</p>
+        <div class="mt hidden" id="outputs-empty"></div>
         <pre class="term mt hidden" id="outputs-view"></pre>
       </div>
     </div>
@@ -626,7 +626,7 @@
       <p class="sub" id="x-preview"></p>
       <span id="x-status" class="sub"></span>
       <pre class="term mt hidden" id="x-output"></pre>
-      <button class="ghost mt hidden" id="x-copy" type="button">Copy output</button>
+      <div class="hidden" id="x-actions"></div>
     </div>
   </div>
 

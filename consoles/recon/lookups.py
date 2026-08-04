@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from shared import apikeys, common
 
@@ -1259,6 +1259,115 @@ def _guess_country(digits_with_plus: str) -> str | None:
     return None
 
 
+# NANP (country code +1) geographic area codes -> US state / region. Pure
+# static table -- no network, no key -- so a US number resolves to a rough
+# location keylessly. Non-geographic codes (800/888/900/etc) and Canadian
+# codes aren't in here, so they fall through to None rather than a wrong US
+# state. Source: NANPA area-code assignments.
+_NANP_AREA_CODES = {
+    "201": "New Jersey", "202": "District of Columbia", "203": "Connecticut",
+    "205": "Alabama", "206": "Washington", "207": "Maine", "208": "Idaho",
+    "209": "California", "210": "Texas", "212": "New York", "213": "California",
+    "214": "Texas", "215": "Pennsylvania", "216": "Ohio", "217": "Illinois",
+    "218": "Minnesota", "219": "Indiana", "220": "Ohio", "223": "Pennsylvania",
+    "224": "Illinois", "225": "Louisiana", "228": "Mississippi", "229": "Georgia",
+    "231": "Michigan", "234": "Ohio", "239": "Florida", "240": "Maryland",
+    "248": "Michigan", "251": "Alabama", "252": "North Carolina", "253": "Washington",
+    "254": "Texas", "256": "Alabama", "260": "Indiana", "262": "Wisconsin",
+    "267": "Pennsylvania", "269": "Michigan", "270": "Kentucky", "272": "Pennsylvania",
+    "276": "Virginia", "281": "Texas", "301": "Maryland", "302": "Delaware",
+    "303": "Colorado", "304": "West Virginia", "305": "Florida", "307": "Wyoming",
+    "308": "Nebraska", "309": "Illinois", "310": "California", "312": "Illinois",
+    "313": "Michigan", "314": "Missouri", "315": "New York", "316": "Kansas",
+    "317": "Indiana", "318": "Louisiana", "319": "Iowa", "320": "Minnesota",
+    "321": "Florida", "323": "California", "325": "Texas", "330": "Ohio",
+    "331": "Illinois", "334": "Alabama", "336": "North Carolina", "337": "Louisiana",
+    "339": "Massachusetts", "346": "Texas", "347": "New York", "351": "Massachusetts",
+    "352": "Florida", "360": "Washington", "361": "Texas", "364": "Kentucky",
+    "380": "Ohio", "385": "Utah", "386": "Florida", "401": "Rhode Island",
+    "402": "Nebraska", "404": "Georgia", "405": "Oklahoma", "406": "Montana",
+    "407": "Florida", "408": "California", "409": "Texas", "410": "Maryland",
+    "412": "Pennsylvania", "413": "Massachusetts", "414": "Wisconsin",
+    "415": "California", "417": "Missouri", "419": "Ohio", "423": "Tennessee",
+    "424": "California", "425": "Washington", "430": "Texas", "432": "Texas",
+    "434": "Virginia", "435": "Utah", "440": "Ohio", "442": "California",
+    "443": "Maryland", "458": "Oregon", "463": "Indiana", "469": "Texas",
+    "470": "Georgia", "475": "Connecticut", "478": "Georgia", "479": "Arkansas",
+    "480": "Arizona", "484": "Pennsylvania", "501": "Arkansas", "502": "Kentucky",
+    "503": "Oregon", "504": "Louisiana", "505": "New Mexico", "507": "Minnesota",
+    "508": "Massachusetts", "509": "Washington", "510": "California", "512": "Texas",
+    "513": "Ohio", "515": "Iowa", "516": "New York", "517": "Michigan",
+    "518": "New York", "520": "Arizona", "530": "California", "531": "Nebraska",
+    "534": "Wisconsin", "539": "Oklahoma", "540": "Virginia", "541": "Oregon",
+    "551": "New Jersey", "559": "California", "561": "Florida", "562": "California",
+    "563": "Iowa", "567": "Ohio", "570": "Pennsylvania", "571": "Virginia",
+    "573": "Missouri", "574": "Indiana", "575": "New Mexico", "580": "Oklahoma",
+    "585": "New York", "586": "Michigan", "601": "Mississippi", "602": "Arizona",
+    "603": "New Hampshire", "605": "South Dakota", "606": "Kentucky", "607": "New York",
+    "608": "Wisconsin", "609": "New Jersey", "610": "Pennsylvania", "612": "Minnesota",
+    "614": "Ohio", "615": "Tennessee", "616": "Michigan", "617": "Massachusetts",
+    "618": "Illinois", "619": "California", "620": "Kansas", "623": "Arizona",
+    "626": "California", "628": "California", "629": "Tennessee", "630": "Illinois",
+    "631": "New York", "636": "Missouri", "641": "Iowa", "646": "New York",
+    "650": "California", "651": "Minnesota", "657": "California", "660": "Missouri",
+    "661": "California", "662": "Mississippi", "667": "Maryland", "669": "California",
+    "678": "Georgia", "681": "West Virginia", "682": "Texas", "701": "North Dakota",
+    "702": "Nevada", "703": "Virginia", "704": "North Carolina", "706": "Georgia",
+    "707": "California", "708": "Illinois", "712": "Iowa", "713": "Texas",
+    "714": "California", "715": "Wisconsin", "716": "New York", "717": "Pennsylvania",
+    "718": "New York", "719": "Colorado", "720": "Colorado", "724": "Pennsylvania",
+    "725": "Nevada", "727": "Florida", "731": "Tennessee", "732": "New Jersey",
+    "734": "Michigan", "737": "Texas", "740": "Ohio", "743": "North Carolina",
+    "747": "California", "754": "Florida", "757": "Virginia", "760": "California",
+    "762": "Georgia", "763": "Minnesota", "765": "Indiana", "769": "Mississippi",
+    "770": "Georgia", "772": "Florida", "773": "Illinois", "774": "Massachusetts",
+    "775": "Nevada", "779": "Illinois", "781": "Massachusetts", "785": "Kansas",
+    "786": "Florida", "801": "Utah", "802": "Vermont", "803": "South Carolina",
+    "804": "Virginia", "805": "California", "806": "Texas", "808": "Hawaii",
+    "810": "Michigan", "812": "Indiana", "813": "Florida", "814": "Pennsylvania",
+    "815": "Illinois", "816": "Missouri", "817": "Texas", "818": "California",
+    "828": "North Carolina", "830": "Texas", "831": "California", "832": "Texas",
+    "843": "South Carolina", "845": "New York", "847": "Illinois", "848": "New Jersey",
+    "850": "Florida", "854": "South Carolina", "856": "New Jersey", "857": "Massachusetts",
+    "858": "California", "859": "Kentucky", "860": "Connecticut", "862": "New Jersey",
+    "863": "Florida", "864": "South Carolina", "865": "Tennessee", "870": "Arkansas",
+    "872": "Illinois", "878": "Pennsylvania", "901": "Tennessee", "903": "Texas",
+    "904": "Florida", "906": "Michigan", "907": "Alaska", "908": "New Jersey",
+    "909": "California", "910": "North Carolina", "912": "Georgia", "913": "Kansas",
+    "914": "New York", "915": "Texas", "916": "California", "917": "New York",
+    "918": "Oklahoma", "919": "North Carolina", "920": "Wisconsin", "925": "California",
+    "928": "Arizona", "929": "New York", "930": "Indiana", "931": "Tennessee",
+    "934": "New York", "936": "Texas", "937": "Ohio", "938": "Alabama",
+    "940": "Texas", "941": "Florida", "947": "Michigan", "949": "California",
+    "951": "California", "952": "Minnesota", "954": "Florida", "956": "Texas",
+    "959": "Connecticut", "970": "Colorado", "971": "Oregon", "972": "Texas",
+    "973": "New Jersey", "978": "Massachusetts", "979": "Texas", "980": "North Carolina",
+    "984": "North Carolina", "985": "Louisiana", "989": "Michigan",
+}
+
+
+def nanp_region(area_code: str | None) -> str | None:
+    """US state/region for a 3-digit NANP area code, or None if it's not a
+    known US geographic code. Pure table lookup -- no network, no key."""
+    if not area_code:
+        return None
+    return _NANP_AREA_CODES.get(str(area_code).strip())
+
+
+def _nanp_area_code(digits: str) -> str | None:
+    """Pull the 3-digit area code out of a normalized phone string, only for
+    NANP (+1 / 11-digit-leading-1 / bare-10-digit) numbers. Anything else
+    returns None so a non-US number never gets a bogus US state."""
+    only = re.sub(r"\D", "", digits or "")
+    if (digits or "").strip().startswith("+"):
+        return only[1:4] if only.startswith("1") and len(only) == 11 else None
+    if len(only) == 11 and only.startswith("1"):
+        return only[1:4]
+    if len(only) == 10:
+        return only[:3]
+    return None
+
+
 def _ipqs_phone_lookup(digits: str, key: str) -> dict:
     phone = digits.lstrip("+")
     status, body, _, err = _safe_fetch(
@@ -1278,10 +1387,15 @@ def _ipqs_phone_lookup(digits: str, key: str) -> dict:
 
 def phone_scan(number: str) -> dict:
     digits = re.sub(r"[^\d+]", "", number)
+    area_code = _nanp_area_code(digits)
     result: dict = {
         "input": number, "normalized": digits,
         "country_guess": _guess_country(digits),
         "digit_count": len(re.sub(r"\D", "", digits)),
+        # Keyless NANP area-code -> US region (pure table); None for non-US
+        # or non-geographic codes, so a live carrier lookup still adds value.
+        "area_code": area_code,
+        "us_region": nanp_region(area_code),
     }
 
     api_key = apikeys.get_key("NUMLOOKUP_API_KEY")
@@ -1352,6 +1466,42 @@ def _vt_hash_lookup(h: str, key: str) -> dict:
     return {"ok": False, "error": _keyed_note(status, err)}
 
 
+def _malwarebazaar_lookup(h: str) -> dict:
+    """abuse.ch MalwareBazaar get_info -- keyless, a second known-sample oracle
+    alongside CIRCL. POSTs the query through the same SSRF-guarded fetch every
+    other call here uses. Degrades to an error field, never raises. When the
+    hash is a known sample it returns the malware signature / file type / tags;
+    a 'hash_not_found' is a clean 'not malware on file', not an error. (abuse.ch
+    has been tightening this endpoint toward auth-required; if a key ever
+    becomes mandatory the request just degrades to an error note here.)"""
+    body = urlencode({"query": "get_info", "hash": h}).encode("utf-8")
+    status, resp, _, err = _safe_fetch(
+        "https://mb-api.abuse.ch/api/v1/", timeout=FETCH_TIMEOUT, max_bytes=300_000,
+        data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if status == 200:
+        data = _json_or_none(resp) or {}
+        qs = data.get("query_status")
+        if qs == "ok":
+            first = (data.get("data") or [{}])[0] or {}
+            return {
+                "ok": True, "known": True,
+                "signature": first.get("signature"),
+                "file_type": first.get("file_type"),
+                "file_name": first.get("file_name"),
+                "first_seen": first.get("first_seen"),
+                "delivery_method": first.get("delivery_method"),
+                "tags": first.get("tags") or [],
+                "error": None,
+            }
+        if qs == "hash_not_found":
+            return {"ok": True, "known": False, "error": None,
+                    "note": "not a known sample in MalwareBazaar"}
+        # illegal_hash / no_hash_provided / http_post_expected / auth errors --
+        # surface the provider's own status rather than guessing.
+        return {"ok": False, "known": None, "error": qs or "unexpected response"}
+    return {"ok": False, "known": None, "error": err or f"HTTP {status}"}
+
+
 def hash_scan(h: str) -> dict:
     h = h.strip().lower()
     algo = _HASH_ALGO_BY_LEN.get(len(h))
@@ -1377,6 +1527,12 @@ def hash_scan(h: str) -> dict:
                    "note": "not present in CIRCL hashlookup (NSRL known-file + malware corpora)"}
     else:
         result = {"input": h, "algo": algo, "known": None, "error": err or f"HTTP {status}"}
+
+    # MalwareBazaar -- keyless, top-level like CIRCL above (not gated behind a
+    # key). CIRCL leans on the NSRL known-GOOD corpus; MalwareBazaar is a
+    # known-BAD malware corpus, so the two answer different questions and are
+    # worth running side by side.
+    result["malwarebazaar"] = _malwarebazaar_lookup(h)
 
     keyed: dict = {}
     unlock: list[str] = []

@@ -52,15 +52,13 @@
     </form>
   </div>
 
-  <div id="status-line" class="mt faint hidden"></div>
+  <div id="status-line" class="mt faint hidden" aria-live="polite"></div>
 
-  <div id="pivot-trail" class="pivot-trail mt hidden"></div>
+  <div id="pivot-trail" class="pivot-trail mt hidden" aria-label="Scan trail"></div>
 
-  <div id="results-toolbar" class="toolbar-row mt hidden">
-    <button class="ghost" id="res-copy-json" type="button">Copy JSON</button>
-    <button class="ghost" id="res-copy-md" type="button">Copy Markdown</button>
-    <button class="ghost" id="res-download" type="button">Download .json</button>
-  </div>
+  <!-- Populated by N.resultBar once a scan completes (Copy Markdown / Copy JSON
+       / Download .md / Download .json). -->
+  <div id="results-toolbar" class="mt hidden"></div>
 
   <div id="results" class="mt"></div>
 
@@ -87,6 +85,7 @@
 
   <div id="recon-history-wrap" class="hidden">
     <div class="section-title">Scan history</div>
+    <p class="sub" id="recon-history-note"></p>
     <div id="recon-history" class="grid cols-3 mt"></div>
   </div>
 

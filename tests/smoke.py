@@ -86,7 +86,7 @@ def field(j, key):
         return None
     if key in j:
         return j[key]
-    for wrap in ("result", "results", "data", "overview", "memory"):
+    for wrap in ("result", "results", "data", "overview", "memory", "hashes"):
         w = j.get(wrap)
         if isinstance(w, dict) and key in w:
             return w[key]
@@ -353,6 +353,30 @@ def main():
         st, j = jget(port, "/api/devkit/cidr", method="POST", body={"cidr": "192.168.1.0/24"})
         check("devkit cidr /24 -> 254 usable hosts",
               st == 200 and field(j, "num_usable_hosts") == 254, str(j)[:120])
+        # ---- new: HMAC (text + key + algo -> hex) ----
+        st, j = jget(port, "/api/devkit/hmac", method="POST",
+                     body={"text": "data", "key": "secret", "algo": "sha256"})
+        import hmac as _hmac, hashlib as _hl
+        want_hmac = _hmac.new(b"secret", b"data", _hl.sha256).hexdigest()
+        blob = json.dumps(j) if isinstance(j, dict) else ""
+        check("devkit hmac sha256 known vector", st == 200 and want_hmac in blob, str(j)[:120])
+
+        # ---- new: hash a file via raw-body upload (in memory, no disk) ----
+        want_sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        hfreq = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/devkit/hashfile", method="POST", data=b"abc",
+            headers={"Host": f"127.0.0.1:{port}",
+                     "Origin": f"http://127.0.0.1:{port}",
+                     "Content-Type": "application/octet-stream",
+                     "X-Filename": urllib.parse.quote("abc.txt")})
+        try:
+            with urllib.request.urlopen(hfreq, timeout=20) as r:
+                hst, hj = r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            hst, hj = e.code, {}
+        check("devkit hashfile sha256(abc) in memory",
+              hst == 200 and field(hj, "sha256") == want_sha, str(hj)[:120])
+
         # a mutating POST route still enforces the CSRF Origin check
         noorigin = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/devkit/cidr", method="POST",
@@ -379,6 +403,22 @@ def main():
               st == 200 and isinstance(tot, (int, float)) and tot > 0, str(j)[:120])
         st, j = jget(port, "/api/systems/disks")
         check("systems disks reachable", st == 200, str(j)[:120])
+
+    # ---- hub (control panel overview v2: honest per-source status keys) ----
+    if "hub" in servers:
+        print("\nHub:")
+        port = servers["hub"][1]
+        st, j = jget(port, "/api/overview")
+        srcs = j.get("sources") if isinstance(j, dict) else None
+        check("hub overview 200 with sources map", st == 200 and isinstance(srcs, dict), str(j)[:160])
+        if isinstance(srcs, dict):
+            # every source reports an honest status (ok/down/timeout/error), so
+            # the client can show "offline" vs "starting…" instead of a bare "—"
+            valid = {"ok", "down", "timeout", "error"}
+            for name in ("tools", "posture", "devkit", "systems"):
+                s = srcs.get(name, {})
+                check(f"hub overview {name} has a status",
+                      isinstance(s, dict) and s.get("status") in valid, str(s)[:120])
 
     for srv, _ in servers.values():
         try:

@@ -144,15 +144,17 @@ _DISCLOSURE_HEADERS = {
 
 
 def _analyze_cookies(set_cookie: Optional[str]) -> tuple[list, list]:
-    """Return (cookies, findings). `common.fetch` collapses duplicate
-    Set-Cookie into one comma-joined value; split on the boundary between one
-    cookie's attributes and the next cookie's name=value (a comma directly
-    before `token=`), tolerating the Expires=...GMT comma inside a cookie."""
+    """Return (cookies, findings). `common.fetch` newline-joins repeated
+    Set-Cookie headers (see the contract in common._collect_headers), so split
+    on that newline first to analyze every cookie, then keep the legacy
+    comma-before-`name=` split per line for any single comma-joined value
+    (tolerating the Expires=...GMT comma inside a cookie)."""
     if not set_cookie:
         return [], []
-    # Split only on ", " that precedes a `name=` (start of a new cookie),
-    # never the comma inside `Expires=Wed, 09 Jun 2021 ...`.
-    parts = re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)", set_cookie)
+    # Newline is the Set-Cookie separator now; the per-line comma split only ever
+    # fires on a ", " that precedes a new `name=`, never inside `Expires=Wed, 09 ...`.
+    parts = [c for line in set_cookie.split("\n")
+             for c in re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)", line)]
     cookies, findings = [], []
     for part in parts:
         segs = [s.strip() for s in part.split(";")]

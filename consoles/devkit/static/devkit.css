@@ -71,6 +71,23 @@
 .dk-match-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .dk-match-head .dk-code { flex: 0 1 auto; white-space: pre-wrap; word-break: break-word; }
 
+/* file-hash drop zone */
+.dk-drop {
+  margin-top: 12px; border: 1px dashed var(--line-2); border-radius: 10px;
+  padding: 22px 16px; text-align: center; cursor: pointer; color: var(--txt-dim);
+  font-size: 13px; transition: border-color .15s, background .15s, color .15s;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+}
+.dk-drop:hover, .dk-drop:focus-visible { border-color: var(--accent); color: var(--txt); outline: none; }
+.dk-drop.drag {
+  border-color: var(--accent); color: var(--txt);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.dk-drop-label { pointer-events: none; }
+
+/* rows toggled off by JS (uuid namespace/name, shown only for v3/v5) */
+.dk-hide { display: none; }
+
 @media (max-width: 560px) {
   .dk-kv-key { flex-basis: 96px; }
 }

@@ -16,13 +16,21 @@ into a 500 rather than dropping the connection.
 """
 
 import functools
+import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared import common
 from consoles.devkit import tools
+
+# The file-hash route reads the whole upload into memory to hash it, so it needs
+# a larger body cap than the global 256 KiB — but a bounded one (default 64 MiB,
+# overridable). Applied per-route via App.body_limits so every other POST keeps
+# the tight default. The bytes are hashed and dropped; nothing is written.
+HASHFILE_MAX = int(os.environ.get("NUCLEUS_DEVKIT_HASHFILE_MAX_MB") or 64) * 1024 * 1024
 
 
 # The tool groups the UI renders, in page order. Exposed via /api/devkit/manifest
@@ -82,6 +90,27 @@ def _flag(v, default: bool = True) -> bool:
     return bool(v)
 
 
+def _header(req: common.Request, name: str) -> str:
+    """Case-insensitive header lookup — req.headers is whatever casing the
+    client sent, but header names are case-insensitive on the wire (mirrors
+    bastion/scrub's upload handling)."""
+    want = name.lower()
+    for k, v in req.headers.items():
+        if k.lower() == want:
+            return v
+    return ""
+
+
+def _clean_filename(name: str) -> str:
+    """The uploaded name is only echoed back in JSON and shown via textContent —
+    it is NEVER used as a filesystem path (nothing in this handler touches disk).
+    Still, strip control characters, keep the basename only, and cap the length
+    so a hostile X-Filename can't smuggle newlines or bloat the response."""
+    name = "".join(ch for ch in str(name) if ch >= " " and ch != "\x7f")
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return name[:255]
+
+
 # --------------------------------------------------------------------------
 # handlers
 # --------------------------------------------------------------------------
@@ -91,6 +120,48 @@ def h_hash(req: common.Request) -> common.Response:
         return common.Response.error(400, "missing text")
     try:
         result = tools.hash_text(str(j["text"]), algos=j.get("algos"), algo=j.get("algo"))
+    except (ValueError, TypeError) as e:
+        return common.Response.error(400, str(e))
+    return _ok(result)
+
+
+def h_hashfile(req: common.Request) -> common.Response:
+    """Hash an uploaded file's bytes IN MEMORY — no disk write, no parsing.
+
+    Mirrors bastion/scrub's upload: the raw request body IS the file bytes and
+    the (percent-encoded UTF-8) filename rides in X-Filename. POST-only, so
+    common's Origin/CSRF check applies, and the oversized-body cap is enforced
+    upstream via App.body_limits BEFORE this handler runs. Devkit's no-I/O rule
+    holds here: we read the request body only, feed it to hashlib, and never
+    touch the filesystem or interpret the content.
+    """
+    if not req.body:
+        return common.Response.error(400, "empty upload — send the file bytes as the request body")
+    raw = _header(req, "X-Filename")
+    filename = _clean_filename(urllib.parse.unquote(raw)) if raw.strip() else ""
+    result = tools.hash_file_bytes(req.body)
+    return _ok({"filename": filename, "size": len(req.body), "hashes": result})
+
+
+def h_hmac(req: common.Request) -> common.Response:
+    j = req.json()
+    if "text" not in j:
+        return common.Response.error(400, "missing text")
+    if "key" not in j:
+        return common.Response.error(400, "missing key")
+    try:
+        result = tools.hmac_digest(str(j["text"]), str(j["key"]), algo=str(j.get("algo", "sha256")))
+    except (ValueError, TypeError) as e:
+        return common.Response.error(400, str(e))
+    return _ok(result)
+
+
+def h_checksums(req: common.Request) -> common.Response:
+    j = req.json()
+    if "text" not in j:
+        return common.Response.error(400, "missing text")
+    try:
+        result = tools.checksums(str(j["text"]))
     except (ValueError, TypeError) as e:
         return common.Response.error(400, str(e))
     return _ok(result)
@@ -154,7 +225,8 @@ def h_gen(req: common.Request) -> common.Response:
     kind = str(j.get("kind", "")).lower()
     try:
         if kind == "uuid":
-            result = tools.gen_uuid(version=j.get("version", 4), count=j.get("count", 1))
+            result = tools.gen_uuid(version=j.get("version", 4), count=j.get("count", 1),
+                                    namespace=j.get("namespace"), name=j.get("name"))
         elif kind == "password":
             result = tools.gen_password(
                 length=j.get("length", 20),
@@ -310,6 +382,9 @@ def h_manifest(req: common.Request) -> common.Response:
 # Every route goes through _guard so no bad input can ever 500 (see _guard).
 ROUTES = {key: _guard(fn) for key, fn in {
     "POST /api/devkit/hash": h_hash,
+    "POST /api/devkit/hashfile": h_hashfile,
+    "POST /api/devkit/hmac": h_hmac,
+    "POST /api/devkit/checksums": h_checksums,
     "POST /api/devkit/encode": h_encode,
     "POST /api/devkit/decode": h_decode,
     "POST /api/devkit/jwt": h_jwt,
@@ -333,6 +408,9 @@ def build_app() -> common.App:
         slug="devkit",
         static_dir=Path(__file__).resolve().parent / "static",
         routes=ROUTES,
+        # Only the file-hash route takes a big body (it hashes the bytes in
+        # memory); every other POST keeps the global 256 KiB MAX_BODY cap.
+        body_limits={"POST /api/devkit/hashfile": HASHFILE_MAX},
     )
 
 

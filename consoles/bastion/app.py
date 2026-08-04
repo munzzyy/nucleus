@@ -16,7 +16,9 @@ REPORTS_DIR = Path(__file__).resolve().parents[2] / "engine" / "reports"
 
 
 def h_posture(req: common.Request) -> common.Response:
-    return common.Response.json(posture.run_all())
+    # ?force=1 bypasses the 30s posture cache for a manual "Refresh" from the UI
+    # so the panel isn't stale-forever; the default poll stays cached.
+    return common.Response.json(posture.run_all(force=bool(req.q("force"))))
 
 
 def h_hardening(req: common.Request) -> common.Response:

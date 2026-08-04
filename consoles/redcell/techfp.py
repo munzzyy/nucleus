@@ -178,13 +178,15 @@ def _norm_headers(headers: dict) -> dict:
 
 
 def _cookie_names(set_cookie: str) -> list[str]:
-    """Cookie NAMES only, never values — mirrors webscan._analyze_cookies'
-    comma-splitting (common.fetch collapses duplicate Set-Cookie headers into
-    one comma-joined value; split only on a comma that precedes a new
-    `name=`, never the comma inside `Expires=Wed, 09 Jun 2021 ...`)."""
+    """Cookie NAMES only, never values — mirrors webscan._analyze_cookies.
+    common.fetch newline-joins repeated Set-Cookie headers (see the contract in
+    common._collect_headers), so split on that newline first to see every cookie,
+    then keep the legacy comma-before-`name=` split per line for any single
+    comma-joined value (never the comma inside `Expires=Wed, 09 Jun 2021 ...`)."""
     if not set_cookie:
         return []
-    parts = re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)", set_cookie)
+    parts = [c for line in set_cookie.split("\n")
+             for c in re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)", line)]
     names = []
     for part in parts:
         seg = part.split(";", 1)[0]

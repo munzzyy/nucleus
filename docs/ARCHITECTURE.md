@@ -24,7 +24,8 @@ The design constraint was to match how the rest of your stack already works: a s
 
 - **`shared/common.py`** is the whole security-critical surface, written once:
   - loopback bind, Host-header allowlist, per-POST Origin/Referer check, strict CSP, static file sandbox
-  - `fetch()` — the single SSRF-guarded outbound HTTP path (recon's only door out)
+  - `fetch()` — the single SSRF-guarded outbound HTTP path (recon's only door out). Its response-header collapse preserves every `Set-Cookie` (repeats joined with `\n`, since cookie values carry their own commas) so downstream cookie analysis sees all of them, not just the last — callers split `resp_headers.get("Set-Cookie","")` on `\n`.
+  - `_origin_ok()` — the per-POST CSRF check requires an **exact port match**; a port-less Origin (`http://localhost` = `:80`, `https://127.0.0.1` = `:443`) is refused, since Nucleus only ever serves on its fixed 88xx/89xx ports and a real same-origin request always carries the real port.
   - `dns_query()` — encrypted DNS-over-HTTPS (Google→Cloudflare), so no dnspython and no repeat of the old shared-`Resolver` thread-safety bug
   - `run_tool()` — the single no-shell, time-bounded execution primitive (argv list only)
   - `which()` / `tool_version()` — tool detection
@@ -43,7 +44,7 @@ Three consoles on three ports are three origins. Rather than open CORS (and wide
 
 1. Handler dispatch checks the `Host` header against the allowlist → 403 if foreign.
 2. `/healthz`, `/api/siblings`, and static routes are served by the core.
-3. A registered route runs. For POST, the core first checks a same-origin `Origin`/`Referer` and caps the body size.
+3. A registered route runs. For POST, the core first checks a same-origin `Origin`/`Referer` (exact host **and** port) and caps the body size (per-route override via `App.body_limits`, e.g. the scrub and devkit file-hash uploads).
 4. The handler returns a `common.Response`; a handler exception becomes a clean 500, never a crash.
 
 ## Recon data flow (OSINT)
@@ -73,15 +74,17 @@ Four things Redcell does itself, so they work on a box with nothing installed. N
 
 ## Bastion (defensive)
 
-Read-only. Posture checks inspect this machine (sysctls, auditd, Quad9 DoT via `resolvectl`, Tor, WireGuard, MAC randomization, firewall, `arch-audit` CVEs) and report ok/warn/bad/unknown with the exact fix command — Bastion never runs sudo or changes anything. The **report engine** (`engine/osint_report.py`) takes a domain and produces a graded passive assessment (DNS, SPF/DMARC, TLS + security headers, crt.sh attack surface, InternetDB ports/CVEs) rendered to Markdown/HTML. It's importable and has a CLI, so the old income-machine skills that shell out to a `report.py` can point at it again.
+Read-only. Posture checks inspect this machine (sysctls, auditd, Quad9 DoT via `resolvectl`, Tor, WireGuard, MAC randomization, firewall, `arch-audit` CVEs) and report ok/warn/bad/unknown with the exact fix command — Bastion never runs sudo or changes anything. The **report engine** (`engine/osint_report.py`) takes a domain and produces a graded passive assessment (DNS, SPF/DMARC, plus passive **MTA-STS** — `_check_mtasts` fetches `https://mta-sts.<domain>/.well-known/mta-sts.txt` through the engine's SSRF-guarded fetch and reads its `mode` — and **TLS-RPT** — `_check_tlsrpt` reads the `_smtp._tls.<domain>` TXT — folded into the email score with the same variable-max pattern as the shodan check; TLS + security headers, crt.sh attack surface, InternetDB ports/CVEs) rendered to Markdown/HTML. It's importable and has a CLI, so the old income-machine skills that shell out to a `report.py` can point at it again.
 
 ## Devkit (developer toolbelt)
 
-Does no I/O of any kind — no network, no filesystem — which is the whole point: whatever you paste in stays in the process. It follows the same shape as the security consoles but inverts one thing: instead of read-only GETs, every tool is a `POST /api/devkit/<tool>` that takes JSON and returns JSON, so nothing you're encoding or hashing ends up in a URL or a log.
+Does effectively no I/O — no network, and the only filesystem-shaped input is the raw request body of the file-hash route — which is the whole point: whatever you paste or drop in stays in the process. It follows the same shape as the security consoles but inverts one thing: instead of read-only GETs, every tool is a `POST /api/devkit/<tool>` that takes JSON and returns JSON, so nothing you're encoding or hashing ends up in a URL or a log.
 
-All the real work lives in `consoles/devkit/tools.py` as small pure functions — `hash_text`, `encode`/`decode`, `jwt_decode`, `json_tool`, the `gen_*` generators, `time_convert`, `cron_next`, `base_convert`, `color_convert`, `humanize_bytes`/`parse_bytes`, `text_tools`, `text_diff`, `regex_test`, `cidr_info`/`cidr_contains`. Keeping them pure means each one is unit-testable by import with no server, and `app.py` handlers stay thin: parse the body, validate it's present, call the function, wrap the result in `Response.json` or a clean `Response.error(400, …)`. A tool never raises to the client.
+All the real work lives in `consoles/devkit/tools.py` as small pure functions — `hash_text`, `encode`/`decode`, `jwt_decode`, `json_tool`, the `gen_*` generators (`gen_uuid` now also does deterministic **UUID v5** from a namespace + name), an **HMAC** function (text + key + algorithm to a hex MAC) and **CRC32/Adler32 checksums**, `time_convert`, `cron_next`, `base_convert`, `color_convert`, `humanize_bytes`/`parse_bytes`, `text_tools`, `text_diff`, `regex_test`, `cidr_info`/`cidr_contains`. Keeping them pure means each one is unit-testable by import with no server, and `app.py` handlers stay thin: parse the body, validate it's present, call the function, wrap the result in `Response.json` or a clean `Response.error(400, …)`. A tool never raises to the client.
 
-Routes: `POST /api/devkit/{hash, encode, decode, jwt, json, gen, time, cron, base, color, bytes, text, diff, regex, cidr}`, plus a `GET /api/devkit/manifest` so the UI can render its sections without hardcoding them.
+The one route that isn't JSON-in is `POST /api/devkit/hashfile`: a raw-body upload (filename in an `X-Filename` header, size-capped via `App.body_limits`) that hashes the bytes in memory for md5/sha1/sha256/sha512/blake2b and returns the digests + size + filename. It reads the request body only — never writes to disk, never parses the file — so hashing a hostile file is safe.
+
+Routes: `POST /api/devkit/{hash, hashfile, encode, decode, jwt, json, gen, hmac, time, cron, base, color, bytes, text, diff, regex, cidr}`, plus a `GET /api/devkit/manifest` so the UI can render its sections without hardcoding them.
 
 The one subprocess in the whole console is the regex tester. A user pattern can catastrophically backtrack, and re has no timeout, so `regex_test` runs the match in a short-lived `sys.executable -c <worker>` through `run_tool` with a hard timeout — our own Python, an argv list, no shell, trusted-shape JSON on stdin. A pathological pattern times out cleanly instead of pinning a server thread forever.
 
@@ -93,11 +96,22 @@ Collectors: `overview`, `cpu` (per-core + overall by sampling `/proc/stat` twice
 
 Routes are all GET — reads are safe cross-origin, so no POST or Origin check is needed: `GET /api/systems/{overview, cpu, memory, disks, network, listening, processes, sensors, services}`, plus a combined `GET /api/systems/all` for first paint.
 
+The collectors stay stateless — no server-side history. Everything richer is client-side: CPU% and mem% feed a short in-browser ring buffer rendered as inline SVG sparklines, the process and listening tables sort and filter over the already-rendered rows, "Download snapshot" bundles the current panels into one JSON via the shared kit, and the refresh loop is visibility-aware (pause/resume, cadence selector, auto-pause on `document.hidden`).
+
 ## Shared frontend and the command palette
 
 Every console's UI is a plain IIFE over `window.Nucleus` (`N.el`/`N.get`/`N.post`/`N.esc`/`N.toast`/`N.safeUrl`), styled by the shared design system in `shared/static/`, under the same strict CSP — no inline JS or CSS, DOM built with `N.el`/`textContent` so any echoed value (a JWT payload, a regex input, a process name) renders as inert text, never `innerHTML`.
 
-`shared/static/nucleus.js` also holds the cross-console furniture: the switcher (with live sibling health dots), the keyboard shortcuts (`g` + a letter to jump, `/` to focus a console's main input, `1`–`6` for the six pages), and the **command palette**. Ctrl-K / Cmd-K opens a fuzzy launcher whose entries are computed at open time from two sources: one "Go to <console>" per sibling, and one entry per `.section-title` and card heading on the current page (scroll-into-view). Because it discovers sections from the DOM, it works on every console with zero per-console registration — a new tool that adds a heading is reachable from the palette for free. It's exposed as `N.openCommandPalette()` / `N.closeCommandPalette()`.
+On top of that base, `shared/static/nucleus.js` provides one small **result kit** every console reuses so a result behaves the same everywhere:
+
+- `N.copy(text, okMsg)` / `N.copyButton(getText, opts)` — clipboard with a hidden-textarea fallback for non-secure contexts, a pre-wired button that flips to "copied ✓", and a screen-reader announcement.
+- `N.download(name, content, mime)` / `N.downloadJson(obj, name)` — Blob download, no server round-trip.
+- `N.resultBar({getText, json, filename, extra})` — the standard Copy / Copy JSON / Download / Download JSON affordance row on a result card.
+- `N.remember(key)` — namespaced, try/catch-guarded `localStorage` (remembered inputs, recents, deep-link state) that no-ops when storage is unavailable.
+- `N.announce(msg)` — a shared visually-hidden `aria-live` region; every `N.toast` also announces.
+- `N.stateCard(kind, msg)` — honest loading / empty / error blocks, so a failure renders red (`var(--bad)`) with an alert role instead of a muted dash.
+
+`nucleus.js` also holds the cross-console furniture: the switcher (with live sibling health dots), the keyboard shortcuts (`g` + a letter to jump, `/` to focus a console's main input, `1`–`6` for the six pages), and the **command palette**. Ctrl-K / Cmd-K opens a fuzzy launcher whose entries are computed at open time from two sources: one "Go to <console>" per sibling, and one entry per `.section-title` and card heading on the current page (scroll-into-view), plus any commands a console registers via `N.registerCommand({label, run, section})`. When the query is empty it shows a most-recently-used list first (persisted through `N.remember("cmd-mru")`). Because it discovers sections from the DOM, it works on every console with zero per-console registration — a new tool that adds a heading is reachable from the palette for free. Both the palette and the `?` help overlay trap focus (Tab/Shift-Tab cycle within) and restore focus to the previously-focused element on close. It's exposed as `N.openCommandPalette()` / `N.closeCommandPalette()`.
 
 ## Extending it
 

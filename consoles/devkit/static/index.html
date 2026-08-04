@@ -15,7 +15,7 @@
     </div>
 
     <!-- Hashing -->
-    <div class="section-title">Hashing</div>
+    <div class="section-title" id="tool-hashing">Hashing</div>
     <div class="card">
       <h2>Hash text</h2>
       <div class="field">
@@ -28,8 +28,46 @@
       <div id="dk-hash-out" class="dk-result"></div>
     </div>
 
+    <div class="card">
+      <h2>Hash a file</h2>
+      <p class="faint m0">Hashed in memory only — the bytes are never written to disk, never parsed, and never leave this machine. md5, sha1, sha256, sha512, blake2b.</p>
+      <div class="dk-drop" id="dk-file-drop" tabindex="0" role="button" aria-label="Choose a file to hash, or drop one here">
+        <input type="file" id="dk-file-input" class="sr-only" tabindex="-1" aria-hidden="true">
+        <span class="dk-drop-label">Drop a file here, or click to choose</span>
+      </div>
+      <div id="dk-hashfile-out" class="dk-result"></div>
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>HMAC</h3>
+        <div class="field"><label for="dk-hmac-text">Message</label><textarea id="dk-hmac-text" rows="2" spellcheck="false"></textarea></div>
+        <div class="row">
+          <div class="field grow"><label for="dk-hmac-key">Key</label><input type="text" id="dk-hmac-key" autocomplete="off" spellcheck="false"></div>
+          <div class="field"><label for="dk-hmac-algo">Algorithm</label>
+            <select id="dk-hmac-algo">
+              <option value="sha256">sha256</option>
+              <option value="sha1">sha1</option>
+              <option value="sha384">sha384</option>
+              <option value="sha512">sha512</option>
+              <option value="md5">md5</option>
+            </select>
+          </div>
+          <div class="field fit"><button id="dk-hmac-run" type="button">Compute</button></div>
+        </div>
+        <div id="dk-hmac-out" class="dk-result"></div>
+      </div>
+      <div class="card">
+        <h3>Checksums</h3>
+        <p class="faint m0 pull-up">CRC32 and Adler32 — error-detection checksums, not cryptographic hashes.</p>
+        <div class="field"><label for="dk-cksum-text">Text</label><textarea id="dk-cksum-text" rows="2" spellcheck="false"></textarea></div>
+        <div class="row"><div class="field fit"><button id="dk-cksum-run" type="button">Compute</button></div></div>
+        <div id="dk-cksum-out" class="dk-result"></div>
+      </div>
+    </div>
+
     <!-- Encode / decode -->
-    <div class="section-title">Encode / decode</div>
+    <div class="section-title" id="tool-encode">Encode / decode</div>
     <div class="card">
       <h2>Encode &amp; decode</h2>
       <div class="field">
@@ -56,7 +94,7 @@
     </div>
 
     <!-- JWT -->
-    <div class="section-title">JWT</div>
+    <div class="section-title" id="tool-jwt">JWT</div>
     <div class="card">
       <h2>Decode a JWT</h2>
       <div class="field">
@@ -78,7 +116,7 @@
     </div>
 
     <!-- JSON -->
-    <div class="section-title">JSON</div>
+    <div class="section-title" id="tool-json">JSON</div>
     <div class="card">
       <h2>Format &amp; validate</h2>
       <div class="field">
@@ -95,16 +133,28 @@
     </div>
 
     <!-- Generators -->
-    <div class="section-title">Generators</div>
+    <div class="section-title" id="tool-generators">Generators</div>
     <div class="grid cols-2">
       <div class="card">
         <h3>UUID</h3>
         <div class="row">
           <div class="field"><label for="dk-uuid-version">Version</label>
-            <select id="dk-uuid-version"><option value="4">v4 (random)</option><option value="1">v1 (time)</option></select>
+            <select id="dk-uuid-version">
+              <option value="4">v4 (random)</option>
+              <option value="1">v1 (time)</option>
+              <option value="5">v5 (namespace, SHA-1)</option>
+              <option value="3">v3 (namespace, MD5)</option>
+            </select>
           </div>
           <div class="field"><label for="dk-uuid-count">Count</label><input type="number" id="dk-uuid-count" value="1" min="1" max="100"></div>
           <div class="field fit"><button id="dk-uuid-run" type="button">Generate</button></div>
+        </div>
+        <div class="row dk-hide" id="dk-uuid-ns-fields">
+          <div class="field"><label for="dk-uuid-ns">Namespace</label>
+            <input type="text" id="dk-uuid-ns" value="dns" placeholder="dns / url / oid / x500 / UUID" spellcheck="false" list="dk-uuid-ns-list" autocomplete="off">
+            <datalist id="dk-uuid-ns-list"><option value="dns"></option><option value="url"></option><option value="oid"></option><option value="x500"></option></datalist>
+          </div>
+          <div class="field grow"><label for="dk-uuid-name">Name</label><input type="text" id="dk-uuid-name" placeholder="example.com" spellcheck="false" autocomplete="off"></div>
         </div>
         <div id="dk-uuid-out" class="dk-result"></div>
       </div>
@@ -145,7 +195,7 @@
     </div>
 
     <!-- Time -->
-    <div class="section-title">Time</div>
+    <div class="section-title" id="tool-time">Time</div>
     <div class="grid cols-2">
       <div class="card">
         <h3>Now</h3>
@@ -185,7 +235,7 @@
     </div>
 
     <!-- Cron -->
-    <div class="section-title">Cron</div>
+    <div class="section-title" id="tool-cron">Cron</div>
     <div class="card">
       <h2>Next fire times</h2>
       <div class="row">
@@ -197,7 +247,7 @@
     </div>
 
     <!-- Numbers & color -->
-    <div class="section-title">Numbers &amp; color</div>
+    <div class="section-title" id="tool-numbers">Numbers &amp; color</div>
     <div class="grid cols-2">
       <div class="card">
         <h3>Base convert</h3>
@@ -232,7 +282,7 @@
     </div>
 
     <!-- Text -->
-    <div class="section-title">Text</div>
+    <div class="section-title" id="tool-text">Text</div>
     <div class="card">
       <h2>Transform text</h2>
       <div class="field"><label for="dk-text-input">Text</label><textarea id="dk-text-input" rows="4" spellcheck="false"></textarea></div>
@@ -282,7 +332,7 @@
     </div>
 
     <!-- Regex -->
-    <div class="section-title">Regex</div>
+    <div class="section-title" id="tool-regex">Regex</div>
     <div class="card">
       <h2>Test a pattern</h2>
       <p class="faint pull-up m0">Evaluated in a sandboxed subprocess with a 3-second timeout — a catastrophic pattern can't hang the app.</p>
@@ -296,7 +346,7 @@
     </div>
 
     <!-- Network (CIDR) -->
-    <div class="section-title">Network (CIDR)</div>
+    <div class="section-title" id="tool-cidr">Network (CIDR)</div>
     <div class="card">
       <h2>CIDR calculator</h2>
       <div class="row">

@@ -143,7 +143,42 @@ def _check_dkim_hint(domain: str) -> dict:
     return {"found": False, "selector": None}
 
 
-def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool) -> tuple[int, int, list]:
+def _check_mtasts(domain: str) -> dict:
+    """MTA-STS (RFC 8461): a published policy that tells sending mail servers to
+    require TLS for inbound mail to this domain, and to refuse to fall back to
+    cleartext. The policy lives at a well-known HTTPS path on the mta-sts
+    subdomain; we grade presence + mode (enforce/testing/none). Fetched through
+    the same SSRF-guarded path as every other web check, so a hostile or dead
+    host degrades to {present: False} instead of crashing the report."""
+    res = _fetch(f"https://mta-sts.{domain}/.well-known/mta-sts.txt",
+                 timeout=_SRC_TIMEOUT, max_bytes=20_000)
+    if not (res.get("ok") and res.get("status") == 200 and res.get("body")):
+        return {"present": False, "mode": None,
+                "status": res.get("status") if res.get("ok") else None}
+    text = res["body"].decode("utf-8", "replace")
+    fields = {}
+    for line in text.splitlines():
+        key, sep, val = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = val.strip()
+    # A real policy file starts with `version: STSv1`. Without that marker a 200
+    # is just some other page answering on that host, not an MTA-STS policy.
+    if fields.get("version", "").lower() != "stsv1":
+        return {"present": False, "mode": None, "status": res.get("status")}
+    return {"present": True, "mode": (fields.get("mode") or "").lower() or None,
+            "status": 200}
+
+
+def _check_tlsrpt(domain: str) -> dict:
+    """TLS-RPT (RFC 8460): a TXT record at _smtp._tls.<domain> naming where to
+    send SMTP TLS failure reports. Its presence means the operator is actually
+    watching inbound-mail TLS health, which is the signal we grade."""
+    vals = [v for v in _txt_values(f"_smtp._tls.{domain}") if v.lower().startswith("v=tlsrptv1")]
+    return {"present": bool(vals), "record": vals[0] if vals else None}
+
+
+def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool,
+                 mtasts: dict | None = None, tlsrpt: dict | None = None) -> tuple[int, int, list]:
     max_pts, pts, findings = 30, 0, []
 
     if spf["present"]:
@@ -203,6 +238,42 @@ def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool) -> tuple[
                                  "Best-effort check against common selectors only "
                                  f"({', '.join(_DKIM_SELECTORS)}) — DKIM may still be configured "
                                  "under a different selector."))
+
+    # MTA-STS + TLS-RPT protect *inbound* mail in transit, so they only apply to
+    # a domain that actually receives mail (has MX). Each is graded only when
+    # there's an MX AND the check ran — the same variable-max discipline the
+    # attack-surface section uses, so a no-mail domain or a source outage neither
+    # inflates nor penalizes the grade. The existing four-arg callers (and the
+    # unit tests) pass neither, so the email max stays 30 for them.
+    if mx_present and mtasts is not None:
+        max_pts += 4
+        mode = mtasts.get("mode") if mtasts.get("present") else None
+        if mode == "enforce":
+            pts += 4
+        elif mode == "testing":
+            pts += 2
+            findings.append(finding("low", "MTA-STS policy is in testing mode, not enforce",
+                                     "Testing mode reports TLS failures but still allows cleartext "
+                                     "delivery. Move to mode: enforce once the reports look clean."))
+        elif mtasts.get("present"):
+            findings.append(finding("low", "MTA-STS policy present but mode is not enforce",
+                                     "A policy with mode: none provides no protection. Set "
+                                     "mode: enforce so senders require TLS for mail to you."))
+        else:
+            findings.append(finding("low", "No MTA-STS policy found",
+                                     "Publish an MTA-STS policy (mta-sts.<domain>/.well-known/"
+                                     "mta-sts.txt with mode: enforce) so senders require TLS for "
+                                     "inbound mail and won't silently fall back to cleartext."))
+
+    if mx_present and tlsrpt is not None:
+        max_pts += 2
+        if tlsrpt.get("present"):
+            pts += 2
+        else:
+            findings.append(finding("info", "No TLS-RPT (SMTP TLS reporting) record found",
+                                     "Publish a _smtp._tls.<domain> TXT record (v=TLSRPTv1) so you "
+                                     "get reports when a sender can't establish TLS to your mail "
+                                     "servers."))
 
     return pts, max_pts, findings
 
@@ -714,11 +785,13 @@ def diff(domain: str, out_dir: Path = REPORTS_DIR, *, before: str | None = None)
 # --------------------------------------------------------------------------
 # main entry point
 #
-# Score weights (out of a 108-point total — up from 90 before the passive
-# signals below were added; kept deliberately small relative to the existing
-# categories so an already-good site's grade barely moves and a genuinely
-# absent control still shows up as a real, visible deduction):
-#   email (30): SPF 12, DMARC up to 18, DKIM hint informational only
+# Score weights (kept deliberately small relative to the existing categories so
+# an already-good site's grade barely moves and a genuinely absent control still
+# shows up as a real, visible deduction):
+#   email (30, up to 36): SPF 12, DMARC up to 18, DKIM hint informational only,
+#     + MTA-STS 4 + TLS-RPT 2 — but the last two are graded ONLY for a domain
+#     with MX (they protect inbound mail), so a no-mail domain's email max stays
+#     30 and the two signals never penalize it.
 #   web (53 = 40 existing + 13 new): HSTS/CSP/X-Frame/nosniff/Referrer/
 #     Permissions-Policy/redirect (40) + TLS cert health (8) + CAA (3) +
 #     security.txt (2)
@@ -759,6 +832,13 @@ def assess(domain: str) -> dict:
         "subdomains": lambda: _crtsh_subdomains(domain),
         "shodan": lambda: _shodan_internetdb(apex_ip),
     }
+    # MTA-STS + TLS-RPT only matter for a domain that receives mail, so they're
+    # only fetched when there's an MX — no wasted outbound (one HTTPS + one TXT)
+    # for a no-mail domain, and `.get(...)` below yields None so scoring skips
+    # them cleanly.
+    if mx_present:
+        collectors["mtasts"] = lambda: _check_mtasts(domain)
+        collectors["tlsrpt"] = lambda: _check_tlsrpt(domain)
     with ThreadPoolExecutor(max_workers=len(collectors)) as ex:
         futures = {k: ex.submit(fn) for k, fn in collectors.items()}
         r = {k: f.result() for k, f in futures.items()}
@@ -767,8 +847,9 @@ def assess(domain: str) -> dict:
     https_res, http_res, tls = r["https"], r["http"], r["tls"]
     caa, sec_txt, dnssec = r["caa"], r["sec_txt"], r["dnssec"]
     subdomains, shodan = r["subdomains"], r["shodan"]
+    mtasts, tlsrpt = r.get("mtasts"), r.get("tlsrpt")
 
-    email_pts, email_max, email_findings = _score_email(spf, dmarc, dkim, mx_present)
+    email_pts, email_max, email_findings = _score_email(spf, dmarc, dkim, mx_present, mtasts, tlsrpt)
 
     web_pts, web_max, web_findings, banner = _score_web(https_res, http_res)
     tls_pts, tls_max, tls_findings = _score_tls(tls)
@@ -804,7 +885,8 @@ def assess(domain: str) -> dict:
         },
         "findings": all_findings,
         "dns": dns_section,
-        "email_security": {"spf": spf, "dmarc": dmarc, "dkim_hint": dkim, "mx_present": mx_present},
+        "email_security": {"spf": spf, "dmarc": dmarc, "dkim_hint": dkim, "mx_present": mx_present,
+                           "mtasts": mtasts, "tlsrpt": tlsrpt},
         "web": {
             "https": {"ok": https_res.get("ok"), "status": https_res.get("status"),
                       "error": https_res.get("error"), "headers": https_res.get("headers", {})},
@@ -855,8 +937,23 @@ def _md_safe(value) -> str:
 _DIRECTION_ARROW = {"up": "▲", "down": "▼", "same": "▬"}
 
 
+def _mtasts_md(mtasts) -> str:
+    if mtasts is None:
+        return "not applicable (no MX)"
+    if not mtasts.get("present"):
+        return "absent"
+    return "present (mode=" + _md_safe(mtasts.get("mode") or "unspecified") + ")"
+
+
+def _tlsrpt_md(tlsrpt) -> str:
+    if tlsrpt is None:
+        return "not applicable (no MX)"
+    return "present" if tlsrpt.get("present") else "absent"
+
+
 def render_markdown(report: dict) -> str:
     d = report["domain"]
+    es = report["email_security"]
     lines = [
         f"# Passive security assessment — {d}",
         "",
@@ -883,17 +980,19 @@ def render_markdown(report: dict) -> str:
         "",
         "## DNS",
         "",
-        f"- A: {', '.join(report['dns']['A']) or 'none'}",
-        f"- AAAA: {', '.join(report['dns']['AAAA']) or 'none'}",
+        f"- A: {_md_safe(', '.join(report['dns']['A'])) or 'none'}",
+        f"- AAAA: {_md_safe(', '.join(report['dns']['AAAA'])) or 'none'}",
         f"- MX: {_md_safe(', '.join(report['dns']['MX'])) or 'none'}",
         f"- NS: {_md_safe(', '.join(report['dns']['NS'])) or 'none'}",
         "",
         "## Email security",
         "",
-        f"- SPF: {'present' if report['email_security']['spf']['present'] else 'absent'}"
-        + (f" — `{_md_safe(report['email_security']['spf']['record'])}`" if report['email_security']['spf']['present'] else ""),
-        f"- DMARC: {'present, policy=' + _md_safe(report['email_security']['dmarc']['policy']) if report['email_security']['dmarc']['present'] else 'absent'}",
-        f"- DKIM hint: {'found (selector: ' + _md_safe(report['email_security']['dkim_hint']['selector']) + ')' if report['email_security']['dkim_hint']['found'] else 'not detected (common selectors only)'}",
+        f"- SPF: {'present' if es['spf']['present'] else 'absent'}"
+        + (f" — `{_md_safe(es['spf']['record'])}`" if es['spf']['present'] else ""),
+        f"- DMARC: {'present, policy=' + _md_safe(es['dmarc']['policy']) if es['dmarc']['present'] else 'absent'}",
+        f"- DKIM hint: {'found (selector: ' + _md_safe(es['dkim_hint']['selector']) + ')' if es['dkim_hint']['found'] else 'not detected (common selectors only)'}",
+        f"- MTA-STS: {_mtasts_md(es.get('mtasts'))}",
+        f"- TLS-RPT: {_tlsrpt_md(es.get('tlsrpt'))}",
         "",
         "## Web / TLS",
         "",
@@ -923,6 +1022,14 @@ _HTML_ESCAPE = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#3
 
 def _esc(s) -> str:
     return re.sub(r"[&<>\"']", lambda m: _HTML_ESCAPE[m.group(0)], str(s if s is not None else ""))
+
+
+def _mtasts_html(mtasts) -> str:
+    if mtasts is None:
+        return "not applicable (no MX)"
+    if not mtasts.get("present"):
+        return "absent"
+    return "present, mode=" + _esc(mtasts.get("mode") or "unspecified")
 
 
 _GRADE_COLOR = {"A": "#38d39f", "B": "#8fd339", "C": "#ffb454", "D": "#ff8a3d", "F": "#ff5c72"}
@@ -1021,6 +1128,8 @@ def render_html(report: dict) -> str:
     <tr><th>SPF</th><td>{'present' if es['spf']['present'] else 'absent'}{' — <code>' + _esc(es['spf']['record']) + '</code>' if es['spf']['present'] else ''}</td></tr>
     <tr><th>DMARC</th><td>{('present, policy=' + _esc(es['dmarc']['policy'])) if es['dmarc']['present'] else 'absent'}</td></tr>
     <tr><th>DKIM hint</th><td>{('found (selector: ' + _esc(es['dkim_hint']['selector']) + ')') if es['dkim_hint']['found'] else 'not detected (common selectors only)'}</td></tr>
+    <tr><th>MTA-STS</th><td>{_mtasts_html(es.get('mtasts'))}</td></tr>
+    <tr><th>TLS-RPT</th><td>{_tlsrpt_md(es.get('tlsrpt'))}</td></tr>
   </table>
 
   <h2>Web / TLS</h2>

@@ -67,31 +67,113 @@ def _settings_post(req) -> common.Response:
     return common.Response.json({"ok": True, "name": key, "set": bool(value)})
 
 
+# Which console owns each headline stat, and how long that probe is allowed to
+# take. Posture gets the biggest budget: its first uncached run shells out to
+# the arch audit and legitimately takes tens of seconds, after which it's cached
+# for 15 minutes. Rather than pretend that's a failure, the probe times out and
+# the hub says "starting…".
+_SOURCES = {
+    "tools":   {"console": "redcell", "port": 8910, "timeout": 4.0},
+    "posture": {"console": "bastion", "port": 8920, "timeout": 5.0},
+    "devkit":  {"console": "devkit",  "port": 8930, "timeout": 2.0},
+    "systems": {"console": "systems", "port": 8940, "timeout": 2.5},
+}
+
+
+def _summary_probe(port: int, path: str, timeout: float):
+    """Pull the `summary` block out of a console's endpoint, honestly.
+
+    Returns (value, status, detail) — status is common.local_get_json_status's
+    ok/down/timeout/error, so the client can tell "offline" from "still warming
+    up" from "answered with something I didn't understand".
+    """
+    data, status, detail = common.local_get_json_status(port, path, timeout=timeout)
+    if status != "ok":
+        return None, status, detail
+    summary = data.get("summary")
+    if not isinstance(summary, dict):
+        return None, "error", "no summary in response"
+    return summary, "ok", ""
+
+
+def _devkit_probe():
+    """How many tools Devkit is offering, straight from its own manifest."""
+    spec = _SOURCES["devkit"]
+    data, status, detail = common.local_get_json_status(
+        spec["port"], "/api/devkit/manifest", timeout=spec["timeout"])
+    if status != "ok":
+        return None, status, detail
+    sections = data.get("sections")
+    if not isinstance(sections, list):
+        return None, "error", "no sections in manifest"
+    # The manifest is one entry per tool section today. If it ever grows a
+    # per-section tool list, count those instead of the sections.
+    tools = sum(len(s["tools"]) for s in sections
+                if isinstance(s, dict) and isinstance(s.get("tools"), list))
+    return {"sections": len(sections), "tools": tools or len(sections)}, "ok", ""
+
+
+def _systems_probe():
+    """One line of machine health: load + memory pressure."""
+    spec = _SOURCES["systems"]
+    data, status, detail = common.local_get_json_status(
+        spec["port"], "/api/systems/overview", timeout=spec["timeout"])
+    if status != "ok":
+        return None, status, detail
+    load = data.get("loadavg")
+    out = {
+        "hostname": data.get("hostname"),
+        "uptime_human": data.get("uptime_human"),
+        "cpu_count": data.get("cpu_count"),
+        "load1": round(load[0], 2) if isinstance(load, list) and load else None,
+        "mem_percent": None,
+    }
+    # /api/systems/overview reports TOTAL memory, not usage — the percentage
+    # this headline wants only exists on /api/systems/memory. Second cheap
+    # loopback call rather than a made-up number.
+    mem, mem_status, _mem_detail = common.local_get_json_status(
+        spec["port"], "/api/systems/memory", timeout=spec["timeout"])
+    if mem_status == "ok" and isinstance(mem.get("percent"), (int, float)):
+        out["mem_percent"] = mem["percent"]
+    return out, "ok", ""
+
+
 def _overview(req) -> common.Response:
-    # Run the three slow sub-queries concurrently — health pings, the tool
-    # inventory, and the live posture probes are independent, so the whole
-    # aggregate is bounded by the slowest one, not their sum.
+    # Every sub-query runs concurrently — the health pings and the four console
+    # probes are independent, so the whole aggregate is bounded by the slowest
+    # one, not their sum. A console being down never blocks the rest.
     import concurrent.futures as cf
+    import time
 
-    out = {"consoles": [], "tools": None, "posture": None,
-           "published_tools": PUBLISHED_TOOLS}
+    out = {
+        "consoles": [], "tools": None, "posture": None, "devkit": None,
+        "systems": None, "sources": {}, "published_tools": PUBLISHED_TOOLS,
+        "generated_at": round(time.time(), 3),
+    }
 
-    def _tools():
-        inv = common.local_get_json(8910, "/api/inventory", timeout=3.5)
-        return inv["summary"] if inv and isinstance(inv.get("summary"), dict) else None
-
-    def _posture():
-        p = common.local_get_json(8920, "/api/posture", timeout=3.5)
-        return p["summary"] if p and isinstance(p.get("summary"), dict) else None
-
-    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+    with cf.ThreadPoolExecutor(max_workers=5) as ex:
         f_sib = ex.submit(common.siblings_status)
-        f_tools = ex.submit(_tools)
-        f_post = ex.submit(_posture)
+        futures = {
+            "tools": ex.submit(_summary_probe, _SOURCES["tools"]["port"],
+                               "/api/inventory", _SOURCES["tools"]["timeout"]),
+            "posture": ex.submit(_summary_probe, _SOURCES["posture"]["port"],
+                                 "/api/posture", _SOURCES["posture"]["timeout"]),
+            "devkit": ex.submit(_devkit_probe),
+            "systems": ex.submit(_systems_probe),
+        }
         out["consoles"] = f_sib.result()
-        up = {c["slug"]: c.get("up") for c in out["consoles"]}
-        out["tools"] = f_tools.result() if up.get("redcell") else None
-        out["posture"] = f_post.result() if up.get("bastion") else None
+        up = {c["slug"]: bool(c.get("up")) for c in out["consoles"]}
+        for name, fut in futures.items():
+            value, status, detail = fut.result()
+            console = _SOURCES[name]["console"]
+            # A successful probe always wins (it may have raced a console that
+            # was still starting when the health ping ran). Otherwise the ping
+            # is what explains the failure.
+            if status != "ok" and not up.get(console):
+                status, detail = "down", detail or "console not running"
+            out[name] = value
+            out["sources"][name] = {"status": status, "detail": detail,
+                                    "console": console, "port": _SOURCES[name]["port"]}
 
     return common.Response.json(out)
 

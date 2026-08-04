@@ -168,6 +168,17 @@ def _allowed_hosts(port: int) -> set[str]:
 
 
 def _origin_ok(origin: str, port: int) -> bool:
+    """True only for an Origin that is exactly this console's own origin.
+
+    The port must match EXACTLY. A port-less Origin ("http://localhost",
+    i.e. localhost:80, or "https://127.0.0.1", i.e. :443) used to be accepted
+    too, on the theory that it was still loopback — but that made any page
+    served from a default-port loopback server a valid CSRF source for every
+    console, including POST /api/run and POST /api/settings. Nucleus never
+    serves on 80 or 443 (ports are fixed at 8890-8940), so a genuine
+    same-origin request from one of our own pages ALWAYS carries the real
+    port and nothing legitimate is lost by requiring it.
+    """
     if not origin:
         return False
     try:
@@ -177,8 +188,9 @@ def _origin_ok(origin: str, port: int) -> bool:
         oport = u.port
     except ValueError:
         return False
-    return (u.hostname in ("127.0.0.1", "localhost", "::1")
-            and (oport == port or (oport is None and u.scheme in ("http", "https"))))
+    return (u.scheme in ("http", "https")
+            and u.hostname in ("127.0.0.1", "localhost", "::1")
+            and oport == port)
 
 
 def _ip_is_public(ip) -> bool:
@@ -277,6 +289,39 @@ _UA = os.environ.get("NUCLEUS_UA") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
 _MAX_REDIRECTS = 5
+
+
+def _collect_headers(pairs) -> dict:
+    """Flatten a response's header list into a dict WITHOUT losing repeats.
+
+    `{k: v for k, v in resp.getheaders()}` keeps only the last value of a
+    repeated header, which quietly threw away every Set-Cookie but one — so a
+    site that sets a session cookie plus a tracking cookie looked like it set
+    one, and redcell's cookie-flag analysis only ever graded the last one.
+
+    Contract for callers:
+      * single-valued headers behave exactly as before (a plain string)
+      * repeats are joined with ", " (the RFC 9110 rule for list-valued fields)
+      * Set-Cookie repeats are joined with "\\n" instead, because cookie values
+        legitimately contain commas (Expires=Wed, 09 Jun 2027 ...) and comma
+        splitting them is guesswork. Callers that want the individual cookies
+        do: `resp_headers.get("Set-Cookie", "").split("\\n")`.
+
+    Header names keep the casing the server sent for the first occurrence; a
+    repeat that differs only in case folds into that same entry.
+    """
+    out: dict = {}
+    canon: dict = {}   # lowercased name -> the key actually used in `out`
+    for k, v in pairs:
+        low = k.lower()
+        key = canon.get(low)
+        if key is None:
+            canon[low] = k
+            out[k] = v
+            continue
+        sep = "\n" if low == "set-cookie" else ", "
+        out[key] = out[key] + sep + v
+    return out
 
 
 def _resolve_public(host: str) -> tuple[str, int]:
@@ -447,7 +492,7 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
                     method, body_data = "GET", None
                 continue
             payload = resp.read(max_bytes)
-            resp_headers = {k: v for k, v in resp.getheaders()}
+            resp_headers = _collect_headers(resp.getheaders())
             conn.close()
             return status, payload, resp_headers
         finally:
@@ -572,6 +617,50 @@ def _tcp_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def local_get_json_status(port: int, path: str,
+                          timeout: float = 4.0) -> tuple[Optional[dict], str, str]:
+    """`local_get_json` that also says WHY it came back empty.
+
+    Returns (data, status, detail) where status is one of:
+      "ok"      — a 200 with a JSON object
+      "down"    — nothing listening (connection refused)
+      "timeout" — listening but didn't answer inside the budget (cold start,
+                  or a probe that's genuinely slow the first time)
+      "error"   — answered, but not with something usable
+
+    The hub needs this distinction: "offline" and "still starting up" and
+    "broke" are three different things to show an operator, and collapsing
+    them into a bare `None` is exactly the kind of dishonest UI this app is
+    supposed to avoid.
+    """
+    if port not in {c["port"] for c in CONSOLES}:
+        return None, "error", "not a Nucleus port"
+    url = f"http://127.0.0.1:{port}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            if r.status != 200:
+                return None, "error", f"HTTP {r.status}"
+            data = json.loads(r.read(4_000_000).decode("utf-8"))
+            if not isinstance(data, dict):
+                return None, "error", "unexpected payload"
+            return data, "ok", ""
+    except urllib.error.HTTPError as e:          # must precede URLError
+        return None, "error", f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return None, "timeout", f"no answer in {timeout:g}s"
+        if isinstance(reason, ConnectionRefusedError):
+            return None, "down", "connection refused"
+        return None, "error", str(reason or e)[:120]
+    except TimeoutError:                          # socket.timeout is this since 3.10
+        return None, "timeout", f"no answer in {timeout:g}s"
+    except ConnectionRefusedError:
+        return None, "down", "connection refused"
+    except (OSError, json.JSONDecodeError, ValueError, http.client.HTTPException) as e:
+        return None, "error", f"{type(e).__name__}: {e}"[:120]
+
+
 def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]:
     """GET JSON from one of OUR OWN consoles on loopback.
 
@@ -579,17 +668,10 @@ def local_get_json(port: int, path: str, timeout: float = 4.0) -> Optional[dict]
     loopback) because the target is a fixed, trusted Nucleus port on 127.0.0.1.
     Used only by the hub to aggregate console data server-side, so the browser
     never has to make a cross-origin call. Returns None if the console is down.
+    Thin wrapper over `local_get_json_status` so there's one implementation.
     """
-    if port not in {c["port"] for c in CONSOLES}:
-        return None
-    try:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
-            if r.status != 200:
-                return None
-            return json.loads(r.read(4_000_000).decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, http.client.HTTPException):
-        return None
+    data, _status, _detail = local_get_json_status(port, path, timeout)
+    return data
 
 
 # --------------------------------------------------------------------------

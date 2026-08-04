@@ -3858,5 +3858,446 @@ class DevkitHandlerContractTests(unittest.TestCase):
                         "Content-Type": "application/json"}), 403)
 
 
+# ==========================================================================
+# 24. shared/common.py — CSRF _origin_ok exact-port + fetch Set-Cookie
+#     preservation (the two framework security fixes from the upgrade pass)
+# ==========================================================================
+class OriginExactPortTests(unittest.TestCase):
+    """_origin_ok must accept ONLY this console's own origin, and the port has
+    to match EXACTLY. A port-less Origin (http://localhost -> :80, or
+    https://127.0.0.1 -> :443) used to slip through on a "still loopback"
+    theory, which made any default-port loopback page a CSRF source for every
+    console. Nucleus never serves on 80/443, so a genuine same-origin request
+    always carries the real port and nothing legitimate is lost by requiring
+    it."""
+
+    PORT = 8890
+
+    def test_exact_port_origin_accepted(self):
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            with self.subTest(host=host):
+                self.assertTrue(common._origin_ok(f"http://{host}:{self.PORT}", self.PORT))
+
+    def test_portless_origin_rejected(self):
+        # http://localhost is :80, https://127.0.0.1 is :443 — neither is us.
+        for origin in ("http://127.0.0.1", "http://localhost", "https://127.0.0.1",
+                       "https://localhost", "http://[::1]"):
+            with self.subTest(origin=origin):
+                self.assertFalse(common._origin_ok(origin, self.PORT))
+
+    def test_wrong_port_origin_rejected(self):
+        for bad in (self.PORT + 1, 80, 443, 9999):
+            with self.subTest(port=bad):
+                self.assertFalse(common._origin_ok(f"http://127.0.0.1:{bad}", self.PORT))
+
+    def test_foreign_host_rejected_even_with_right_port(self):
+        self.assertFalse(common._origin_ok(f"http://evil.example:{self.PORT}", self.PORT))
+
+    def test_empty_and_malformed_origin_rejected(self):
+        self.assertFalse(common._origin_ok("", self.PORT))
+        # A crafted bad port must not crash the guard — it must read as False.
+        self.assertFalse(common._origin_ok("http://127.0.0.1:8890.evil", self.PORT))
+
+
+class _TwoCookieHandler(http.server.BaseHTTPRequestHandler):
+    """Emits TWO Set-Cookie headers so the fetch header-collapse fix can be
+    proven end-to-end: a naive {k: v for ...} would keep only the last one."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        # Two cookies; the first carries an Expires with its own comma to prove
+        # the "\n" join (not ",") is what keeps them separable downstream.
+        self.send_header("Set-Cookie",
+                         "session=abc; Path=/; Expires=Wed, 09 Jun 2027 10:18:14 GMT; HttpOnly")
+        self.send_header("Set-Cookie", "tracking=xyz; Path=/; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class FetchSetCookiePreservationTests(unittest.TestCase):
+    """common.fetch must preserve every Set-Cookie header. Repeats collapse to
+    the last value under a plain dict comprehension; the fix joins Set-Cookie
+    repeats with "\\n" (comma is unsafe — cookies carry Expires=..., commas).
+    Callers split resp_headers.get("Set-Cookie", "") on "\\n"."""
+
+    def test_both_cookies_survive_the_fetch(self):
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _TwoCookieHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/"
+            # Pin the SSRF resolver to loopback so fetch will talk to the test
+            # server (the guard otherwise refuses 127.0.0.1) — same technique
+            # the stresstest keep-alive tests use.
+            with mock.patch.object(common, "_resolve_public",
+                                   return_value=("127.0.0.1", socket.AF_INET)):
+                status, _body, headers = common.fetch(url, timeout=5)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(status, 200)
+        raw = headers.get("Set-Cookie", "")
+        cookies = raw.split("\n")
+        self.assertEqual(len(cookies), 2, f"expected 2 cookies, got {cookies!r}")
+        names = [c.split("=", 1)[0] for c in cookies]
+        self.assertEqual(names, ["session", "tracking"])
+        # The Expires comma inside cookie #1 must NOT have split it into two.
+        self.assertIn("Expires=Wed, 09 Jun 2027", cookies[0])
+
+    def test_single_valued_headers_stay_plain_strings(self):
+        # Backward-compat: a non-repeated header is still a bare string, not a
+        # list, so every existing single-valued consumer keeps working.
+        out = common._collect_headers([("Content-Type", "text/html"),
+                                       ("Server", "nginx")])
+        self.assertEqual(out["Content-Type"], "text/html")
+        self.assertEqual(out["Server"], "nginx")
+
+    def test_non_cookie_repeats_join_with_comma(self):
+        out = common._collect_headers([("Vary", "Accept"), ("Vary", "Origin")])
+        self.assertEqual(out["Vary"], "Accept, Origin")
+
+
+# ==========================================================================
+# 25. consoles/devkit/tools.py — the new crypto/checksum/id tools
+#     (HMAC, CRC32, Adler32, UUID v5). Known-answer vectors, tolerant to the
+#     exact function name / result-wrapper the console author picks — a wrong
+#     digest fails offline regardless.
+# ==========================================================================
+def _first_attr(mod, names):
+    for n in names:
+        fn = getattr(mod, n, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _hex_in(out, length=None):
+    """Pull the first hex string out of a tool result (bare string, or under a
+    conventional key). Optionally require an exact hex length."""
+    def _ok(s):
+        if not isinstance(s, str):
+            return False
+        s = s.strip().lower()
+        if not s or any(c not in "0123456789abcdef" for c in s):
+            return False
+        return length is None or len(s) == length
+    if _ok(out):
+        return out.strip().lower()
+    if isinstance(out, dict):
+        for k in ("hmac", "digest", "hex", "result", "value", "output", "mac"):
+            v = out.get(k)
+            if _ok(v):
+                return v.strip().lower()
+        for v in out.values():
+            if _ok(v):
+                return v.strip().lower()
+    return None
+
+
+def _uint32(v):
+    """Normalize a checksum value (int, decimal string, or hex string) to a
+    32-bit int, trying both decimal and hex readings of an ambiguous string."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v & 0xFFFFFFFF
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s.startswith("0x"):
+            try:
+                return int(s, 16) & 0xFFFFFFFF
+            except ValueError:
+                return None
+        for base in (10, 16):
+            try:
+                return int(s, base) & 0xFFFFFFFF
+            except ValueError:
+                continue
+    return None
+
+
+class DevkitHmacTests(unittest.TestCase):
+    def setUp(self):
+        self.fn = _first_attr(devkit_tools,
+                              ("hmac_text", "hmac_digest", "hmac_hex", "hmac_hash",
+                               "hmac_sign", "hmac_compute", "hmac_tool"))
+        if self.fn is None:
+            self.fail("devkit HMAC tool not present (expected e.g. hmac_text)")
+
+    def _call(self, text, key, algo):
+        for kw in ("algo", "algorithm", "alg", "hash"):
+            try:
+                return self.fn(text, key, **{kw: algo})
+            except TypeError:
+                continue
+        return self.fn(text, key, algo)
+
+    def test_hmac_sha256_known_vector(self):
+        text = "The quick brown fox jumps over the lazy dog"
+        expected = hmac.new(b"key", text.encode(), hashlib.sha256).hexdigest()
+        got = _hex_in(self._call(text, "key", "sha256"), length=64)
+        self.assertEqual(got, expected)
+
+    def test_hmac_sha1_known_vector(self):
+        expected = hmac.new(b"secret", b"data", hashlib.sha1).hexdigest()
+        got = _hex_in(self._call("data", "secret", "sha1"), length=40)
+        self.assertEqual(got, expected)
+
+
+class DevkitChecksumTests(unittest.TestCase):
+    """CRC32 + Adler32 — real zlib values, whether they land in the hash tool's
+    output or a dedicated checksums function."""
+
+    def _checksums(self, text):
+        fn = _first_attr(devkit_tools,
+                         ("checksums", "checksum", "crc_adler", "crc"))
+        if fn is not None:
+            return fn(text)
+        # Folded into the hash tool instead.
+        try:
+            return devkit_tools.hash_text(text, algos=["crc32", "adler32"])
+        except (ValueError, TypeError):
+            self.fail("no checksums tool and hash_text doesn't do crc32/adler32")
+
+    def _pull(self, out, key):
+        if isinstance(out, dict):
+            if key in out:
+                return _uint32(out[key])
+            for wrap in ("result", "value", "checksums"):
+                w = out.get(wrap)
+                if isinstance(w, dict) and key in w:
+                    return _uint32(w[key])
+        return None
+
+    def test_crc32_known_value(self):
+        out = self._checksums("abc")
+        expected = zlib.crc32(b"abc") & 0xFFFFFFFF
+        self.assertEqual(self._pull(out, "crc32"), expected)
+
+    def test_adler32_known_value(self):
+        out = self._checksums("abc")
+        expected = zlib.adler32(b"abc") & 0xFFFFFFFF
+        self.assertEqual(self._pull(out, "adler32"), expected)
+
+
+class DevkitUuidV5Tests(unittest.TestCase):
+    """UUID v5 is a SHA-1 namespace hash — it must be deterministic for a fixed
+    namespace + name and report version 5."""
+
+    def _extract(self, out):
+        cand = TestDevkit._as_list(out)
+        for item in cand:
+            try:
+                return uuid.UUID(str(item))
+            except (ValueError, AttributeError):
+                continue
+        return None
+
+    def _call(self, name):
+        errs = []
+        for kw in ({"version": 5, "namespace": "dns", "name": name},
+                   {"version": 5, "ns": "dns", "name": name},
+                   {"version": 5, "namespace": str(uuid.NAMESPACE_DNS), "name": name},
+                   {"version": 5, "namespace": "url", "name": name}):
+            try:
+                out = devkit_tools.gen_uuid(**kw)
+            except (TypeError, ValueError) as e:
+                errs.append(str(e))
+                continue
+            u = self._extract(out)
+            if u is not None:
+                return u
+        self.fail(f"gen_uuid did not produce a v5 UUID for a namespace+name ({errs})")
+
+    def test_uuid5_is_version_5(self):
+        self.assertEqual(self._call("example.com").version, 5)
+
+    def test_uuid5_is_deterministic(self):
+        self.assertEqual(self._call("example.com"), self._call("example.com"))
+
+    def test_uuid5_differs_by_name(self):
+        self.assertNotEqual(self._call("example.com"), self._call("example.org"))
+
+
+# ==========================================================================
+# 26. consoles/devkit/app.py — POST /api/devkit/hashfile (in-memory file hash)
+#     Raw-body upload, X-Filename header, no disk write, no parsing. Proven
+#     over a live loopback server the same way the scrub upload contract is.
+# ==========================================================================
+class DevkitHashfileTests(unittest.TestCase):
+    SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+    def _free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def setUp(self):
+        app = _devkit_build_app()
+        if "POST /api/devkit/hashfile" not in app.routes:
+            self.fail("devkit hashfile route not registered (POST /api/devkit/hashfile)")
+        self.httpd = None
+        last_error = None
+        for _attempt in range(3):
+            port = self._free_port()
+            try:
+                self.httpd = common.serve(app, port=port, block=False)
+                self.port = port
+                break
+            except OSError as e:
+                last_error = e
+                continue
+        if self.httpd is None:
+            self.skipTest(f"could not bind a loopback test port: {last_error}")
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _post(self, body: bytes, headers: dict):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", "/api/devkit/hashfile", body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def _origin_headers(self, filename="sample.bin"):
+        return {"Origin": f"http://127.0.0.1:{self.port}",
+                "Content-Type": "application/octet-stream",
+                "X-Filename": filename}
+
+    def test_known_bytes_hash_to_known_sha256(self):
+        status, body = self._post(b"abc", self._origin_headers("abc.txt"))
+        self.assertEqual(status, 200)
+        j = json.loads(body)
+        # digests may sit at the top level or under a "hashes"/"result" map
+        digests = j.get("hashes") or j.get("result") or j
+        self.assertEqual(digests.get("sha256"), self.SHA256_ABC)
+        # size + filename echoed back
+        self.assertEqual(j.get("size", j.get("result", {}).get("size")), 3)
+        self.assertIn("abc.txt", json.dumps(j))
+        # the standard digest set is present
+        blob = json.dumps(j)
+        for algo in ("md5", "sha1", "sha512", "blake2b"):
+            self.assertIn(algo, blob)
+
+    def test_empty_body_is_400_not_500(self):
+        status, _ = self._post(b"", self._origin_headers())
+        self.assertEqual(status, 400)
+
+    def test_post_without_origin_refused_403(self):
+        status, _ = self._post(b"abc", {"Content-Type": "application/octet-stream",
+                                        "X-Filename": "abc.txt"})
+        self.assertEqual(status, 403)
+
+    def test_route_carries_a_raised_body_limit(self):
+        # hashfile takes whole files, so it opts into a larger cap like scrub.
+        app = _devkit_build_app()
+        self.assertGreater(app.body_limits.get("POST /api/devkit/hashfile", 0),
+                           0)
+
+
+# ==========================================================================
+# 27. engine/osint_report.py — MTA-STS + TLS-RPT passive email checks
+#     (additive to the email score, same style as _check_dmarc/_check_spf)
+# ==========================================================================
+class MtaStsTlsRptTests(unittest.TestCase):
+    def setUp(self):
+        self.mtasts = getattr(report, "_check_mtasts", None)
+        self.tlsrpt = getattr(report, "_check_tlsrpt", None)
+        if self.mtasts is None or self.tlsrpt is None:
+            self.fail("engine MTA-STS / TLS-RPT checks not present "
+                      "(_check_mtasts / _check_tlsrpt)")
+
+    def test_mtasts_enforce_policy_detected(self):
+        policy = b"version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 604800\n"
+        with mock.patch.object(report.common, "fetch", return_value=(200, policy, {})):
+            out = self.mtasts("example.com")
+        self.assertTrue(out.get("present"))
+        self.assertEqual((out.get("mode") or "").lower(), "enforce")
+
+    def test_mtasts_absent_is_clean_not_crash(self):
+        with mock.patch.object(report.common, "fetch",
+                               side_effect=ValueError("blocked / no policy")):
+            out = self.mtasts("example.com")
+        self.assertIsInstance(out, dict)
+        self.assertFalse(out.get("present"))
+
+    def test_tlsrpt_present_detected(self):
+        rec = "v=TLSRPTv1; rua=mailto:reports@example.com"
+        with mock.patch.object(report, "_txt_values", return_value=[rec]):
+            out = self.tlsrpt("example.com")
+        self.assertTrue(out.get("present"))
+
+    def test_tlsrpt_absent_is_clean_not_crash(self):
+        with mock.patch.object(report, "_txt_values", return_value=[]):
+            out = self.tlsrpt("example.com")
+        self.assertIsInstance(out, dict)
+        self.assertFalse(out.get("present"))
+
+    def test_email_score_folds_in_without_crashing_on_neither(self):
+        # A domain with neither MTA-STS nor TLS-RPT must still score cleanly:
+        # the new signals are additive and, when absent, must not raise. Passed
+        # as kwargs only if _score_email accepts them (variable-max pattern).
+        import inspect
+        spf = {"present": True, "record": "v=spf1 -all", "valid": True, "qualifier": "-"}
+        dmarc = {"present": True, "record": "v=DMARC1; p=reject", "policy": "reject"}
+        dkim = {"found": True, "selector": "default"}
+        params = inspect.signature(report._score_email).parameters
+        kwargs = {}
+        if "mtasts" in params:
+            kwargs["mtasts"] = {"present": False}
+        if "tlsrpt" in params:
+            kwargs["tlsrpt"] = {"present": False}
+        pts, max_pts, findings = report._score_email(spf, dmarc, dkim,
+                                                     mx_present=True, **kwargs)
+        self.assertLessEqual(pts, max_pts)
+        self.assertIsInstance(findings, list)
+
+
+# ==========================================================================
+# 28. consoles/recon/lookups.py — NANP area-code -> US region (pure table,
+#     offline; keyless location for a US phone number)
+# ==========================================================================
+from consoles.recon import lookups as recon_lookups  # noqa: E402
+
+
+class NanpAreaCodeTests(unittest.TestCase):
+    def setUp(self):
+        self.fn = _first_attr(recon_lookups,
+                              ("nanp_region", "_nanp_region", "area_code_region",
+                               "nanp_lookup", "_nanp_lookup", "nanp_area_code"))
+        if self.fn is None:
+            self.fail("recon NANP area-code table not present (expected e.g. nanp_region)")
+
+    def test_known_area_code_returns_us_region(self):
+        # 212 is New York City — unambiguous.
+        out = self.fn("212")
+        text = out if isinstance(out, str) else json.dumps(out)
+        self.assertTrue(text)
+        self.assertIn("york", text.lower())
+
+    def test_known_area_code_accepts_int(self):
+        # A caller might pass the digits as an int; the table shouldn't care.
+        try:
+            out = self.fn(212)
+        except (TypeError, ValueError):
+            self.skipTest("table takes a string area code only")
+        text = out if isinstance(out, str) else json.dumps(out)
+        self.assertIn("york", text.lower())
+
+    def test_unknown_area_code_is_empty_not_a_crash(self):
+        out = self.fn("000")
+        self.assertFalse(out)  # None / "" / {} — a miss, never a raise
+
+
 if __name__ == "__main__":
     unittest.main()

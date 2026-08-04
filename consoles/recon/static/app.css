@@ -20,6 +20,16 @@
 .site-pill a { color: inherit; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-pill a:hover { text-decoration: underline; }
 
+/* -- username site-grid controls: text filter + found-only toggle -- */
+.site-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.site-controls .site-filter { flex: 1 1 220px; margin: 0; }
+.site-foundonly {
+  display: inline-flex; align-items: center; gap: 6px; margin: 0;
+  font-size: 12.5px; font-weight: 600; color: var(--txt-dim); cursor: pointer;
+  text-transform: none; letter-spacing: 0;
+}
+.site-foundonly input { width: auto; margin: 0; }
+
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
 .kv dt { color: var(--txt-faint); text-transform: uppercase; font-size: 10.5px; letter-spacing: .05em; }
 .kv dd { margin: 0 0 6px; color: var(--txt); word-break: break-word; }
@@ -113,3 +123,8 @@
   background: color-mix(in srgb, var(--accent) 12%, transparent); cursor: default;
 }
 .trail-sep { color: var(--txt-faint); }
+
+/* -- takeover result rows. These declarations used to live in an inline
+   style="" attribute, which the strict CSP dropped (rows rendered with no
+   separator); moved here so they actually apply. -- */
+.takeover-row { padding: 8px 0; border-top: 1px solid var(--line); }

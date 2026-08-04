@@ -787,7 +787,17 @@ def analyze(url: str, deep: bool = False) -> dict:
 
     # 2) response headers (already in hand — a token echoed in X-Api-Key / a
     #    Set-Cookie session JWT is a real leak the body scan would miss).
-    hdr_blob = "\n".join(f"{k}: {v}" for k, v in (headers or {}).items())
+    #    common.fetch newline-joins repeated Set-Cookie (see the contract in
+    #    common._collect_headers); split it back out so a secret in ANY cookie
+    #    (not just the last) is scanned as its own labeled line, never glued to
+    #    the next cookie's name.
+    hdr_lines = []
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "set-cookie":
+            hdr_lines += [f"{k}: {cookie}" for cookie in str(v).split("\n")]
+        else:
+            hdr_lines.append(f"{k}: {v}")
+    hdr_blob = "\n".join(hdr_lines)
     if hdr_blob:
         findings += scan_text(hdr_blob, source=f"{url} (response headers)")
         scanned_bytes += len(hdr_blob)

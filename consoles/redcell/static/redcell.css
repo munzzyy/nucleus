@@ -91,6 +91,13 @@ td.mono.small, .small.mono { font-size: 11.5px; }
 
 button.ghost.small, .ghost.small { padding: 5px 10px; font-size: 12px; }
 
+/* ---- secondary button: neutral mid-weight, between the accent primary and the
+   transparent ghost. Referenced by several build/verify buttons and the shared
+   result bars but never defined until now, so it fell back to the primary look. */
+button.secondary, .btn.secondary { background: var(--bg-2); border-color: var(--line-2); color: var(--txt); }
+button.secondary:hover, .btn.secondary:hover { border-color: var(--txt-dim); filter: none; }
+button.secondary.small, .secondary.small { padding: 5px 10px; font-size: 12px; }
+
 /* ---- how-this-works help card (native <details>, no JS needed to toggle) ---- */
 .help-card summary {
   cursor: pointer; font-weight: 650; font-size: 15px; color: var(--txt); list-style: none;

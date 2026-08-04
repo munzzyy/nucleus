@@ -16,13 +16,22 @@
 
     <div class="sys-controls">
       <button id="sys-refresh" class="ghost" type="button">Refresh all</button>
-      <span class="faint small" id="sys-refresh-note">auto-refreshing</span>
+      <button id="sys-pause" class="ghost" type="button" aria-pressed="false">Pause</button>
+      <label for="sys-cadence">cadence</label>
+      <select id="sys-cadence" aria-label="Refresh cadence">
+        <option value="0.5">Fast</option>
+        <option value="1" selected>Normal</option>
+        <option value="2">Relaxed</option>
+        <option value="4">Slow</option>
+      </select>
+      <button id="sys-snapshot" class="ghost" type="button">Download snapshot</button>
+      <span class="faint small" id="sys-updated"></span>
     </div>
 
     <div id="sys-headline" class="grid cols-3 mb"></div>
 
     <div class="section-title">Overview</div>
-    <div id="sys-overview" class="card"></div>
+    <div id="sys-overview"></div>
 
     <div class="section-title">CPU</div>
     <div id="sys-cpu"></div>

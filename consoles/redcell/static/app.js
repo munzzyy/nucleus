@@ -44,6 +44,166 @@
     if (id) clearInterval(id);
   }
 
+  // -- shared UI kit adapters (Phase-2, over window.Nucleus) ------------------
+  // Remembered per-tool / per-tier choices, namespaced per console by N.remember.
+  const LAST_TOOL = N.remember("last-tool");
+  const LAST_TIER = N.remember("last-tier");
+
+  // A filesystem-safe base name from a url/host/label — no extension, the shared
+  // result bar appends one from the mime type.
+  function fnBase(s, prefix) {
+    const core = String(s == null ? "" : s)
+      .replace(/^https?:\/\//i, "").replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "").slice(0, 60) || "result";
+    return prefix ? prefix + "-" + core : core;
+  }
+
+  // Drop the shared Copy / Download bar into a slot under a text output. Rebuilt
+  // each run so re-running never stacks bars; getText is read live on click.
+  function fillSlot(slotId, getText, filenameBase, mime) {
+    const slot = document.getElementById(slotId);
+    if (!slot) return;
+    slot.innerHTML = "";
+    slot.appendChild(N.resultBar({ getText: getText, filename: filenameBase, mime: mime }));
+    slot.classList.remove("hidden");
+  }
+
+  // Append the standard Copy / Copy JSON / Download bar to a result card. `toText`
+  // (optional) yields a human-readable text/markdown form; `json` overrides the
+  // object used for the JSON affordances (defaults to the same `r`).
+  function appendCardBar(card, r, filenameBase, toText, mime, json) {
+    card.appendChild(N.resultBar({
+      getText: toText ? (() => toText(r)) : null,
+      json: json !== undefined ? json : r,
+      filename: filenameBase,
+      mime: mime || (toText ? "text/markdown" : "text/plain"),
+    }));
+    return card;
+  }
+
+  // ---- text/markdown serializers for the export affordances ----------------
+  function analyzeToMarkdown(r) {
+    const L = ["# HTTP security posture — " + (r.url || ""), "",
+      `Grade ${r.grade} · ${r.score_pct}% (${r.points}/${r.max_points} pts)`,
+      `HTTP ${r.status}` + (r.content_type ? " · " + r.content_type : "")];
+    if (r.server) L.push("Server: " + r.server);
+    if (r.title) L.push("Title: " + r.title);
+    L.push("", "## Findings");
+    if (!r.findings || !r.findings.length) L.push("- none");
+    else r.findings.forEach(f => L.push(`- [${f.severity}] ${f.title}: ${f.detail}`));
+    if (r.cookies && r.cookies.length) {
+      L.push("", "## Cookies");
+      r.cookies.forEach(c => L.push(`- ${c.name}: Secure=${c.secure ? "yes" : "no"} · HttpOnly=${c.httponly ? "yes" : "no"} · SameSite=${c.samesite}`));
+    }
+    if (r.disclosures && r.disclosures.length) {
+      L.push("", "## Disclosures");
+      r.disclosures.forEach(d => L.push(`- ${d.header}: ${d.value}`));
+    }
+    return L.join("\n");
+  }
+
+  // The secret-scan export deliberately reports MASKED values only — a downloaded
+  // report or a clipboard copy must never spill live credentials to disk.
+  function secretScanToMarkdown(r) {
+    const c = r.counts || {};
+    const leaks = r.real_leak_count || 0;
+    const L = ["# Secret / API-key leak scan" + (r.url ? " — " + r.url : ""), "",
+      `${leaks} real leak${leaks === 1 ? "" : "s"} found`,
+      `Severity: ${c.critical || 0} critical · ${c.high || 0} high · ${c.medium || 0} medium · ${c.low || 0} low · ${c.info || 0} info`];
+    const findings = r.findings || [];
+    const real = findings.filter(f => !f.public_ok);
+    const pub = findings.filter(f => f.public_ok);
+    L.push("", "## Real leaks");
+    if (!real.length) L.push("- none");
+    else real.forEach(f => L.push(`- [${f.severity}] ${f.rule} — source ${f.source} · ${f.masked}`));
+    if (pub.length) {
+      L.push("", "## Public by design (expected)");
+      pub.forEach(f => L.push(`- [${f.severity}] ${f.rule} — source ${f.source} · ${f.masked}`));
+    }
+    return L.join("\n");
+  }
+
+  // Strip the raw secret material before a scan result is copied/downloaded as
+  // JSON — mirrors the UI's masked-by-default view so an export can't leak keys.
+  function sanitizeSecretResult(r) {
+    let clone;
+    try { clone = JSON.parse(JSON.stringify(r)); } catch (_) { return { ok: r.ok }; }
+    (clone.findings || []).forEach(f => {
+      if (f.match != null) f.match = f.masked || "[redacted]";
+      delete f.snippet;                        // the snippet frames the raw secret
+      if (f.verify) delete f.verify.command;   // the verify command embeds it too
+    });
+    return clone;
+  }
+
+  function tlsToMarkdown(r) {
+    const L = ["# TLS / cipher audit — " + (r.host || ""), "",
+      `Grade ${r.grade} · ${r.score_pct}%` + (r.resolved_ip ? " · " + r.resolved_ip : "")];
+    const protos = r.protocols || {};
+    const pl = Object.keys(protos).map(k =>
+      `${k}: ${protos[k].accepted === true ? "accepted" : protos[k].accepted === false ? "refused" : "?"}`);
+    if (pl.length) L.push("Protocols: " + pl.join(" · "));
+    const cert = r.cert || {};
+    L.push("Cert: issuer " + (cert.issuer || "?") + (cert.trusted ? " · trusted" : " · UNTRUSTED") +
+      (cert.days_left != null ? ` · ${cert.days_left}d left` : ""));
+    L.push("", "## Findings");
+    const fs = r.findings || [];
+    if (!fs.length) L.push("- none");
+    else fs.forEach(f => L.push(`- [${f.severity}] ${f.title}` + (f.detail ? ": " + f.detail : "")));
+    return L.join("\n");
+  }
+
+  function techToMarkdown(r) {
+    const L = ["# Tech-stack fingerprint", "",
+      `${r.count} technolog${r.count === 1 ? "y" : "ies"} detected`, ""];
+    (r.technologies || []).forEach(t => L.push(`- ${t.name} (${t.category} · ${t.confidence})` +
+      (Array.isArray(t.evidence) && t.evidence.length ? " — " + t.evidence.join(" ; ") : "")));
+    return L.join("\n");
+  }
+
+  function jwtToText(r) {
+    return "alg: " + (r.alg || "?") +
+      "\n\nheader:\n" + JSON.stringify(r.header, null, 2) +
+      "\n\nclaims:\n" + JSON.stringify(r.payload, null, 2) +
+      "\n\nfindings:\n" + (r.findings || []).map(f => `- [${f.severity}] ${f.title}`).join("\n");
+  }
+
+  function stressToMarkdown(r) {
+    const t = r.totals || {}, lat = r.latency_overall_ms || {};
+    const L = ["# Resilience / DDoS probe", "",
+      `Grade ${r.grade} · resilience ${r.score}/100`,
+      `${t.requests} requests · peak ${t.peak_rps} rps · ${Math.round((t.distress_rate || 0) * 100)}% failed · ${t.timeouts} timeouts`,
+      `Latency p50/p95/p99: ${lat.p50}/${lat.p95}/${lat.p99} ms`, "", "## Defense verdicts"];
+    (r.verdicts || []).forEach(v => L.push(`- [${v.status}] ${v.area}: ${v.detail}`));
+    if ((r.remediation || []).length) {
+      L.push("", "## Remediation");
+      r.remediation.forEach(i => L.push(`- ${i.area}: ${i.fix}` + (i.verify ? ` (verify: ${i.verify})` : "")));
+    }
+    return L.join("\n");
+  }
+
+  function playbookToMarkdown(report) {
+    const a = report.summary || {};
+    const L = ["# Website assessment — " + (report.name || report.playbook || ""), "",
+      "Target: " + report.target, "Run: " + report.started,
+      `Findings: ${a.critical || 0} critical · ${a.high || 0} high · ${a.medium || 0} medium · ${a.low || 0} low · ${a.info || 0} info`, ""];
+    (report.steps || []).forEach(s => {
+      L.push("## " + s.label + " — " + s.status);
+      if (s.error) { L.push("error: " + s.error, ""); return; }
+      const r = s.result;
+      if (!r) { L.push(""); return; }
+      if (s.kind === "web-analyze") L.push(analyzeToMarkdown(r));
+      else if (s.kind === "secret-scan") L.push(secretScanToMarkdown(r));
+      else {
+        L.push("```", "$ " + (r.argv || []).join(" "), (r.stdout || "").trim() || "(no output)");
+        if (r.stderr && r.stderr.trim()) L.push("[stderr]", r.stderr.trim());
+        L.push("```");
+      }
+      L.push("");
+    });
+    return L.join("\n");
+  }
+
   document.addEventListener("DOMContentLoaded", init);
 
   async function init() {
@@ -62,6 +222,10 @@
     wireTargetField("web-analyze-target");
     wireTargetField("secret-scan-target");
     wireTargetField("stress-probe-target");
+    wireTargetField("tls-audit-target");
+    wireTargetField("techfp-target");
+    wireTargetField("stress-verify-target");
+    wireTargetField("stress-build-url");
     document.getElementById("hist-refresh").addEventListener("click", loadHistory);
     document.getElementById("outputs-refresh").addEventListener("click", loadOutputs);
     await loadInventory(false);
@@ -202,10 +366,6 @@
     args.addEventListener("input", updateExpertPreview);
     args.addEventListener("keydown", e => { if (e.key === "Enter" && !btn.disabled) runExpert(); });
     btn.addEventListener("click", runExpert);
-    document.getElementById("x-copy").addEventListener("click", () => {
-      const text = document.getElementById("x-output").textContent;
-      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
-    });
   }
 
   async function runExpert() {
@@ -217,7 +377,6 @@
     btn.disabled = true;
     out.classList.remove("hidden");
     out.textContent = "running " + tool + " …";
-    document.getElementById("x-copy").classList.remove("hidden");
     expertTickerId = tickerStart("x-status", "running " + tool);
     try {
       const r = await N.post("/api/expert", {
@@ -240,6 +399,7 @@
       N.toast(e.message || "expert run failed", "bad");
     } finally {
       btn.disabled = !expertGateOk();
+      fillSlot("x-actions", () => out.textContent, fnBase(tool, "redcell-expert"), "text/plain");
     }
   }
 
@@ -382,7 +542,10 @@
       sel.appendChild(N.el("option", { value: r.key, text: r.key
         + (r.installed ? "" : "  (not installed)") + (r.known_broken ? "  ⚠ known broken" : "") }));
     });
-    sel.onchange = renderRunnerDetail;
+    // Reopen on the tool you used last, when it's still in this box's inventory.
+    const remembered = LAST_TOOL.get("");
+    if (remembered && Array.from(sel.options).some(o => o.value === remembered)) sel.value = remembered;
+    sel.onchange = () => { LAST_TOOL.set(sel.value); renderRunnerDetail(); };
     renderRunnerDetail();
   }
 
@@ -442,10 +605,6 @@
   function wireRunner() {
     const runBtn = document.getElementById("run-btn");
     runBtn.addEventListener("click", runSafeTool);
-    document.getElementById("run-copy").addEventListener("click", () => {
-      const text = document.getElementById("run-output").textContent;
-      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
-    });
     // Enter-to-run on the target field, same pattern as Bastion's report-domain —
     // respects the auth-gate disabled state so it can't fire before authorization.
     document.getElementById("run-target").addEventListener("keydown", e => {
@@ -478,6 +637,7 @@
         const hasTool = Array.from(sel.options).some(o => o.value === tool);
         if (!hasTool) { N.toast("tool inventory still loading — try again in a second", "bad"); return; }
         sel.value = tool;
+        LAST_TOOL.set(tool);
         renderRunnerDetail();
         document.getElementById("run-target").focus();
       });
@@ -509,7 +669,6 @@
 
     out.classList.remove("hidden");
     out.textContent = "";
-    document.getElementById("run-copy").classList.remove("hidden");
     document.getElementById("run-btn").disabled = true;
     runTickerId = tickerStart("run-status", "running " + spec.key);
     try {
@@ -530,6 +689,7 @@
       N.toast("run refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
     } finally {
       document.getElementById("run-btn").disabled = !authorized;
+      fillSlot("run-actions", () => out.textContent, fnBase(spec.key, "redcell-run"), "text/plain");
     }
   }
 
@@ -594,10 +754,6 @@
     }
     function wire() {
       document.getElementById(ids.buildBtn).addEventListener("click", build);
-      document.getElementById(ids.copyBtn).addEventListener("click", () => {
-        const text = document.getElementById(ids.result).textContent;
-        navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
-      });
     }
     async function build() {
       const spec = currentSpec();
@@ -610,6 +766,9 @@
         const r = await N.post("/api/build", { tool: spec.key, params });
         document.getElementById(ids.result).textContent = r.command;
         document.getElementById(ids.resultWrap).classList.remove("hidden");
+        // Copy the command or keep it as a runnable .sh — via the shared kit.
+        fillSlot(ids.actions, () => document.getElementById(ids.result).textContent,
+                 fnBase(spec.key, "redcell-command"), "application/x-sh");
       } catch (e) {
         N.toast("build failed: " + e.message, "bad");
       }
@@ -631,11 +790,11 @@
 
   const buildPanel = makeBuilderPanel({
     select: "build-tool", desc: "build-desc", note: "build-note", fields: "build-fields",
-    buildBtn: "build-btn", resultWrap: "build-result-wrap", result: "build-result", copyBtn: "build-copy",
+    buildBtn: "build-btn", resultWrap: "build-result-wrap", result: "build-result", actions: "build-actions",
   });
   const pwBuildPanel = makeBuilderPanel({
     select: "pw-build-tool", desc: "pw-build-desc", note: "pw-build-note", fields: "pw-build-fields",
-    buildBtn: "pw-build-btn", resultWrap: "pw-build-result-wrap", result: "pw-build-result", copyBtn: "pw-build-copy",
+    buildBtn: "pw-build-btn", resultWrap: "pw-build-result-wrap", result: "pw-build-result", actions: "pw-build-actions",
   }, b => b.key === "hashcat" || b.key === "john");
 
   function renderBuilderSelect() { buildPanel.renderSelect(); pwBuildPanel.renderSelect(); }
@@ -846,11 +1005,17 @@
     const authorized = gateChecked();
     const lab = labChecked();
     const agg = { critical: 0, high: 0, medium: 0, low: 0, info: 0, ran: [] };
+    // Assemble a downloadable assessment client-side (no new server state): each
+    // step's raw result plus the rolled-up counts become one JSON/Markdown report.
+    const report = { playbook: pb.key, name: pb.name, target: target,
+                     started: new Date().toISOString(), summary: agg, steps: [] };
 
     for (const se of stepEls) {
       if (!se.checkbox.checked) {
         se.statusPill.textContent = "skipped";
         se.statusPill.className = "pill pb-status";
+        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
+                            tool: se.step.tool, status: "skipped" });
         continue;
       }
       se.statusPill.className = "pill pb-status warn";
@@ -860,13 +1025,14 @@
         se.statusPill.textContent = `running — ${((Date.now() - started) / 1000).toFixed(1)}s`;
       }, 200);
       try {
-        let node;
+        let node, stepResult = null;
         if (se.step.kind === "web-analyze") {
           const r = await N.post("/api/web-analyze", { url: targetForKind(target, "url"), authorized, lab, proceed_exposed: opsecOverride() });
           if (r.ok === false) throw Object.assign(new Error(r.error || "analysis failed"), { body: r });
           agg.high += r.counts.high; agg.medium += r.counts.medium; agg.low += r.counts.low;
           agg.ran.push(`header/CORS analysis: grade ${r.grade}`);
           node = buildAnalyzeCard(r);
+          stepResult = r;
         } else if (se.step.kind === "secret-scan") {
           const r = await N.post("/api/secret-scan", { url: targetForKind(target, "url"), authorized, lab, proceed_exposed: opsecOverride() });
           if (r.ok === false) throw Object.assign(new Error(r.error || "secret scan failed"), { body: r });
@@ -875,15 +1041,19 @@
           const leaks = r.real_leak_count || 0;
           agg.ran.push(`secret scan: ${leaks} real leak${leaks === 1 ? "" : "s"}`);
           node = buildSecretScanCard(r);
+          stepResult = sanitizeSecretResult(r);   // never bundle raw secrets into the export
         } else {
           const stepTarget = targetForKind(target, runnerKind(se.step.tool));
           const body = { tool: se.step.tool, target: stepTarget, authorized, lab, options: se.step.options || {}, proceed_exposed: opsecOverride() };
           if (se.step.needs_wordlist) body.wordlist = PB_WORDLIST_ID;
           const r = await N.post("/api/run", body);
           node = buildRunResultNode(r);
+          stepResult = r;
           const hasOutput = !!(r.stdout && r.stdout.trim());
           agg.ran.push(`${se.step.tool}: ${hasOutput ? "returned output" : "no output"}`);
         }
+        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
+                            tool: se.step.tool, status: "done", result: stepResult });
         clearInterval(se.ticker); se.ticker = null;
         se.statusPill.textContent = "done";
         se.statusPill.className = "pill pb-status ok";
@@ -907,10 +1077,14 @@
           "error: " + ((e.body && e.body.error) ? e.body.error : e.message) }));
         se.resultBox.classList.remove("hidden");
         agg.ran.push(`${stepKindLabel(se.step)}: failed`);
+        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
+                            tool: se.step.tool, status: "failed",
+                            error: (e.body && e.body.error) ? e.body.error : e.message });
       }
     }
 
     renderPlaybookSummary(agg);
+    appendPlaybookExport(report);
     PB_RUNNING = false;
     startBtn.textContent = "Run again";
     refreshPlaybookRunButton();
@@ -933,6 +1107,19 @@
         [N.el("span", { class: "dot" }), document.createTextNode(`${n} ${sev}`)])));
     el.appendChild(counts);
     el.appendChild(N.el("p", { class: "sub mt-8", text: agg.ran.join(" · ") || "no steps ran" }));
+  }
+
+  // One downloadable report for the whole assessment — every step's result bundled
+  // into JSON or Markdown, assembled client-side (no new server state), via the kit.
+  function appendPlaybookExport(report) {
+    const el = document.getElementById("pb-summary");
+    el.appendChild(N.el("div", { class: "section-title mt", text: "Export assessment" }));
+    el.appendChild(N.resultBar({
+      getText: () => playbookToMarkdown(report),
+      json: report,
+      filename: fnBase(report.target, "redcell-assessment"),
+      mime: "text/markdown",
+    }));
   }
 
   // $ argv header + raw stdout/stderr, same shape as the Run tab's own
@@ -1058,7 +1245,7 @@
     if (c.subject_cn) certBits.push(`CN ${c.subject_cn}`);
     wrap.appendChild(N.el("p", { class: "sub mono small", text: "cert: " + certBits.join(" · ") }));
     wrap.appendChild(buildFindingList(r.findings));
-    return wrap;
+    return appendCardBar(wrap, r, fnBase(r.host, "redcell-tls"), tlsToMarkdown);
   }
 
   function buildTechCard(r) {
@@ -1081,7 +1268,7 @@
       list.appendChild(row);
     });
     wrap.appendChild(list);
-    return wrap;
+    return appendCardBar(wrap, r, "redcell-tech", techToMarkdown);
   }
 
   function buildJwtCard(r) {
@@ -1102,7 +1289,7 @@
         if (cmd) { const p = N.el("pre", { class: "term" }); p.textContent = cmd; wrap.appendChild(p); }
       });
     }
-    return wrap;
+    return appendCardBar(wrap, r, "redcell-jwt", jwtToText, "text/plain");
   }
 
   async function runTlsAudit() {
@@ -1240,9 +1427,7 @@
     valueRow.appendChild(valueEl);
     const revealBtn = N.el("button", { type: "button", class: "ghost small", text: "Reveal" });
     const copyBtn = N.el("button", { type: "button", class: "ghost small hidden", text: "Copy" });
-    copyBtn.addEventListener("click", () => {
-      navigator.clipboard.writeText(f.match).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
-    });
+    copyBtn.addEventListener("click", () => N.copy(f.match));
     let revealed = false;
     revealBtn.addEventListener("click", () => {
       revealed = !revealed;
@@ -1280,9 +1465,7 @@
         vReveal.textContent = vShown ? "Hide command" : "Reveal command";
         vCopy.classList.toggle("hidden", !vShown);
       });
-      vCopy.addEventListener("click", () => {
-        navigator.clipboard.writeText(v.command).then(() => N.toast("command copied", "ok"), () => N.toast("copy failed", "bad"));
-      });
+      vCopy.addEventListener("click", () => N.copy(v.command, "command copied"));
       ctl.appendChild(vReveal);
       ctl.appendChild(vCopy);
       box.appendChild(ctl);
@@ -1384,6 +1567,14 @@
     }
     card.appendChild(footer);
 
+    // Export uses the sanitized result (masked values only) so a copied/downloaded
+    // report can't spill live credentials to the clipboard or disk.
+    card.appendChild(N.resultBar({
+      getText: () => secretScanToMarkdown(r),
+      json: sanitizeSecretResult(r),
+      filename: fnBase(r.url || "site", "redcell-secretscan"),
+      mime: "text/markdown",
+    }));
     return card;
   }
 
@@ -1402,7 +1593,8 @@
     const card = N.el("div", { class: "analyze-card" });
 
     const gradeRow = N.el("div", { class: "grade-row" });
-    gradeRow.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade }));
+    gradeRow.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade,
+      role: "img", "aria-label": "Grade " + r.grade }));
     const meta = N.el("div", { class: "grade-meta" });
     meta.appendChild(N.el("div", { class: "grade-score", text: `${r.score_pct}%  (${r.points}/${r.max_points} pts)` }));
     meta.appendChild(N.el("div", { class: "sub mono", text:
@@ -1470,7 +1662,7 @@
     card.appendChild(N.el("div", { class: "section-title", text: "CORS" }));
     card.appendChild(buildCorsVerdict(r.cors));
 
-    return card;
+    return appendCardBar(card, r, fnBase(r.url, "redcell-headers"), analyzeToMarkdown);
   }
 
   function buildCorsVerdict(cors) {
@@ -1598,7 +1790,7 @@
     const list = N.el("div", { class: "hash-candidates" });
     r.candidates.forEach((c, idx) => list.appendChild(buildHashCandidateCard(c, idx === 0)));
     wrap.appendChild(list);
-    return wrap;
+    return appendCardBar(wrap, r, "redcell-hash-id");
   }
 
   function buildHashCandidateCard(c, top) {
@@ -1641,9 +1833,7 @@
     const row = N.el("div", { class: "cmd-line" });
     row.appendChild(N.el("code", { class: "mono small", text: cmd }));
     const btn = N.el("button", { type: "button", class: "ghost small", text: "Copy" });
-    btn.addEventListener("click", () => {
-      navigator.clipboard.writeText(cmd).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad"));
-    });
+    btn.addEventListener("click", () => N.copy(cmd));
     row.appendChild(btn);
     return row;
   }
@@ -1713,8 +1903,19 @@
     const tbody = document.querySelector("#hist-table tbody");
     tbody.innerHTML = "";
     const empty = document.getElementById("hist-empty");
-    if (!j.runs.length) { empty.classList.remove("hidden"); return; }
+    const table = document.getElementById("hist-table");
+    // Honest empty state: the on-disk trail is off by default, so "nothing here"
+    // means "logging is off", not "broken" — say so instead of an empty table.
+    if (!j.runs.length) {
+      empty.innerHTML = "";
+      empty.appendChild(N.stateCard("empty",
+        "No runs recorded here. On-disk run history is off by default — set NUCLEUS_LOGGING=1 to keep a trail. Runs still execute and show inline; they're just not persisted."));
+      empty.classList.remove("hidden");
+      table.classList.add("hidden");
+      return;
+    }
     empty.classList.add("hidden");
+    table.classList.remove("hidden");
     j.runs.forEach(r => {
       const tr = N.el("tr");
       tr.appendChild(N.el("td", { class: "mono small muted", text: r.ts || "" }));
@@ -1755,7 +1956,13 @@
     const list = document.getElementById("outputs-list");
     const empty = document.getElementById("outputs-empty");
     list.innerHTML = "";
-    if (!files.length) { empty.classList.remove("hidden"); return; }
+    if (!files.length) {
+      empty.innerHTML = "";
+      empty.appendChild(N.stateCard("empty",
+        "No saved outputs. Full tool output (nmap XML, nuclei JSON, and the like) is written to disk only when NUCLEUS_LOGGING=1 — off by default, so this is expected, not a failure."));
+      empty.classList.remove("hidden");
+      return;
+    }
     empty.classList.add("hidden");
     files.forEach(f => {
       const row = N.el("div", { class: "output-row" });
@@ -1766,6 +1973,15 @@
       const viewBtn = N.el("button", { class: "ghost", type: "button", text: "View" });
       viewBtn.addEventListener("click", () => viewOutput(f.name));
       row.appendChild(viewBtn);
+      // Real download of the saved file — fetch it and hand it to N.download.
+      const dlBtn = N.el("button", { class: "secondary", type: "button", text: "Download" });
+      dlBtn.addEventListener("click", async () => {
+        dlBtn.disabled = true;
+        try { N.download(f.name, await fetchOutputFile(f.name), "text/plain"); }
+        catch (e) { N.toast("download failed: " + (e.message || "error"), "bad"); }
+        finally { dlBtn.disabled = false; }
+      });
+      row.appendChild(dlBtn);
       list.appendChild(row);
     });
   }
@@ -1819,7 +2035,10 @@
       customRow.classList.toggle("hidden", !isCustom);
       if (breakerLine) breakerLine.classList.toggle("hidden", !isCustom);
     };
-    tierSel.addEventListener("change", syncCustomRow);
+    // Reopen on the intensity you picked last.
+    const rememberedTier = LAST_TIER.get("");
+    if (rememberedTier && Array.from(tierSel.options).some(o => o.value === rememberedTier)) tierSel.value = rememberedTier;
+    tierSel.addEventListener("change", () => { LAST_TIER.set(tierSel.value); syncCustomRow(); });
     syncCustomRow();
     document.getElementById("stress-build-btn").addEventListener("click", buildLoadTest);
   }
@@ -1956,7 +2175,8 @@
     }
     // Headline: grade + key totals — reuses the analyzer's grade-row look.
     const head = N.el("div", { class: "grade-row" });
-    head.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade }));
+    head.appendChild(N.el("div", { class: "grade-badge grade-" + r.grade, text: r.grade,
+      role: "img", "aria-label": "Grade " + r.grade }));
     const meta = N.el("div", { class: "grade-meta" });
     // For a custom run, name the load the operator dialed in; else the tier.
     let intensity = "tier " + r.tier;
@@ -2052,7 +2272,7 @@
       r.notes.forEach(n => notes.appendChild(N.el("p", { class: "faint small", text: n })));
       wrap.appendChild(notes);
     }
-    return wrap;
+    return appendCardBar(wrap, r, "redcell-resilience", stressToMarkdown);
   }
 
   async function buildLoadTest() {
@@ -2073,12 +2293,22 @@
           out.appendChild(N.el("div", { class: "small faint", text: f.name }));
           const pre = N.el("pre", { class: "term", text: f.content });
           out.appendChild(pre);
-          out.appendChild(mkCopyBtn(f.content));
+          const bar = N.el("div", { class: "result-bar" });
+          bar.appendChild(mkCopyBtn(f.content));
+          const dl = N.el("button", { type: "button", class: "secondary small", text: "Download" });
+          dl.addEventListener("click", () => N.download(f.name, f.content, "text/plain"));
+          bar.appendChild(dl);
+          out.appendChild(bar);
         });
       }
       if (r.command) {
         out.appendChild(N.el("pre", { class: "term", text: r.command }));
-        out.appendChild(mkCopyBtn(r.command));
+        const bar = N.el("div", { class: "result-bar" });
+        bar.appendChild(mkCopyBtn(r.command));
+        const dl = N.el("button", { type: "button", class: "secondary small", text: "Download .sh" });
+        dl.addEventListener("click", () => N.download("loadtest.sh", "#!/bin/sh\n" + r.command + "\n", "application/x-sh"));
+        bar.appendChild(dl);
+        out.appendChild(bar);
       }
       out.appendChild(N.el("p", { class: "faint small mt-8", text: r.note || "" }));
       out.appendChild(N.el("p", { class: "faint small", text:
@@ -2089,9 +2319,8 @@
   }
 
   function mkCopyBtn(text) {
-    const btn = N.el("button", { type: "button", class: "secondary small mt-8", text: "Copy" });
-    btn.addEventListener("click", () =>
-      navigator.clipboard.writeText(text).then(() => N.toast("copied", "ok"), () => N.toast("copy failed", "bad")));
+    const btn = N.el("button", { type: "button", class: "secondary small", text: "Copy" });
+    btn.addEventListener("click", () => N.copy(text));
     return btn;
   }
 })();

@@ -45,6 +45,7 @@ import string
 import sys
 import time
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 
 from shared import common
@@ -146,6 +147,62 @@ def hash_text(text, algos=None, algo=None) -> dict:
         h.update(data)
         out[key] = h.hexdigest()
     return out
+
+
+# The set the file-hash upload returns. Deliberately narrower than the text
+# tool's default (no sha3_256) — these are the digests people actually paste
+# into a "verify this download" box.
+FILE_HASHES = ("md5", "sha1", "sha256", "sha512", "blake2b")
+
+
+def hash_file_bytes(data, algos=None) -> dict:
+    """Hex digests of raw file bytes, hashed entirely in memory.
+
+    Backs the file-hash upload route: the handler passes the request body
+    straight in, and this never touches the filesystem and never parses the
+    content — it only feeds the bytes to hashlib. Same {algo: hexdigest} shape
+    as hash_text; the default set is FILE_HASHES.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("data must be bytes")
+    wanted = list(algos) if algos else list(FILE_HASHES)
+    out: dict = {}
+    for name in wanted:
+        key = str(name).lower()
+        try:
+            h = hashlib.new(key)
+        except (ValueError, TypeError):
+            raise ValueError(f"unknown hash algorithm: {name}")
+        h.update(data)
+        out[key] = h.hexdigest()
+    return out
+
+
+def hmac_digest(text, key, algo="sha256") -> dict:
+    """HMAC of `text` under `key`, as hex. `algo` is any hashlib name (default
+    sha256). Local and pure — no key is ever fetched, stored, or written."""
+    algo = str(algo or "sha256").lower()
+    try:
+        hashlib.new(algo)  # validate the name before it reaches hmac
+    except (ValueError, TypeError):
+        raise ValueError(f"unknown hash algorithm: {algo}")
+    try:
+        mac = hmac.new(_to_bytes(key), _to_bytes(text), algo).hexdigest()
+    except (ValueError, TypeError) as e:
+        # e.g. a hash that HMAC can't drive (no block_size)
+        raise ValueError(f"cannot HMAC with {algo}: {e}")
+    return {"hmac": mac, "algo": algo}
+
+
+def checksums(text) -> dict:
+    """CRC32 and Adler32 of `text` (UTF-8). These are error-detection
+    checksums, not cryptographic hashes — returned as zero-padded 8-char hex
+    and as the raw unsigned 32-bit integer."""
+    b = _to_bytes(text)
+    crc = zlib.crc32(b) & 0xffffffff
+    adler = zlib.adler32(b) & 0xffffffff
+    return {"crc32": "%08x" % crc, "crc32_int": crc,
+            "adler32": "%08x" % adler, "adler32_int": adler}
 
 
 # --------------------------------------------------------------------------
@@ -322,11 +379,41 @@ def json_tool(text, mode: str = "pretty", sort_keys: bool = False) -> dict:
 # --------------------------------------------------------------------------
 # generators (all cryptographically strong via `secrets`)
 # --------------------------------------------------------------------------
-def gen_uuid(version=4, count=1) -> dict:
+_UUID_NAMESPACES = {
+    "dns": uuid.NAMESPACE_DNS, "url": uuid.NAMESPACE_URL,
+    "oid": uuid.NAMESPACE_OID, "x500": uuid.NAMESPACE_X500,
+}
+
+
+def _resolve_uuid_ns(namespace) -> uuid.UUID:
+    """A v3/v5 namespace is one of the four well-known names (dns/url/oid/x500)
+    or any UUID string. Empty defaults to the DNS namespace."""
+    if namespace is None or str(namespace).strip() == "":
+        return uuid.NAMESPACE_DNS
+    key = str(namespace).strip().lower()
+    if key in _UUID_NAMESPACES:
+        return _UUID_NAMESPACES[key]
+    try:
+        return uuid.UUID(str(namespace).strip())
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("namespace must be dns/url/oid/x500 or a UUID string")
+
+
+def gen_uuid(version=4, count=1, namespace=None, name=None) -> dict:
     version = int(version)
+    # v3/v5 are name-based (deterministic): a namespace UUID + a name hash to
+    # the same UUID every time, so `count` is meaningless — return the one.
+    if version in (3, 5):
+        if name is None or str(name) == "":
+            raise ValueError(f"uuid v{version} needs a name")
+        ns = _resolve_uuid_ns(namespace)
+        make = uuid.uuid5 if version == 5 else uuid.uuid3
+        u = make(ns, str(name))
+        return {"uuids": [str(u)], "version": version,
+                "namespace": str(ns), "name": str(name)}
     count = _capcount(count, 100)
     if version not in (1, 4):
-        raise ValueError("uuid version must be 1 or 4")
+        raise ValueError("uuid version must be 1, 3, 4, or 5")
     make = uuid.uuid4 if version == 4 else uuid.uuid1
     return {"uuids": [str(make()) for _ in range(count)], "version": version}
 

@@ -16,10 +16,23 @@
 
     <div class="card nudge hidden" id="keys-nudge"></div>
 
+    <div class="card searchbar">
+      <div class="field grow">
+        <label for="q">Search anything</label>
+        <input type="text" id="q" name="q" autocomplete="off" spellcheck="false"
+               placeholder="username, email, domain, IP, phone, hash…">
+      </div>
+      <div class="field fit">
+        <button type="button" id="hub-search-go">Scan in Recon</button>
+      </div>
+      <p class="faint small m0" id="hub-search-hint">Opens Recon with this target and runs it.</p>
+    </div>
+
     <div class="section-title">Consoles</div>
-    <div class="grid cols-3" id="consoles"><p class="faint">Loading…</p></div>
+    <div class="grid cols-3" id="consoles"></div>
 
     <div class="grid cols-3 mt" id="stats"></div>
+    <div id="overview-bar"></div>
 
     <div class="section-title">Connected local apps</div>
     <div class="grid cols-3" id="apps"></div>

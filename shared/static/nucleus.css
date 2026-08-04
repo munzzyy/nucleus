@@ -206,6 +206,46 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 .kbd { font-family: var(--mono); font-size: 12px; background: var(--bg-2); border: 1px solid var(--line-2);
   border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; color: var(--txt-dim); }
 
+/* ---- shared UI kit (N.copy / N.download / N.resultBar / N.stateCard) ---- */
+
+/* Visually hidden but still read by screen readers. Used by N.announce's live
+   region, by the "found / not found" word on colour-coded pills, and as the
+   parking spot for the temporary <a download> N.download clicks. */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* The execCommand('copy') fallback textarea. Off-screen rather than clipped:
+   a clipped textarea can't reliably be selected, and selection is the whole
+   mechanism of that fallback. */
+.copy-fallback { position: fixed; top: -1000px; left: 0; width: 1px; height: 1px; opacity: 0; }
+
+/* Wrap any table that can outgrow its card in <div class="table-scroll"> so the
+   table scrolls sideways inside the card instead of stretching the page. */
+.table-scroll { overflow-x: auto; }
+
+/* The standard row of result affordances (copy / copy JSON / download). */
+.result-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.result-bar button, .result-bar .btn { padding: 7px 12px; font-size: 13px; }
+
+/* N.stateCard — one look for loading / empty / error everywhere. An error is
+   RED and role=alert; "nothing found" stays muted. They must never look alike. */
+.state-loading, .state-empty, .state-error { display: flex; align-items: center; gap: 10px; }
+.state-loading .state-msg, .state-empty .state-msg { color: var(--txt-dim); font-size: 13.5px; }
+.state-error { border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+  background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.state-error .state-msg { color: var(--bad); font-size: 13.5px; }
+
+/* Skeleton placeholder for a value that's still loading. */
+.skel { display: inline-block; min-width: 60px; height: 1em; border-radius: 5px; vertical-align: middle;
+  background: linear-gradient(90deg, var(--bg-2), var(--bg-3), var(--bg-2));
+  background-size: 200% 100%; animation: skelshift 1.3s ease-in-out infinite; }
+.skel.wide { min-width: 100%; height: 13px; }
+.skel.tall { height: 30px; min-width: 90px; }
+@keyframes skelshift { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .skel { animation: none; }
+}
+
 /* ---- utilities (replace inline style= attrs, which the strict CSP drops) ---- */
 .brand-link { text-decoration: none; color: inherit; }
 .field.grow  { flex: 3 1 320px; }

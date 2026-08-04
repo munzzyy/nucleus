@@ -13,18 +13,27 @@
   const resourcesEl = document.getElementById("resources");
   const resSearch = document.getElementById("res-search");
   const resultsToolbar = document.getElementById("results-toolbar");
-  const btnCopyJson = document.getElementById("res-copy-json");
-  const btnCopyMd = document.getElementById("res-copy-md");
-  const btnDownload = document.getElementById("res-download");
   const historyWrap = document.getElementById("recon-history-wrap");
   const historyList = document.getElementById("recon-history");
+  const historyNote = document.getElementById("recon-history-note");
   const trailEl = document.getElementById("pivot-trail");
 
   let lastScanData = null;
   let lastScanQuery = "";
+  let lastTakeoverData = null;
+  let lastUsernameSites = [];
   let scanTicker = null;
+  let siteFilterTimer = null;
   let pivotTrail = [];
   const MAX_TRAIL = 8;
+
+  // Client-side memory via the shared kit (namespaced per console).
+  const recentsStore = N.remember("recents");
+  const lastTypeStore = N.remember("last-type");
+  const RECENTS_MAX = 12;
+  // Mirror takeover._MAX_SUBS_PER_REQUEST so the one-click "check these for
+  // takeover" button never sends more than the server will accept.
+  const TAKEOVER_MAX_SUBS = 200;
 
   const TYPE_LABEL = {
     username: "Username", email: "Email", domain: "Domain", ip: "IP address",
@@ -69,7 +78,7 @@
   // handled by one delegated listener on #results (see launchPivot below).
   function pivotChip(value, type) {
     if (!value) return "";
-    return `<button type="button" class="pivot-chip" data-pivot-value="${esc(value)}" data-pivot-type="${esc(type)}">⇢ scan</button>`;
+    return `<button type="button" class="pivot-chip" data-pivot-value="${esc(value)}" data-pivot-type="${esc(type)}" aria-label="Scan ${esc(value)}">⇢ scan</button>`;
   }
 
   function pivotRow(value, type) {
@@ -158,20 +167,71 @@
   }
 
   // -- per-module renderers ---------------------------------------------------
+  // One site pill, with a visually-hidden status word so found/not-found is
+  // conveyed to a screen reader, not by colour alone.
+  function sitePill(s) {
+    const kind = s.found === true ? "found" : s.found === false ? "notfound" : "unknown";
+    const word = s.found === true ? "found" : s.found === false ? "not found" : "unconfirmed";
+    const inner = s.url
+      ? `<a href="${esc(N.safeUrl(s.url))}" target="_blank" rel="noopener noreferrer" title="${esc(s.note)}">${esc(s.site)}</a>`
+      : `<span title="${esc(s.note)}">${esc(s.site)}</span>`;
+    return `<div class="site-pill ${kind}" role="listitem"><span class="dot"></span>${inner}`
+      + `<span class="sr-only"> — ${word}</span></div>`;
+  }
+
+  // found → unconfirmed → not-found, stable within each rank so the server's
+  // priority ordering (curated high-signal sites first) survives the sort.
+  function foundRank(f) { return f === true ? 0 : (f === false ? 2 : 1); }
+  function sortedSites(sites) {
+    return sites
+      .map((s, i) => [s, i])
+      .sort((a, b) => (foundRank(a[0].found) - foundRank(b[0].found)) || (a[1] - b[1]))
+      .map(x => x[0]);
+  }
+  function renderSiteGrid(sites) { return sortedSites(sites).map(sitePill).join(""); }
+
+  function applyUsernameFilter() {
+    const grid = document.getElementById("site-grid");
+    if (!grid) return;
+    const filterEl = document.getElementById("site-filter");
+    const foundOnlyEl = document.getElementById("site-found-only");
+    const countEl = document.getElementById("site-count");
+    const q = ((filterEl && filterEl.value) || "").trim().toLowerCase();
+    const foundOnly = !!(foundOnlyEl && foundOnlyEl.checked);
+    let list = lastUsernameSites;
+    if (foundOnly) list = list.filter(s => s.found === true);
+    if (q) list = list.filter(s => (s.site || "").toLowerCase().includes(q));
+    grid.innerHTML = list.length ? renderSiteGrid(list)
+      : '<p class="faint" role="listitem">no sites match</p>';
+    if (countEl) countEl.textContent = `${list.length} of ${lastUsernameSites.length} shown`;
+  }
+
+  function wireUsernameControls() {
+    const filterEl = document.getElementById("site-filter");
+    const foundOnlyEl = document.getElementById("site-found-only");
+    if (filterEl) filterEl.addEventListener("input", () => {
+      clearTimeout(siteFilterTimer);
+      siteFilterTimer = setTimeout(applyUsernameFilter, 140);
+    });
+    if (foundOnlyEl) foundOnlyEl.addEventListener("change", applyUsernameFilter);
+    applyUsernameFilter();  // sets the initial "N of M shown" count
+  }
+
   function renderUsername(m) {
-    const sites = (m.sites || []).map(s => {
-      const kind = s.found === true ? "found" : s.found === false ? "notfound" : "unknown";
-      const inner = s.url
-        ? `<a href="${esc(N.safeUrl(s.url))}" target="_blank" rel="noopener noreferrer" title="${esc(s.note)}">${esc(s.site)}</a>`
-        : `<span title="${esc(s.note)}">${esc(s.site)}</span>`;
-      return `<div class="site-pill ${kind}"><span class="dot"></span>${inner}</div>`;
-    }).join("");
+    lastUsernameSites = m.sites || [];
     const summary = `<div class="badge-row">
         ${pill("ok", `${m.found_count} found`)}
         ${pill("bad", `${m.not_found_count} not found`)}
         ${pill("warn", `${m.unknown_count} unknown`)}
         <span class="faint">checked ${m.checked}${m.total_available ? ` of ${m.total_available}` : ""} sites in ${m.took_ms}ms${m.dataset ? ` · ${esc(m.dataset)}` : ""}</span>
       </div>`;
+    const controls = `<div class="site-controls">
+        <input type="search" id="site-filter" class="site-filter" autocomplete="off" spellcheck="false"
+               placeholder="filter sites…" aria-label="Filter checked sites">
+        <label class="site-foundonly"><input type="checkbox" id="site-found-only"> found only</label>
+        <span class="faint small" id="site-count"></span>
+      </div>`;
+    const grid = `<div class="site-grid" id="site-grid" role="list">${renderSiteGrid(lastUsernameSites)}</div>`;
     const sampleNote = (m.total_available && m.checked < m.total_available)
       ? `<p class="faint mt small">Sample within the time budget — ${m.total_available - m.checked} more sites weren't checked. Re-run to cover more.</p>`
       : "";
@@ -183,7 +243,7 @@
         ["Created", m.github.created_at], ["Blog", m.github.blog], ["Location", m.github.location],
       ]));
     }
-    return card("Username", summary + `<div class="site-grid">${sites}</div>` + sampleNote) + githubCard;
+    return card("Username", summary + controls + grid + sampleNote) + githubCard;
   }
 
   function renderEmail(m) {
@@ -191,7 +251,11 @@
     const an = m.breach_analytics || {};
     const gv = m.gravatar || {};
     const k = m.keyed || {};
+    // The local-part is a common username elsewhere — offer a one-click pivot
+    // that re-runs the username scan on it.
+    const localPart = (m.input || "").split("@")[0];
     const summary = kv([
+      ["Local part", localPart ? raw(pivotValue(localPart, "username")) : ""],
       ["Domain", m.domain ? raw(pivotValue(m.domain, "domain")) : ""],
       ["Breached", bc.ok ? (bc.breached ? `yes — ${bc.breaches.length} breach(es)` : "no known exposure") : "check failed"],
       ["Risk", an.risk_label ? `${an.risk_label} (${an.risk_score})` : "n/a"],
@@ -291,9 +355,13 @@
     const stSrc = subs.securitytrails || {};
     const stPart = stSrc.error != null || stSrc.count
       ? `, SecurityTrails: ${stSrc.count || 0}${stSrc.error ? ` (${esc(stSrc.error)})` : ""}` : "";
+    const nTakeover = Math.min((subs.names || []).length, TAKEOVER_MAX_SUBS);
+    const takeoverBtn = (subs.names || []).length
+      ? `<button type="button" class="ghost mt sub-takeover-btn">Check these ${nTakeover} for takeover</button>`
+      : "";
     const subsHtml = (subs.names || []).length
       ? `<p class="faint mb">${subs.count} unique name(s) — crt.sh: ${crtSrc.count || 0}${crtSrc.error ? ` (${esc(crtSrc.error)})` : ""}, `
-        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${pivotList(subs.names, "domain")}`
+        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${pivotList(subs.names, "domain")}${takeoverBtn}`
       : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}${stPart}</p>`;
 
     const us = m.urlscan || {};
@@ -449,7 +517,11 @@
   function renderPhone(m) {
     const l = m.lookup || {};
     const k = m.keyed || {};
-    const top = kv([["Country (guess)", m.country_guess || "unknown"], ["Digits", m.digit_count]]);
+    const top = kv([
+      ["Country (guess)", m.country_guess || "unknown"],
+      ["US region (area code)", m.us_region ? `${m.us_region} (${m.area_code})` : ""],
+      ["Digits", m.digit_count],
+    ]);
     let lookupHtml;
     if (!l.configured) {
       lookupHtml = `<p class="faint">${esc(l.note)}</p>`;
@@ -487,7 +559,26 @@
           ["Known file", "no"],
           ["Note", m.note || "not found in CIRCL hashlookup"],
         ]);
+    const mb = m.malwarebazaar || {};
+    let mbHtml;
+    if (mb.ok === false) {
+      mbHtml = `<p class="faint">${esc(mb.error || "unavailable")}</p>`;
+    } else if (mb.known) {
+      mbHtml = kv([
+        ["Known malware", "yes"],
+        ["Signature", mb.signature],
+        ["File type", mb.file_type],
+        ["File name", mb.file_name],
+        ["First seen", mb.first_seen],
+        ["Delivery method", mb.delivery_method],
+        ["Tags", (mb.tags || []).join(", ")],
+      ]);
+    } else {
+      mbHtml = kv([["Known malware", "no"], ["Note", mb.note || "not a known sample"]]);
+    }
+
     return card("Hash lookup (CIRCL hashlookup)", body + renderUnlock(m.unlock))
+      + card("MalwareBazaar (abuse.ch)", mbHtml)
       + keyedCard("VirusTotal (file reputation)", k.virustotal, [
           ["Detections", k.virustotal && k.virustotal.malicious != null
             ? `${k.virustotal.malicious} / ${k.virustotal.total}` : ""],
@@ -543,26 +634,7 @@
     mac: renderMac, name: renderWikipedia, company: renderWikipedia,
   };
 
-  // -- copy / export toolbar -------------------------------------------------
-  function copyText(text, okMsg) {
-    navigator.clipboard.writeText(text).then(
-      () => N.toast(okMsg || "copied", "ok"),
-      () => N.toast("copy failed — clipboard blocked", "bad"),
-    );
-  }
-
-  function downloadJson(obj, filename) {
-    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
+  // -- copy / export toolbar (built from the shared kit) ---------------------
   // Generic JSON -> markdown bullet digest — one function that reads any
   // module's shape, so the export doesn't have to be hand-mirrored every
   // time a renderer above changes.
@@ -624,19 +696,43 @@
     return lines.join("\n").trim() + "\n";
   }
 
-  if (btnCopyJson) btnCopyJson.addEventListener("click", () => {
-    if (!lastScanData) return;
-    copyText(JSON.stringify(lastScanData, null, 2));
-  });
-  if (btnCopyMd) btnCopyMd.addEventListener("click", () => {
-    if (!lastScanData) return;
-    copyText(scanToMarkdown(lastScanData), "copied as markdown");
-  });
-  if (btnDownload) btnDownload.addEventListener("click", () => {
-    if (!lastScanData) return;
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadJson(lastScanData, `recon-${lastScanData.detected_type || "scan"}-${stamp}.json`);
-  });
+  // The scan results toolbar: Copy Markdown / Copy JSON / Download .md /
+  // Download .json, all from N.resultBar so recon exports the same way every
+  // other console does. getText/json are functions so the buttons always act
+  // on the current scan even after a pivot re-render.
+  function buildResultsToolbar() {
+    if (!resultsToolbar) return;
+    resultsToolbar.innerHTML = "";
+    resultsToolbar.appendChild(N.resultBar({
+      getText: () => (lastScanData ? scanToMarkdown(lastScanData) : ""),
+      json: () => lastScanData,
+      filename: "recon-" + ((lastScanData && lastScanData.detected_type) || "scan"),
+      mime: "text/markdown",
+      copyLabel: "Copy Markdown",
+    }));
+  }
+
+  // A takeover run as a shareable markdown report (for the takeover result bar).
+  function takeoverToMarkdown(data) {
+    if (!data) return "";
+    const c = data.counts || {};
+    const lines = ["# Subdomain takeover check"];
+    if (data.domain) lines.push("Domain: `" + data.domain + "`");
+    lines.push(`Checked ${data.checked} host(s): ${c.vulnerable || 0} vulnerable, `
+      + `${c.likely || 0} likely, ${c.safe || 0} safe`
+      + (c.error ? `, ${c.error} error` : ""));
+    lines.push("");
+    (data.results || []).forEach(r => {
+      lines.push(`## ${r.subdomain} — ${r.verdict}`);
+      if (r.service) lines.push(`- service: ${r.service}`);
+      if (r.cname_chain && r.cname_chain.length) lines.push(`- CNAME: ${r.cname_chain.join(" -> ")}`);
+      if (r.http_status) lines.push(`- HTTP: ${r.http_status}`);
+      (r.evidence || []).forEach(e => lines.push(`- ${e}`));
+      if (r.note) lines.push(`- note: ${r.note}`);
+      lines.push("");
+    });
+    return lines.join("\n").trim() + "\n";
+  }
 
   // -- elapsed-time ticker (nmap "full" etc can run 600s — an honest clock
   // beats a static spinner that looks hung) -----------------------------
@@ -644,11 +740,22 @@
     stopTicker();
     const start = Date.now();
     statusLine.classList.remove("hidden");
+    // #status-line is an aria-live region; the 5x/sec ticker would flood a
+    // screen reader, so mark it busy while it spins and clear that when the
+    // final "detected: …" line lands (settleStatus) so only that is announced.
+    statusLine.setAttribute("aria-busy", "true");
     const tick = () => {
       statusLine.innerHTML = `<span class="spinner"></span> ${esc(label)} — ${((Date.now() - start) / 1000).toFixed(1)}s`;
     };
     tick();
     scanTicker = setInterval(tick, 200);
+  }
+
+  // Set the final (announced) status text and release the aria-busy hold.
+  function settleStatus(text) {
+    statusLine.classList.remove("hidden");
+    statusLine.textContent = text;
+    statusLine.removeAttribute("aria-busy");
   }
   function stopTicker() {
     if (scanTicker) { clearInterval(scanTicker); scanTicker = null; }
@@ -666,7 +773,8 @@
       const isLast = i === pivotTrail.length - 1;
       const sep = i === 0 ? "" : '<span class="trail-sep">›</span>';
       const cls = "trail-crumb" + (isLast ? " current" : "");
-      return `${sep}<button type="button" class="${cls}" data-trail-index="${i}"${isLast ? " disabled" : ""}>${esc(t.value)}</button>`;
+      const label = isLast ? `Current scan: ${esc(t.value)}` : `Re-run scan for ${esc(t.value)}`;
+      return `${sep}<button type="button" class="${cls}" data-trail-index="${i}" aria-label="${label}"${isLast ? " disabled" : ""}>${esc(t.value)}</button>`;
     }).join("");
   }
 
@@ -703,7 +811,21 @@
     runScan(value, type || "auto");
   }
 
+  // One-click discovery -> takeover: carry the domain scan's subdomains into
+  // the takeover checker (capped at the server's per-request limit) and run it.
+  function launchSubsTakeover() {
+    const mod = lastScanData && lastScanData.modules && lastScanData.modules.domain;
+    const names = (mod && mod.subdomains && mod.subdomains.names) || [];
+    if (!names.length) { N.toast("no subdomains to check", "bad"); return; }
+    const input = document.getElementById("takeover-input");
+    const takeoverCard = document.getElementById("takeover-card");
+    if (input) input.value = names.slice(0, TAKEOVER_MAX_SUBS).join(" ");
+    if (takeoverCard) takeoverCard.scrollIntoView({ behavior: "smooth", block: "start" });
+    runTakeover();
+  }
+
   results.addEventListener("click", (e) => {
+    if (e.target.closest(".sub-takeover-btn")) { launchSubsTakeover(); return; }
     const chip = e.target.closest(".pivot-chip");
     if (!chip) return;
     const value = chip.dataset.pivotValue;
@@ -721,15 +843,22 @@
       stopTicker();
       lastScanData = data;
       lastScanQuery = q;
+      const resolvedType = data.detected_type || type;
       renderResults(data);
-      statusLine.classList.remove("hidden");
-      statusLine.textContent = `detected: ${TYPE_LABEL[data.detected_type] || data.detected_type} · ${data.took_ms}ms`;
+      settleStatus(`detected: ${TYPE_LABEL[data.detected_type] || data.detected_type} · ${data.took_ms}ms`);
+      buildResultsToolbar();
       if (resultsToolbar) resultsToolbar.classList.remove("hidden");
-      pushTrail(q, data.detected_type || type);
+      pushTrail(q, resolvedType);
+      // Remember for the recents panel + deep-link, and make this scan
+      // shareable/reloadable via the URL hash (replaceState so we don't spam
+      // browser history on every pivot).
+      lastTypeStore.set(typeSelect.value);
+      pushRecent(q, resolvedType);
+      writeHash(q, resolvedType);
       loadReconHistory();
     } catch (e) {
       stopTicker();
-      statusLine.textContent = "";
+      settleStatus("");
       N.toast(e.message || "scan failed", "bad");
       results.innerHTML = `<div class="card"><p class="bad">${esc(e.message || "scan failed")}</p></div>`;
     } finally {
@@ -751,6 +880,38 @@
     html += renderPivots(data.pivots);
     html += renderDorks(data.dorks);
     results.innerHTML = html;
+    // The username site grid has interactive controls (filter / found-only)
+    // that must be wired after the innerHTML swap.
+    if (data.detected_type === "username") wireUsernameControls();
+  }
+
+  // -- recents + deep-link ---------------------------------------------------
+  function currentRecents() {
+    const v = recentsStore.get([]);
+    return Array.isArray(v) ? v : [];
+  }
+  function pushRecent(q, type) {
+    let list = currentRecents().filter(r => !(r.q === q && r.type === type));
+    list.unshift({ q: q, type: type, ts: new Date().toISOString() });
+    recentsStore.set(list.slice(0, RECENTS_MAX));
+  }
+  function writeHash(q, type) {
+    try {
+      const h = "#q=" + encodeURIComponent(q) + "&type=" + encodeURIComponent(type || "auto");
+      history.replaceState(null, "", h);
+    } catch (_) { /* replaceState can throw in odd sandboxes — deep-link is a nicety */ }
+  }
+  function readHash() {
+    const h = (location.hash || "").replace(/^#/, "");
+    if (!h) return null;
+    const params = {};
+    h.split("&").forEach(part => {
+      const i = part.indexOf("=");
+      if (i < 0) return;
+      try { params[decodeURIComponent(part.slice(0, i))] = decodeURIComponent(part.slice(i + 1)); }
+      catch (_) { /* skip a malformed pair */ }
+    });
+    return params.q ? { q: params.q, type: params.type || "auto" } : null;
   }
 
   form.addEventListener("submit", (e) => {
@@ -786,7 +947,21 @@
     results.appendChild(wrap);
   }
 
-  renderEmptyState();
+  // Initial load: restore the last-used type, then honor a deep-link
+  // (#q=…&type=…) by running that scan straight away; otherwise show the
+  // clickable empty state.
+  (function initFromEnv() {
+    const savedType = lastTypeStore.get(null);
+    if (savedType && (savedType === "auto" || TYPE_LABEL[savedType])) typeSelect.value = savedType;
+    const linked = readHash();
+    if (linked) {
+      qInput.value = linked.q;
+      if (linked.type && (linked.type === "auto" || TYPE_LABEL[linked.type])) typeSelect.value = linked.type;
+      runScan(linked.q, typeSelect.value);
+    } else {
+      renderEmptyState();
+    }
+  })();
 
   async function loadArsenal() {
     try {
@@ -812,24 +987,40 @@
 
   loadArsenal();
 
-  // -- scan history (feature-detected: hidden if the backend doesn't have
-  // /api/recon-history yet, or ever 404s) -----------------------------------
+  // -- scan history -----------------------------------------------------------
+  // Two honest sources: the disk-backed server log (only populated when
+  // NUCLEUS_LOGGING=1) and this browser's client-side recents. When the server
+  // has entries we show those (reopen-by-id, full stored scan); otherwise we
+  // show the recents this browser remembers (re-run-by-query). The panel is
+  // always visible with a clear note, so it never reads as broken/empty.
+  function setHistoryNote(text) { if (historyNote) historyNote.textContent = text; }
+
   async function loadReconHistory() {
     if (!historyWrap || !historyList) return;
-    let j;
-    try { j = await N.get("/api/recon-history?limit=50"); }
-    catch (e) { return; } // endpoint not there (yet) — stay quiet, leave it hidden
     historyWrap.classList.remove("hidden");
-    renderReconHistory(j.scans || []);
+    let scans = null;
+    try {
+      const j = await N.get("/api/recon-history?limit=50");
+      scans = j.scans || [];
+    } catch (e) { scans = null; }  // endpoint missing / errored — fall back to recents
+    if (scans && scans.length) {
+      setHistoryNote("Persisted scans — server-side history is on. Click one to reopen the full saved result.");
+      renderHistoryItems(scans, "disk");
+    } else {
+      setHistoryNote("Recent scans this browser remembers (client-side only). "
+        + "Set NUCLEUS_LOGGING=1 for a persistent server-side trail you can reopen in full.");
+      renderHistoryItems(currentRecents(), "recents");
+    }
   }
 
-  function renderReconHistory(scans) {
-    if (!scans.length) {
-      historyList.innerHTML = '<p class="faint">No scans logged yet.</p>';
+  function renderHistoryItems(items, mode) {
+    historyList.innerHTML = "";
+    if (!items.length) {
+      historyList.appendChild(N.stateCard("empty",
+        "No scans yet — run one above. On-disk history is off by default; set NUCLEUS_LOGGING=1 to keep a persistent trail."));
       return;
     }
-    historyList.innerHTML = "";
-    scans.forEach(s => {
+    items.forEach(s => {
       const item = N.el("button", { class: "hist-item", type: "button" });
       const top = N.el("div", { class: "hist-top" });
       top.appendChild(N.el("span", { class: "pill", text: TYPE_LABEL[s.type] || s.type || "?" }));
@@ -837,7 +1028,16 @@
       item.appendChild(top);
       item.appendChild(N.el("div", { class: "hist-q mono", text: s.q || "" }));
       if (s.summary) item.appendChild(N.el("div", { class: "sub", text: s.summary }));
-      item.addEventListener("click", () => reopenScan(s.id, s.q));
+      if (mode === "disk") {
+        item.addEventListener("click", () => reopenScan(s.id, s.q));
+      } else {
+        item.addEventListener("click", () => {
+          qInput.value = s.q || "";
+          if (s.type && (s.type === "auto" || TYPE_LABEL[s.type])) typeSelect.value = s.type;
+          runScan(s.q, s.type || "auto");
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        });
+      }
       historyList.appendChild(item);
     });
   }
@@ -855,13 +1055,14 @@
       lastScanQuery = q || data.input || data.q || qInput.value;
       qInput.value = lastScanQuery;
       renderResults(data);
-      statusLine.classList.remove("hidden");
-      statusLine.textContent = `reopened: ${TYPE_LABEL[data.detected_type] || data.detected_type}`
-        + (data.took_ms != null ? ` · ${data.took_ms}ms` : "");
+      settleStatus(`reopened: ${TYPE_LABEL[data.detected_type] || data.detected_type}`
+        + (data.took_ms != null ? ` · ${data.took_ms}ms` : ""));
+      buildResultsToolbar();
       if (resultsToolbar) resultsToolbar.classList.remove("hidden");
       results.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {
       stopTicker();
+      settleStatus("");
       N.toast(e.message || "couldn't load that scan", "bad");
     }
   }
@@ -926,7 +1127,7 @@
       + `</p>`;
     (data.results || []).forEach((r) => {
       const chain = (r.cname_chain && r.cname_chain.length) ? esc(r.cname_chain.join(" → ")) : "no CNAME";
-      body += `<div style="padding:8px 0;border-top:1px solid var(--line)">`
+      body += `<div class="takeover-row">`
         + `<div><span class="pill ${takeoverVerdictPill(r.verdict)}">${esc(r.verdict)}</span> `
         + `<strong>${esc(r.subdomain)}</strong>`
         + (r.service ? ` <span class="faint small">— ${esc(r.service)}</span>` : "")
@@ -955,7 +1156,15 @@
       const payload = parts.length === 1 ? { domain: parts[0] } : { subdomains: parts };
       const data = await N.post("/api/takeover", payload);
       status.textContent = "";
+      lastTakeoverData = data;
       resultWrap.innerHTML = renderTakeover(data);
+      resultWrap.appendChild(N.resultBar({
+        getText: () => takeoverToMarkdown(lastTakeoverData),
+        json: () => lastTakeoverData,
+        filename: "takeover-" + ((lastTakeoverData && lastTakeoverData.domain) || "check"),
+        mime: "text/markdown",
+        copyLabel: "Copy",
+      }));
     } catch (e) {
       status.textContent = "";
       resultWrap.innerHTML = `<p class="bad">${esc(e.message || "takeover check failed")}</p>`;
