@@ -21,13 +21,17 @@ import http.client
 import http.server
 import json
 import os
+import re
+import secrets
 import socket
 import ssl
+import struct
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -51,8 +55,10 @@ from consoles.redcell import tlsaudit
 from consoles.redcell import techfp
 from consoles.redcell import jwtaudit
 from consoles.recon import takeover
+from consoles.bastion import scrub
 from consoles.redcell.app import build_app as _redcell_build_app
 from consoles.recon.app import build_app as _recon_build_app
+from consoles.bastion.app import build_app as _bastion_build_app
 
 # tests/ on path so the labeled-corpus benchmark is importable as a CI floor
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -957,6 +963,98 @@ class LiveSecurityHeaderTests(unittest.TestCase):
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
         self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertIn("referrer-policy", headers)
+
+
+class BodyLimitTests(unittest.TestCase):
+    """App.body_limits raises the POST cap for exactly the routes that opt in
+    (bastion's scrub upload takes whole files); every route absent from the
+    dict keeps the 256 KiB MAX_BODY. Enforcement lives inside _dispatch at
+    request time, so — like the header tests above — only a real loopback
+    request proves it. The over-limit cases declare Content-Length without
+    ever sending a body: the guard fires on the declared length alone, and
+    not sending half a megabyte keeps loopback socket buffers (and the
+    deadlocks they invite) out of the test."""
+
+    def _free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def setUp(self):
+        static_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(static_dir, ignore_errors=True))
+
+        def echo(req):
+            return common.Response.json({"received": len(req.body)})
+
+        app = common.App(
+            slug="unit-test-app", static_dir=static_dir,
+            routes={"POST /api/big": echo, "POST /api/small": echo},
+            body_limits={"POST /api/big": 1024 * 1024},
+        )
+
+        self.httpd = None
+        last_error = None
+        for _attempt in range(3):
+            port = self._free_port()
+            try:
+                self.httpd = common.serve(app, port=port, block=False)
+                self.port = port
+                break
+            except OSError as e:
+                last_error = e
+                continue
+        if self.httpd is None:
+            self.skipTest(f"could not bind a loopback test port: {last_error}")
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _headers(self) -> dict:
+        # POSTs need a same-origin Origin or the CSRF guard 403s before the
+        # body-limit check is ever reached.
+        return {"Origin": f"http://127.0.0.1:{self.port}",
+                "Content-Type": "application/octet-stream"}
+
+    def _post_body(self, path: str, payload: bytes):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", path, body=payload, headers=self._headers())
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def _post_declared(self, path: str, length: int) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.putrequest("POST", path)
+            for k, v in self._headers().items():
+                conn.putheader(k, v)
+            conn.putheader("Content-Length", str(length))
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_opted_in_route_accepts_body_over_max_body(self):
+        payload = b"x" * (512 * 1024)  # 2x MAX_BODY, half the route's own limit
+        status, body = self._post_body("/api/big", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["received"], len(payload))
+
+    def test_route_absent_from_body_limits_keeps_max_body(self):
+        self.assertEqual(self._post_declared("/api/small", 512 * 1024), 413)
+
+    def test_opted_in_route_still_has_a_ceiling(self):
+        self.assertEqual(self._post_declared("/api/big", 2 * 1024 * 1024), 413)
+
+    def test_apps_without_body_limits_default_to_empty(self):
+        # Backward compatibility: every existing console builds App without
+        # the new field and must land on MAX_BODY via the empty-dict default.
+        app = common.App(slug="unit-test-app", static_dir=Path("."), routes={})
+        self.assertEqual(app.body_limits, {})
 
 
 class TlsCertRebindTests(unittest.TestCase):
@@ -2903,6 +3001,295 @@ class RouteRegistrationTests(unittest.TestCase):
     def test_recon_new_route_registered(self):
         app = _recon_build_app()
         self.assertIs(app.routes["POST /api/takeover"], takeover.handle_takeover)
+
+
+# ==========================================================================
+# 20. consoles/bastion/scrub.py — mat2 metadata scrubber
+# ==========================================================================
+def _scrub_png() -> bytes:
+    """The spec fixture: a 1x1 PNG carrying a tEXt `Author: Jane Doe` chunk.
+    Built from stdlib so the suite carries no binary blob — mat2 shows the
+    Author pair, strips the chunk, and the cleaned file re-inspects empty,
+    which makes the whole pipeline provable with ~100 bytes."""
+    def _chunk(t: bytes, d: bytes) -> bytes:
+        c = t + d
+        return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"tEXt", b"Author\x00Jane Doe")
+            + _chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + _chunk(b"IEND", b""))
+
+
+class TestScrub(unittest.TestCase):
+    """Everything the scrub module touches is attacker-influenced: filenames
+    arrive percent-encoded from the browser, metadata values come from inside
+    hostile files, and session tokens ride the query string. These tests pin
+    the pure logic (sanitize / parse / token validation) offline and gate the
+    real-mat2 round trips on the binary being installed."""
+
+    def setUp(self):
+        # Point the module at a throwaway tree so no test can create, purge,
+        # or pollute the real var/scrub.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.scrub_dir = Path(self._tmp.name).resolve() / "scrub"
+        patcher = mock.patch.object(scrub, "SCRUB_DIR", self.scrub_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # -- sanitize_name ------------------------------------------------------
+
+    def test_sanitize_name_strips_traversal(self):
+        self.assertEqual(scrub.sanitize_name("../../etc/passwd.png"), "passwd.png")
+
+    def test_sanitize_name_strips_backslash_paths(self):
+        # Windows-origin drag-drops arrive with backslash separators, which
+        # Path() on Linux treats as ordinary name characters.
+        self.assertEqual(scrub.sanitize_name("..\\..\\x.jpg"), "x.jpg")
+
+    def test_sanitize_name_output_stays_in_safe_charset(self):
+        hostile = [
+            "shot\x00\x1f\x7f.png", "café ☕.png", "СПУТНИК.jpg",
+            "'; rm -rf / #.png", "a  b__c   d.png", "<img src=x>.gif",
+            "%2e%2e%2fescape.pdf",
+        ]
+        for name in hostile:
+            with self.subTest(name=name):
+                out = scrub.sanitize_name(name)
+                self.assertTrue(out)
+                self.assertTrue(re.fullmatch(r"[A-Za-z0-9._ -]+", out), out)
+
+    def test_sanitize_name_caps_length_keeping_extension(self):
+        out = scrub.sanitize_name("a" * 300 + ".jpg")
+        self.assertLessEqual(len(out), 120)
+        self.assertTrue(out.endswith(".jpg"))
+
+    def test_sanitize_name_never_starts_with_dot_dash_or_space(self):
+        for name in (".hidden.png", "--rf.png", "  pad.png"):
+            with self.subTest(name=name):
+                out = scrub.sanitize_name(name)
+                self.assertFalse(out.startswith((".", "-", " ")), out)
+
+    def test_sanitize_name_empty_stem_gets_a_stem(self):
+        for name in ("", ".", "..."):
+            with self.subTest(name=name):
+                out = scrub.sanitize_name(name)
+                self.assertTrue(out.startswith("file"), out)
+
+    # -- parse_show -----------------------------------------------------------
+
+    def test_parse_show_real_output_shape(self):
+        text = ("[+] Metadata for /tmp/scrub/shot.png:\n"
+                "    Author: Jane Doe\n")
+        pairs, _notes = scrub.parse_show(text)
+        self.assertEqual(pairs, [{"key": "Author", "value": "Jane Doe"}])
+
+    def test_parse_show_no_metadata_is_note_not_pair(self):
+        pairs, notes = scrub.parse_show("  No metadata found in /tmp/x.cleaned.png.\n")
+        self.assertEqual(pairs, [])
+        self.assertTrue(any("No metadata found" in n for n in notes), notes)
+
+    def test_parse_show_warning_lines_become_notes(self):
+        text = ("[-] Something went wrong reading the exif block\n"
+                "[+] Metadata for /tmp/shot.png:\n"
+                "    Author: Jane Doe\n")
+        pairs, notes = scrub.parse_show(text)
+        self.assertEqual(pairs, [{"key": "Author", "value": "Jane Doe"}])
+        self.assertTrue(any("Something went wrong" in n for n in notes), notes)
+
+    def test_parse_show_splits_on_first_separator_only(self):
+        # Metadata values routinely contain ": " themselves (URLs, comments) —
+        # only the first separator divides key from value.
+        pairs, _notes = scrub.parse_show(
+            "[+] Metadata for x:\n    Comment: rating: 5 stars: really\n")
+        self.assertEqual(pairs, [{"key": "Comment", "value": "rating: 5 stars: really"}])
+
+    def test_parse_show_caps_pair_count_and_notes_how_many_dropped(self):
+        lines = ["[+] Metadata for /tmp/big.pdf:"]
+        lines += [f"    Key{i}: value {i}" for i in range(600)]
+        pairs, notes = scrub.parse_show("\n".join(lines))
+        self.assertEqual(len(pairs), 500)
+        self.assertTrue(any("100" in n for n in notes), notes)
+
+    def test_parse_show_truncates_oversized_values(self):
+        pairs, _notes = scrub.parse_show(
+            "[+] Metadata for x:\n    Comment: " + "x" * 5000 + "\n")
+        self.assertEqual(len(pairs), 1)
+        self.assertLessEqual(len(pairs[0]["value"]), 2000)
+        self.assertTrue(pairs[0]["value"].startswith("xxxx"))
+
+    def test_parse_show_never_raises_on_garbage(self):
+        for garbage in ("", "\x00\xff\xfe binary junk \x07", "::::\n: : :\n",
+                        "[+]\n[-]\n    :\n", "    lonely-line-without-separator\n"):
+            with self.subTest(garbage=garbage[:20]):
+                pairs, notes = scrub.parse_show(garbage)
+                self.assertIsInstance(pairs, list)
+                self.assertIsInstance(notes, list)
+
+    # -- _session_dir ----------------------------------------------------------
+
+    def test_session_dir_rejects_crafted_tokens(self):
+        for tok in ("", "..", "a/b", "short", "a" * 65,
+                    "../../../../etc/passwd", "..%2F..%2Fetc%2Fpasswd",
+                    "aaaaaaaaaaaaaaa",             # 15 chars — one under the floor
+                    "valid-looking/../escape-oops"):
+            with self.subTest(token=tok):
+                with self.assertRaises(ValueError):
+                    scrub._session_dir(tok)
+
+    def test_session_dir_accepts_real_token_inside_root(self):
+        tok = secrets.token_urlsafe(24)
+        d = scrub._session_dir(tok)
+        d.relative_to(scrub.SCRUB_DIR)  # raises ValueError if it ever escapes
+        self.assertEqual(d.name, tok)
+
+    # -- create / delete / purge ------------------------------------------------
+
+    def test_create_session_writes_private_files(self):
+        sess = scrub.create_session("shot.png", b"data")
+        d = scrub._session_dir(sess["token"])
+        self.assertTrue(d.is_dir())
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(scrub.SCRUB_DIR.stat().st_mode & 0o777, 0o700)
+        meta = json.loads((d / "meta.json").read_text())
+        self.assertEqual(meta["name"], "shot.png")
+        self.assertEqual(meta["size"], 4)
+        for f in d.iterdir():
+            with self.subTest(file=f.name):
+                self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+        uploads = [f for f in d.iterdir() if f.name != "meta.json"]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0].read_bytes(), b"data")
+
+    def test_delete_session_removes_and_is_idempotent(self):
+        sess = scrub.create_session("shot.png", b"x")
+        d = scrub._session_dir(sess["token"])
+        scrub.delete_session(sess["token"])
+        self.assertFalse(d.exists())
+        scrub.delete_session(sess["token"])  # deleting a gone session must not raise
+
+    def test_purge_stale_removes_expired_and_keeps_fresh(self):
+        old = scrub.create_session("old.png", b"x")
+        fresh = scrub.create_session("new.png", b"y")
+        old_dir = scrub._session_dir(old["token"])
+        fresh_dir = scrub._session_dir(fresh["token"])
+        past = time.time() - scrub.SESSION_TTL - 120
+        os.utime(old_dir, (past, past))
+        scrub.purge_stale()
+        self.assertFalse(old_dir.exists())
+        self.assertTrue(fresh_dir.exists())
+
+    def test_purge_stale_without_scrub_dir_is_noop(self):
+        with mock.patch.object(scrub, "SCRUB_DIR",
+                               Path(self._tmp.name) / "never-created"):
+            scrub.purge_stale()  # must not raise
+
+    # -- status ------------------------------------------------------------------
+
+    def test_status_fails_loud_when_mat2_missing(self):
+        # FAIL-LOUD contract: available can never read true without the binary.
+        real_which = common.which
+        with mock.patch.object(common, "which",
+                               side_effect=lambda name: None if name == "mat2" else real_which(name)):
+            st = scrub.status()
+        self.assertFalse(st["available"])
+        self.assertTrue(st.get("reason"))
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_status_reports_version_and_dotted_formats(self):
+        st = scrub.status()
+        self.assertTrue(st["available"])
+        self.assertIn("mat2", st["version"])
+        self.assertEqual(st["max_upload_bytes"], scrub.MAX_UPLOAD)
+        self.assertIsInstance(st["sandbox"], bool)
+        self.assertIn(".png", st["formats"])
+        self.assertTrue(all(f.startswith(".") for f in st["formats"]))
+        self.assertEqual(st["format_count"], len(st["formats"]))
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_supported_exts_lowercase_dotted(self):
+        exts = scrub.supported_exts()
+        self.assertIn(".png", exts)
+        self.assertTrue(all(e == e.lower() and e.startswith(".") for e in exts))
+
+    # -- end-to-end with the real mat2 --------------------------------------------
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_e2e_png_roundtrip_with_real_mat2(self):
+        sess = scrub.create_session("shot.png", _scrub_png())
+        token = sess["token"]
+
+        info = scrub.inspect(token)
+        pairs = info.get("metadata") or []
+        self.assertTrue(any(p["key"] == "Author" and "Jane Doe" in p["value"]
+                            for p in pairs), pairs)
+
+        out = scrub.clean(token)
+        self.assertFalse(out.get("error"), out)
+        self.assertTrue(out["clean"])
+        self.assertEqual(out["metadata_after"], [])
+        self.assertEqual(out["cleaned_name"], "shot.cleaned.png")
+        self.assertGreater(out["size_before"], 0)
+        self.assertGreater(out["size_after"], 0)
+
+        path, name = scrub.cleaned_file(token)
+        self.assertEqual(name, "shot.cleaned.png")
+        data = Path(path).read_bytes()
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertNotIn(b"tEXt", data)
+
+        scrub.delete_session(token)
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            scrub.cleaned_file(token)
+
+    # -- upload route contract (direct handler calls) ------------------------------
+
+    def _upload_handler(self):
+        # The route table is the contract — grab the registered handler rather
+        # than importing a function name the spec doesn't pin. Built after
+        # setUp's SCRUB_DIR patch so build_app's startup purge hits the
+        # throwaway tree, never var/scrub.
+        return _bastion_build_app().routes["POST /api/scrub/upload"]
+
+    @staticmethod
+    def _upload_req(headers: dict, body: bytes) -> common.Request:
+        return common.Request("POST", "/api/scrub/upload", {}, headers, body, "127.0.0.1")
+
+    def test_scrub_routes_registered_with_body_limit(self):
+        app = _bastion_build_app()
+        for key in ("GET /api/scrub/status", "POST /api/scrub/upload",
+                    "POST /api/scrub/clean", "GET /api/scrub/file",
+                    "POST /api/scrub/delete"):
+            with self.subTest(route=key):
+                self.assertIn(key, app.routes)
+        self.assertEqual(app.body_limits.get("POST /api/scrub/upload"), scrub.MAX_UPLOAD)
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_upload_missing_filename_is_400(self):
+        resp = self._upload_handler()(self._upload_req({}, b"data"))
+        self.assertEqual(resp.status, 400)
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_upload_unsupported_extension_is_415(self):
+        # lowercase header on purpose — the lookup must be case-insensitive
+        resp = self._upload_handler()(self._upload_req({"x-filename": "notes.xyz"}, b"data"))
+        self.assertEqual(resp.status, 415)
+        err = json.loads(resp.body)["error"]
+        self.assertIn(".xyz", err)
+        self.assertIn("supported", err.lower())
+
+    @unittest.skipUnless(common.which("mat2"), "mat2 not installed")
+    def test_upload_empty_body_is_400(self):
+        resp = self._upload_handler()(self._upload_req({"X-Filename": "shot.png"}, b""))
+        self.assertEqual(resp.status, 400)
+
+    def test_upload_without_mat2_is_503_fail_loud(self):
+        real_which = common.which
+        with mock.patch.object(common, "which",
+                               side_effect=lambda name: None if name == "mat2" else real_which(name)):
+            resp = self._upload_handler()(self._upload_req({"X-Filename": "shot.png"}, b"data"))
+        self.assertEqual(resp.status, 503)
+        self.assertIn("pacman -S mat2", json.loads(resp.body)["error"])
 
 
 if __name__ == "__main__":

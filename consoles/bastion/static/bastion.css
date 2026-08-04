@@ -65,6 +65,50 @@
 .rec-list li { color: var(--txt-dim); font-size: 13px; margin: 5px 0; line-height: 1.5; }
 .rec-list li code, .anon-verdict .mono { font-family: var(--mono); }
 
+/* ---- scrub panel — drop zone, per-file cards, metadata tables ---- */
+.drop-zone { border: 2px dashed var(--line-2); border-radius: var(--radius); background: var(--bg-1);
+  padding: 36px 22px; text-align: center; cursor: pointer; color: var(--txt-dim);
+  transition: border-color .15s, background .15s; }
+.drop-zone:hover, .drop-zone:focus-visible, .drop-zone.drag { border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-1)); outline: none; }
+.drop-zone > * { pointer-events: none; } /* children never steal the drop/dragleave events */
+.drop-zone .dz-main { font-size: 15px; font-weight: 600; color: var(--txt); }
+.drop-zone .dz-sub { font-size: 12.5px; color: var(--txt-faint); margin-top: 5px; }
+
+.scrub-opts { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin-top: 14px; }
+.scrub-opts .checkline { text-transform: none; letter-spacing: 0; font-weight: 500; margin: 0;
+  align-items: center; cursor: pointer; }
+.scrub-opts .checkline input { margin-top: 0; }
+.scrub-opts select { width: auto; padding: 7px 10px; font-size: 13px; }
+.scrub-actions { display: flex; gap: 8px; margin-left: auto; }
+
+.file-card { margin-top: 14px; }
+.file-card .fc-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.file-card .fc-id { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.file-card .fc-name { font-weight: 600; font-size: 13.5px; word-break: break-all; }
+.file-card .fc-ext { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--txt-dim); flex: none; }
+.file-card .fc-size { font-family: var(--mono); font-size: 11.5px; color: var(--txt-faint); flex: none; }
+.file-card .fc-body { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.file-card .fc-wait { display: flex; align-items: center; gap: 9px; font-size: 13px; }
+.file-card .fc-note { font-size: 12px; }
+.file-card .fc-error { color: var(--bad); font-size: 13px; word-break: break-word; }
+.file-card .fc-verdict { font-weight: 600; font-size: 13.5px; }
+.file-card .fc-verdict.ok { color: var(--ok); }
+.file-card .fc-verdict.warn { color: var(--warn); }
+.file-card .fc-sizes { font-family: var(--mono); font-size: 12px; }
+.file-card .fc-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
+
+/* metadata table — key column muted, values mono; long values widen the
+   table and scroll inside the wrapper instead of blowing up the card */
+.meta-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.meta-table { font-size: 12.5px; }
+.meta-table td { padding: 6px 10px; vertical-align: top; }
+.meta-table tr:last-child td { border-bottom: none; }
+.meta-table td.mkey { color: var(--txt-dim); white-space: nowrap; width: 1%; }
+.meta-table td.mval { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; color: var(--txt); }
+.meta-more { margin-top: 8px; padding: 6px 10px; font-size: 12px; }
+
 /* ---- print (Save as PDF via window.print(), from the report result) ----
    nucleus.css already hides the topbar/switcher/opsec bar. Everything on
    this page besides the report result is noise for a PDF export, so hide

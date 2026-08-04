@@ -5,6 +5,7 @@ var/*.json
 var/*.jsonl
 var/*.log
 var/redcell-out/
+var/scrub/
 engine/reports/
 __pycache__/
 *.pyc

@@ -8,16 +8,26 @@ Exit 0 = all green.
 """
 import importlib
 import json
+import os
+import struct
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from shared import common  # noqa: E402
+
+# Scrub sessions must land in a throwaway tree, never the real var/scrub.
+# consoles.bastion.scrub reads NUCLEUS_SCRUB_DIR once at import time, so the
+# override has to be in place before main() imports the bastion app below.
+_SCRUB_TMP = tempfile.TemporaryDirectory(prefix="nucleus-smoke-scrub-")
+os.environ["NUCLEUS_SCRUB_DIR"] = _SCRUB_TMP.name
 
 OFFSET = 10000
 APPS = {
@@ -64,6 +74,19 @@ def jget(port, path, **kw):
         return st, json.loads(body)
     except Exception:
         return st, {"_raw": body[:200].decode("utf-8", "replace")}
+
+
+def scrub_png():
+    """The scrub-spec fixture: a 1x1 PNG with a tEXt `Author: Jane Doe` chunk
+    mat2 can find and strip — built from stdlib so the smoke run carries no
+    binary blob."""
+    def _chunk(t, d):
+        c = t + d
+        return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"tEXt", b"Author\x00Jane Doe")
+            + _chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + _chunk(b"IEND", b""))
 
 
 def main():
@@ -250,6 +273,58 @@ def main():
         # traversal must be refused
         st, j = jget(port, "/api/report-file?path=../../../../etc/passwd")
         check("bastion report-file blocks traversal", st != 200, str(j)[:120])
+
+        # ---- scrub (mat2 metadata cleaner): full upload → clean → download →
+        # delete round trip, against the temp NUCLEUS_SCRUB_DIR set at the top ----
+        if common.which("mat2"):
+            st, j = jget(port, "/api/scrub/status")
+            check("bastion scrub status available", st == 200 and j.get("available") is True
+                  and bool(j.get("version")), str(j)[:120])
+
+            # upload is a raw-body POST (not JSON), so build it by hand — same
+            # Origin discipline as every other POST in this file
+            upreq = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/scrub/upload", method="POST", data=scrub_png(),
+                headers={"Host": f"127.0.0.1:{port}",
+                         "Origin": f"http://127.0.0.1:{port}",
+                         "Content-Type": "application/octet-stream",
+                         "X-Filename": urllib.parse.quote("smoke.png")})
+            try:
+                with urllib.request.urlopen(upreq, timeout=60) as r:
+                    ust, uj = r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                ust, uj = e.code, {}
+            except Exception as e:  # noqa: BLE001 — a smoke check records, never crashes
+                ust, uj = 0, {"_err": f"{type(e).__name__}: {e}"}
+            token = uj.get("token") or ""
+            meta_keys = [p.get("key") for p in (uj.get("metadata") or [])]
+            check("bastion scrub upload sees Author", ust == 200 and bool(token)
+                  and "Author" in meta_keys, str(uj)[:160])
+
+            st, j = jget(port, "/api/scrub/clean", method="POST", body={"token": token})
+            check("bastion scrub clean re-checks clean", st == 200 and j.get("clean") is True
+                  and j.get("metadata_after") == [], str(j)[:160])
+
+            dlreq = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/scrub/file?token=" + urllib.parse.quote(token),
+                headers={"Host": f"127.0.0.1:{port}"})
+            try:
+                with urllib.request.urlopen(dlreq, timeout=30) as r:
+                    dst = r.status
+                    dtype = r.headers.get("Content-Type", "")
+                    dispo = r.headers.get("Content-Disposition", "")
+                    data = r.read()
+            except urllib.error.HTTPError as e:
+                dst, dtype, dispo, data = e.code, "", "", b""
+            check("bastion scrub download is the clean file",
+                  dst == 200 and "octet-stream" in dtype and "attachment" in dispo
+                  and data.startswith(b"\x89PNG\r\n\x1a\n") and b"tEXt" not in data,
+                  f"status {dst} type {dtype!r} dispo {dispo!r} len {len(data)}")
+
+            st, j = jget(port, "/api/scrub/delete", method="POST", body={"token": token})
+            check("bastion scrub delete ok", st == 200 and j.get("ok") is True, str(j)[:120])
+        else:
+            skip("bastion scrub round-trip", "mat2 not installed")
 
     for srv, _ in servers.values():
         try:

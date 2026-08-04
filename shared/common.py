@@ -62,7 +62,7 @@ CONSOLES: list[dict] = [
     {"slug": "redcell", "name": "Redcell",  "port": 8910,
      "tag": "offensive",      "desc": "The pentest kit — inventory + authorized runners."},
     {"slug": "bastion", "name": "Bastion",  "port": 8920,
-     "tag": "defensive",      "desc": "Hardening, opsec posture, and the report engine."},
+     "tag": "defensive",      "desc": "Hardening, opsec posture, metadata scrubbing, and the report engine."},
 ]
 # Other local apps Nucleus knows how to point at (not part of this repo).
 EXTERNAL_APPS: list[dict] = [
@@ -145,6 +145,10 @@ class App:
     static_dir: Path
     routes: dict = field(default_factory=dict)   # "GET /api/x" -> handler
     version: str = VERSION
+    # Per-route POST body caps: route key ("POST /api/x") -> max bytes. Exists
+    # for bastion's file-upload route, which legitimately takes multi-MB files;
+    # any route absent from this dict keeps the global MAX_BODY cap.
+    body_limits: dict = field(default_factory=dict)
 
     @property
     def meta(self) -> dict:
@@ -858,7 +862,8 @@ def _make_handler(app: App, port: int):
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     length = 0
-                if length > MAX_BODY:
+                limit = app.body_limits.get(key, MAX_BODY)  # per-route override (uploads)
+                if length > limit:
                     self._send(Response.error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body too large"))
                     return
                 body = self.rfile.read(length) if length > 0 else b""

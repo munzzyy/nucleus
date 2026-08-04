@@ -66,7 +66,7 @@ The switcher at the top of every console lights up whichever siblings it can rea
 
 Authorized / lab / CTF use only.
 
-**Bastion (defensive).** Two halves. A read-only posture dashboard that tells you whether this machine is actually hardened — kernel sysctls, auditd, encrypted Quad9 DNS, Tor, WireGuard, MAC randomization, firewall, CVE audit — and shows the exact command to fix anything that isn't. And the **OSINT report engine**: give it a domain and it produces a graded (A–F) passive security assessment with prioritized findings, rendered to Markdown and HTML.
+**Bastion (defensive).** Three parts. A read-only posture dashboard that tells you whether this machine is actually hardened — kernel sysctls, auditd, encrypted Quad9 DNS, Tor, WireGuard, MAC randomization, firewall, CVE audit — and shows the exact command to fix anything that isn't. The **OSINT report engine**: give it a domain and it produces a graded (A–F) passive security assessment with prioritized findings, rendered to Markdown and HTML. And the **scrub panel**: drop files on it, see exactly what metadata they're carrying, and clean them with one click — mat2 does the stripping in sandboxed parsers, then the file is re-checked to prove nothing is left. Cleaned files stay on loopback, and uploads auto-purge after 24 hours.
 
 ## Security model
 
