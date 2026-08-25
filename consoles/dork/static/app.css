@@ -1,0 +1,129 @@
+/* Dork console — layers on top of /shared/nucleus.css. Reuses the shared
+   card / pill / btn / pivot-grid / section-title primitives; only the
+   dork-specific rows and chips live here. */
+
+.auth-note {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--line-2));
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.auth-note strong { color: var(--warn); }
+
+/* the target/apex/brand summary line under the form */
+.dork-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  align-items: baseline;
+  font-size: 13px;
+  color: var(--txt-dim);
+  padding: 10px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.dork-meta b { color: var(--txt); font-family: var(--mono); font-weight: 600; }
+.dork-meta .count { color: var(--accent); font-weight: 700; }
+
+/* a category card carries a short "why" under its heading */
+.cat-why { color: var(--txt-dim); font-size: 12.5px; margin: -4px 0 12px; line-height: 1.45; }
+
+/* one dork = a label + risk chip, the query, its why, and engine links */
+.dork {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line-1, #1c2532);
+}
+.dork:first-of-type { border-top: none; }
+.dork-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dork-head .label { font-size: 13.5px; font-weight: 600; color: var(--txt); }
+
+.risk {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor;
+  font-weight: 700;
+}
+.risk.info      { color: var(--txt-faint); }
+.risk.recon     { color: var(--warn); }
+.risk.sensitive { color: var(--bad); }
+
+/* the query itself — monospace, click to copy the whole thing */
+.dork-q {
+  grid-column: 1 / 2;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--txt-dim);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  padding: 7px 10px;
+  cursor: copy;
+  word-break: break-word;
+  transition: border-color .12s, color .12s;
+}
+.dork-q:hover { border-color: var(--accent); color: var(--txt); }
+.dork-why { grid-column: 1 / 2; font-size: 12px; color: var(--txt-faint); line-height: 1.4; }
+
+/* engine links, primary first then the alternates */
+.dork-engines {
+  grid-column: 2 / 3;
+  grid-row: 1 / 4;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 132px;
+}
+.dork-engines .alts { display: flex; flex-wrap: wrap; gap: 5px; }
+.dork-engines .alts a {
+  font-size: 11px; padding: 3px 8px; border-radius: 6px;
+  border: 1px solid var(--line-2); color: var(--txt-dim);
+}
+.dork-engines .alts a:hover { border-color: var(--accent); color: var(--txt); text-decoration: none; }
+.btn.primary-engine { text-align: center; white-space: nowrap; }
+
+/* a "degraded" engine link — the engine has no equivalent for one of the dork's
+   operators, so it's dimmed with a dashed edge and carries a "~" marker */
+.dork-engines .deg { opacity: .6; border-style: dashed !important; }
+.dork-engines a.deg:hover { opacity: 1; }
+.btn.primary-engine.deg { border-style: dashed; opacity: .82; }
+
+/* per-category actions (open-all-in-Firefox + copy-all) sit in the heading row */
+.cat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.cat-head h2 { margin: 0; }
+.cat-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.cat-copy, .cat-ff { font-size: 11.5px; padding: 5px 10px; }
+
+/* toolbar row of open/copy/download buttons */
+#dork-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* the "route link clicks into Firefox" toggle at the head of the toolbar */
+.ff-toggle {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--txt-dim); cursor: pointer;
+  padding: 5px 11px 5px 9px; border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  user-select: none;
+}
+.ff-toggle:hover { border-color: var(--accent); color: var(--txt); }
+.ff-toggle input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; cursor: pointer; }
+
+/* cheat sheet */
+#dork-cheatsheet summary { cursor: pointer; font-weight: 600; color: var(--txt); }
+#dork-cheatsheet summary:hover { color: var(--accent); }
+.cheat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px 20px; }
+.cheat-grid > div { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
+.cheat-grid code {
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  white-space: nowrap; min-width: 118px;
+}
+.cheat-grid span { color: var(--txt-dim); }
+
+@media (max-width: 640px) {
+  .dork { grid-template-columns: 1fr; }
+  .dork-engines { grid-column: 1 / 2; grid-row: auto; min-width: 0; flex-direction: row; flex-wrap: wrap; align-items: center; }
+}

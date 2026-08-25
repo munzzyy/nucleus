@@ -67,6 +67,8 @@ CONSOLES: list[dict] = [
      "tag": "developer",      "desc": "Encoders, hashes, JWT, JSON, generators, time, regex, CIDR — the everyday dev toolbelt."},
     {"slug": "systems", "name": "Systems",  "port": 8940,
      "tag": "systems",        "desc": "Live local machine health — CPU, memory, disk, network, processes, sensors."},
+    {"slug": "dork",    "name": "Dork",     "port": 8950,
+     "tag": "search",         "desc": "Point it at a website — builds the full professional dork set across every engine + specialist source."},
 ]
 # Other local apps Nucleus knows how to point at (not part of this repo).
 EXTERNAL_APPS: list[dict] = [

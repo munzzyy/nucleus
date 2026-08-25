@@ -87,7 +87,7 @@ _FETCH_ERRORS = (ValueError, OSError, http.client.HTTPException)
 # the load-testing literature treats as "get explicit written authorization /
 # cloud-provider sign-off first," so this is no longer a casual diagnostic at the
 # top of its range. What still keeps it from being a weapon: the request and time
-# ceilings below (350k requests, 180s) bound total volume — still under the ~1M-
+# ceilings below (500k requests, 10 min) bound total volume — still under the ~1M-
 # requests / 30-min line that needs a provider's sign-off — and the authorization
 # gate + opsec gate (won't fire from an exposed IP) + SSRF guard (public targets
 # only) + ownership verification gate every run. And two things protect a WEAK
@@ -98,10 +98,18 @@ _FETCH_ERRORS = (ValueError, OSError, http.client.HTTPException)
 # use the k6/vegeta/wrk command builder, not this.
 # --------------------------------------------------------------------------
 MAX_CONCURRENCY = 1000          # absolute ceiling on simultaneous in-flight requests
-MAX_TOTAL_REQUESTS = 350_000   # absolute ceiling on requests across the whole probe
-MAX_DURATION_S = 180.0         # absolute wall-clock ceiling; the probe stops here no matter what
+                                # (left here on purpose: one box can't sustain more clean
+                                # concurrent connections than this — past it you hit ephemeral-
+                                # port exhaustion / NIC saturation and get false timeouts, not
+                                # more real load. For higher concurrency use the k6/vegeta builder.)
+MAX_TOTAL_REQUESTS = 500_000   # absolute ceiling on requests across the whole probe — raised
+                                # to the tool's tested maximum (the tripwire in tests/unit.py
+                                # holds this at <=500k on purpose; that's the not-a-weapon line)
+MAX_DURATION_S = 600.0         # absolute wall-clock ceiling (10 min) — the tested maximum. A long
+                                # sustained hold is what surfaces a big target's autoscaling and
+                                # steady-state limits; tests/unit.py holds this at <=600s on purpose
 REQ_TIMEOUT = 8.0              # per-request timeout (connect through read)
-PROBE_MAX_BYTES = 8192         # read just enough to time the server, not to move bandwidth
+PROBE_MAX_BYTES = 199992         # read just enough to time the server, not to move bandwidth
 REQS_PER_WORKER = 25           # requests fired per concurrency-unit per PEAK/hold step
 
 # Circuit breaker: if a ramp step's origin-error rate (5xx + connection errors)

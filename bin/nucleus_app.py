@@ -29,6 +29,7 @@ SERVERS = [
     ("hub", "hub.app"), ("recon", "consoles.recon.app"),
     ("redcell", "consoles.redcell.app"), ("bastion", "consoles.bastion.app"),
     ("devkit", "consoles.devkit.app"), ("systems", "consoles.systems.app"),
+    ("dork", "consoles.dork.app"),
 ]
 _coleos_proc = None
 
@@ -145,6 +146,7 @@ def run_app(selftest: bool = False) -> int:
     add("Bastion", go(8920), tip="Defensive / opsec")
     add("Devkit", go(8930), tip="Dev toolbelt")
     add("Systems", go(8940), tip="Local machine health")
+    add("Dork", go(8950), tip="Search-dork generator")
     tb.addSeparator()
     add("←", view.back, "Alt+Left", "Back")
     add("↻", view.reload, "F5", "Reload")

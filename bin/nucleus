@@ -6,6 +6,8 @@
   nucleus up --only recon,bastion   start just those
   nucleus status        show what's online
   nucleus open [name]   open a console in the browser (default: hub)
+  nucleus firefox [name] open a console in Firefox specifically (default: dork),
+                        starting it first if it isn't already running
   nucleus doctor        environment / port sanity check
 
 Every console runs on 127.0.0.1 only. Each is also independently launchable
@@ -15,7 +17,9 @@ this launcher is just the convenience of one command on one box.
 
 import argparse
 import importlib
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import webbrowser
@@ -33,8 +37,9 @@ MODULES = {
     "bastion": "consoles.bastion.app",
     "devkit": "consoles.devkit.app",
     "systems": "consoles.systems.app",
+    "dork": "consoles.dork.app",
 }
-ORDER = ["hub", "recon", "redcell", "bastion", "devkit", "systems"]
+ORDER = ["hub", "recon", "redcell", "bastion", "devkit", "systems", "dork"]
 PORT = {c["slug"]: c["port"] for c in common.CONSOLES}
 
 
@@ -154,6 +159,74 @@ def cmd_open(args):
     return 0
 
 
+def _firefox_bin():
+    """argv prefix that launches Firefox, or None if it isn't installed."""
+    for name in ("firefox", "firefox-esr", "firefox-developer-edition", "firefox-bin"):
+        path = shutil.which(name)
+        if path:
+            return [path]
+    flatpak = shutil.which("flatpak")
+    if flatpak:
+        try:
+            if subprocess.run([flatpak, "info", "org.mozilla.firefox"],
+                              capture_output=True, timeout=4, check=False).returncode == 0:
+                return [flatpak, "run", "org.mozilla.firefox"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def cmd_firefox(args):
+    """Open a console in Firefox specifically — start it first if it's down.
+
+    Defaults to the Dork console, which is built to hand its queries straight
+    to Firefox. Handy when the system default browser isn't Firefox."""
+    slug = args.name or "dork"
+    if slug not in PORT:
+        print(f"unknown console: {slug} (choose from {', '.join(ORDER)})")
+        return 1
+    ff = _firefox_bin()
+    if ff is None:
+        print("Firefox not found on PATH. Install it, or use `nucleus open` for the default browser.")
+        return 1
+
+    port = PORT[slug]
+    srv = None
+    if not _port_busy(port):
+        try:
+            mod = importlib.import_module(MODULES[slug])
+            srv = common.serve(mod.build_app(), port=port, block=False)
+        except Exception as e:
+            print(f"could not start {slug}: {type(e).__name__}: {e}")
+            return 1
+        for _ in range(50):  # wait until it answers so Firefox doesn't race the bind
+            if _port_busy(port):
+                break
+            time.sleep(0.1)
+
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        subprocess.Popen(ff + [url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        print(f"could not launch Firefox: {e}")
+        return 1
+    print(f"Opened {slug} in Firefox → {url}")
+
+    if srv is not None:  # we started it — hold it open so the tab keeps working
+        print("(serving this console; Ctrl-C to stop)")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\nStopping…")
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+    return 0
+
+
 def cmd_doctor(args):
     ok = True
     print("Nucleus doctor\n")
@@ -193,8 +266,12 @@ def main():
     st.set_defaults(func=cmd_status)
 
     op = sub.add_parser("open", help="open a console in the browser")
-    op.add_argument("name", nargs="?", help="hub|recon|redcell|bastion|devkit|systems")
+    op.add_argument("name", nargs="?", help="hub|recon|redcell|bastion|devkit|systems|dork")
     op.set_defaults(func=cmd_open)
+
+    ff = sub.add_parser("firefox", help="open a console in Firefox (default: dork), starting it if needed")
+    ff.add_argument("name", nargs="?", help="dork|hub|recon|redcell|bastion|devkit|systems")
+    ff.set_defaults(func=cmd_firefox)
 
     dr = sub.add_parser("doctor", help="environment sanity check")
     dr.set_defaults(func=cmd_doctor)

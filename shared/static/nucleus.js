@@ -356,6 +356,7 @@
     { slug: "bastion", name: "Bastion", port: 8920 },
     { slug: "devkit", name: "Devkit", port: 8930 },
     { slug: "systems", name: "Systems", port: 8940 },
+    { slug: "dork", name: "Dork", port: 8950 },
   ];
 
   function renderSwitcher(list, self) {
@@ -391,8 +392,8 @@
   // palette works from anywhere) — matching every console's own keydown
   // handlers (Enter-to-run etc), which still work normally since we bail out
   // before touching typed keys.
-  const SHORTCUT_PORTS = { h: 8890, r: 8900, d: 8910, b: 8920, e: 8930, s: 8940,
-    "1": 8890, "2": 8900, "3": 8910, "4": 8920, "5": 8930, "6": 8940 };
+  const SHORTCUT_PORTS = { h: 8890, r: 8900, d: 8910, b: 8920, e: 8930, s: 8940, k: 8950,
+    "1": 8890, "2": 8900, "3": 8910, "4": 8920, "5": 8930, "6": 8940, "7": 8950 };
   let helpOverlayEl = null;
   let helpCloseEl = null;
   let helpPrevFocus = null;
@@ -407,7 +408,7 @@
   }
 
   function primaryInput() {
-    return document.querySelector("#q, #run-target, #report-domain, #dk-input");
+    return document.querySelector("#q, #run-target, #report-domain, #dk-input, #dork-domain");
   }
 
   // --- modal focus trap ----------------------------------------------------
@@ -470,7 +471,8 @@
       ["g b", "go to Bastion"],
       ["g e", "go to Devkit"],
       ["g s", "go to Systems"],
-      ["1 2 3 4 5 6", "same, one key"],
+      ["g k", "go to Dork"],
+      ["1 2 3 4 5 6 7", "same, one key"],
       ["?", "toggle this help"],
       ["Esc", "close this / blur a field"],
     ];
@@ -783,7 +785,7 @@
         gPendingTimer = setTimeout(() => { gPending = false; }, 1200);
         return;
       }
-      if (/^[1-6]$/.test(e.key)) {
+      if (/^[1-7]$/.test(e.key)) {
         e.preventDefault();
         location.href = portUrl(SHORTCUT_PORTS[e.key]) + "/";
         return;

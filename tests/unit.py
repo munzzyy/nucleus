@@ -66,6 +66,8 @@ from consoles.bastion.app import build_app as _bastion_build_app
 from consoles.devkit import tools as devkit_tools
 from consoles.devkit.app import build_app as _devkit_build_app
 from consoles.systems import sysinfo
+from consoles.dork import generator as dork_generator
+from consoles.dork import app as dork_app
 
 # tests/ on path so the labeled-corpus benchmark is importable as a CI floor
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -4297,6 +4299,232 @@ class NanpAreaCodeTests(unittest.TestCase):
     def test_unknown_area_code_is_empty_not_a_crash(self):
         out = self.fn("000")
         self.assertFalse(out)  # None / "" / {} — a miss, never a raise
+
+
+# ==========================================================================
+# consoles/dork/generator.py — normalize() + dork_set()
+# The generator only builds strings, so the risk here isn't network safety —
+# it's that a bad normalize() silently dorks the wrong host, or that a template
+# stops substituting and ships a literal "{host}" into a live search query.
+# ==========================================================================
+class DorkNormalizeTests(unittest.TestCase):
+    def test_plain_domain(self):
+        self.assertEqual(dork_generator.normalize("gomoon.ai"), ("gomoon.ai", "gomoon.ai", "gomoon"))
+
+    def test_strips_scheme_path_query_and_www(self):
+        host, apex, brand = dork_generator.normalize("https://www.Example.com/a/b?x=1#z")
+        self.assertEqual((host, apex, brand), ("example.com", "example.com", "example"))
+
+    def test_subdomain_keeps_host_but_derives_apex(self):
+        host, apex, brand = dork_generator.normalize("app.gomoon.ai")
+        self.assertEqual(host, "app.gomoon.ai")
+        self.assertEqual(apex, "gomoon.ai")
+        self.assertEqual(brand, "gomoon")
+
+    def test_multi_part_suffix(self):
+        # foo.co.uk -> apex foo.co.uk (not co.uk), brand foo (not co)
+        self.assertEqual(dork_generator.normalize("shop.foo.co.uk"), ("shop.foo.co.uk", "foo.co.uk", "foo"))
+
+    def test_strips_port_but_not_ipv6_confusion(self):
+        host, _apex, _brand = dork_generator.normalize("example.com:8443")
+        self.assertEqual(host, "example.com")
+
+    def test_junk_raises_valueerror(self):
+        for bad in ("not a domain", "", "http://", "just-a-word", "1.2.3"):
+            with self.assertRaises(ValueError):
+                dork_generator.normalize(bad)
+
+
+class DorkSetTests(unittest.TestCase):
+    def setUp(self):
+        self.data = dork_generator.dork_set("gomoon.ai")
+
+    def test_shape(self):
+        self.assertEqual(self.data["host"], "gomoon.ai")
+        self.assertEqual(self.data["apex"], "gomoon.ai")
+        self.assertEqual(self.data["brand"], "gomoon")
+        self.assertGreaterEqual(len(self.data["categories"]), 5)
+        self.assertGreater(len(self.data["sources"]), 5)
+
+    def test_count_matches_actual_dorks(self):
+        actual = sum(len(c["dorks"]) for c in self.data["categories"])
+        self.assertEqual(self.data["count"], actual)
+        self.assertGreater(actual, 20)
+
+    def test_no_unsubstituted_template_tokens_anywhere(self):
+        # The single worst regression: a template that stops substituting and
+        # ships "{host}"/"{apex}"/"{brand}" into a live query or source URL.
+        blobs = []
+        for c in self.data["categories"]:
+            for d in c["dorks"]:
+                blobs.append(d["query"])
+        for s in self.data["sources"]:
+            blobs.append(s["url"])
+        for b in blobs:
+            self.assertNotIn("{", b, f"unsubstituted token in: {b}")
+            self.assertNotIn("}", b, f"unsubstituted token in: {b}")
+
+    def test_every_dork_has_query_label_why_and_valid_risk(self):
+        for c in self.data["categories"]:
+            for d in c["dorks"]:
+                self.assertTrue(d["label"] and d["query"] and d["why"])
+                self.assertIn(d["risk"], ("info", "recon", "sensitive"))
+
+    def test_site_dorks_target_the_host(self):
+        first = self.data["categories"][0]["dorks"][0]["query"]
+        self.assertEqual(first, "site:gomoon.ai")
+
+    def test_brand_override_flows_into_leak_dorks(self):
+        data = dork_generator.dork_set("gomoon.ai", keyword="Moonshot Labs")
+        self.assertEqual(data["brand"], "Moonshot Labs")
+        joined = "\n".join(d["query"] for c in data["categories"] for d in c["dorks"])
+        self.assertIn("Moonshot Labs", joined)
+
+    def test_sources_are_all_https_urls_for_the_apex(self):
+        for s in self.data["sources"]:
+            self.assertTrue(s["url"].startswith("https://") or s["url"].startswith("http://"))
+            self.assertTrue(s["name"] and s["why"])
+        # crt.sh must carry the apex, wildcard-encoded
+        crt = [s for s in self.data["sources"] if "crt.sh" in s["url"]]
+        self.assertTrue(crt and "gomoon.ai" in crt[0]["url"])
+
+
+# ==========================================================================
+# consoles/dork — per-engine translation, source allowlist, Firefox launcher
+# The whole point of the console is that a Google-syntax dork gets translated
+# per engine (Bing wants inbody:, Yandex wants mime:, ...) and that the
+# "Open in Firefox" launcher can only ever open a server-built engine URL or an
+# allowlisted specialist source — never an arbitrary client URL.
+# ==========================================================================
+class DorkEngineTranslateTests(unittest.TestCase):
+    def test_engine_search_url_keys_match_engines(self):
+        # server URL templates must cover exactly the engines the UI offers
+        self.assertEqual(set(dork_generator.ENGINE_SEARCH_URL), set(dork_generator.ENGINES))
+        for tmpl in dork_generator.ENGINE_SEARCH_URL.values():
+            self.assertIn("{q}", tmpl)
+            self.assertTrue(tmpl.startswith("https://"))
+
+    def test_engine_search_url_encodes_and_is_https(self):
+        u = dork_generator.engine_search_url("google", 'site:x.com filetype:env "a b"')
+        self.assertTrue(u.startswith("https://www.google.com/search?q="))
+        self.assertNotIn(" ", u)          # spaces url-encoded
+        self.assertIn("filetype%3Aenv", u)
+
+    def test_engine_search_url_rejects_unknown_engine(self):
+        with self.assertRaises(ValueError):
+            dork_generator.engine_search_url("altavista", "x")
+
+    def test_leading_dash_query_becomes_a_safe_https_url(self):
+        # a query that looks like a CLI flag must still yield an https:// URL,
+        # so it can never be read as a Firefox argv flag
+        u = dork_generator.engine_search_url("google", "-inanchor:foo")
+        self.assertTrue(u.startswith("https://"))
+
+    def test_bing_and_brave_rename_intext_to_inbody(self):
+        for e in ("bing", "brave"):
+            q, level = dork_generator.translate_query('site:x.com intext:"api_key"', e)
+            self.assertIn("inbody:", q)
+            self.assertNotIn("intext:", q)
+            self.assertEqual(level, "full")
+
+    def test_yandex_renames_filetype_and_intitle(self):
+        q, level = dork_generator.translate_query("site:x.com filetype:sql", "yandex")
+        self.assertIn("mime:sql", q)
+        self.assertEqual(level, "full")
+        q2, _ = dork_generator.translate_query('site:x.com intitle:"login"', "yandex")
+        self.assertIn("title:", q2)
+        self.assertNotIn("intitle:", q2)
+
+    def test_yandex_and_ddg_degrade_on_inurl(self):
+        for e in ("yandex", "duckduckgo"):
+            _q, level = dork_generator.translate_query("site:x.com inurl:admin", e)
+            self.assertEqual(level, "degraded")
+
+    def test_google_native_never_degrades_or_rewrites(self):
+        src = "site:x.com (inurl:id= OR intitle:login) filetype:env"
+        q, level = dork_generator.translate_query(src, "google")
+        self.assertEqual(q, src)
+        self.assertEqual(level, "full")
+
+    def test_ext_inside_intext_is_not_clipped(self):
+        # the boundary trap: an 'ext:' rename must NOT fire inside 'intext:'
+        q, _level = dork_generator.translate_query('site:x.com intext:"pw"', "yandex")
+        self.assertNotIn("intmime:", q)
+        self.assertIn("intext:", q)   # unsupported on yandex, left intact (flagged)
+
+    def test_every_dork_has_a_variant_for_every_engine(self):
+        data = dork_generator.dork_set("example.com")
+        for c in data["categories"]:
+            for d in c["dorks"]:
+                self.assertEqual(set(d["eng"]), set(dork_generator.ENGINES))
+                for e, v in d["eng"].items():
+                    self.assertIn(v["level"], ("full", "degraded"))
+                    self.assertNotIn("{", v["q"])
+                    self.assertNotIn("}", v["q"])
+
+
+class DorkSourceAllowlistTests(unittest.TestCase):
+    def test_allowlist_covers_every_source_host(self):
+        # SOURCE_HOSTS is what the Firefox launcher trusts; if _sources() emits a
+        # host that isn't in it, that source can't be opened — they must not drift
+        from urllib.parse import urlparse
+        hosts = {urlparse(s["url"]).hostname for s in dork_generator._sources("example.com")}
+        self.assertTrue(hosts)
+        self.assertTrue(hosts <= set(dork_generator.SOURCE_HOSTS),
+                        f"sources not in allowlist: {hosts - set(dork_generator.SOURCE_HOSTS)}")
+
+
+class DorkOpenTargetsTests(unittest.TestCase):
+    def test_engine_query_target_builds_server_side_url(self):
+        urls, problems = dork_app._resolve_targets([{"engine": "google", "query": "site:x.com"}])
+        self.assertEqual(problems, [])
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0].startswith("https://www.google.com/search?q="))
+
+    def test_allowlisted_source_url_is_accepted(self):
+        urls, problems = dork_app._resolve_targets([{"url": "https://crt.sh/?q=%25.example.com"}])
+        self.assertEqual(problems, [])
+        self.assertEqual(urls, ["https://crt.sh/?q=%25.example.com"])
+
+    def test_blocked_host_and_scheme_are_rejected(self):
+        urls, problems = dork_app._resolve_targets([
+            {"url": "https://evil.example.net/x"},
+            {"url": "file:///etc/passwd"},
+            {"url": "http://crt.sh/x"},          # http (not https) rejected by shape
+            {"url": "javascript:alert(1)"},
+        ])
+        self.assertEqual(urls, [])
+        self.assertEqual(len(problems), 4)
+
+    def test_bad_engine_and_empty_and_overlong_query(self):
+        long_q = "a" * (dork_app.MAX_QUERY_LEN + 1)
+        urls, problems = dork_app._resolve_targets([
+            {"engine": "nope", "query": "x"},
+            {"engine": "google", "query": ""},
+            {"engine": "google", "query": long_q},
+        ])
+        self.assertEqual(urls, [])
+        self.assertEqual(len(problems), 3)
+
+    def test_all_resolved_urls_are_https(self):
+        # the argv-injection invariant: nothing handed to Firefox can be a flag
+        urls, _ = dork_app._resolve_targets([
+            {"engine": "duckduckgo", "query": "-flaglike"},
+            {"url": "https://github.com/search?q=x"},
+        ])
+        self.assertTrue(urls)
+        self.assertTrue(all(u.startswith("https://") for u in urls))
+
+    def test_safe_url_re_rejects_whitespace_and_controls(self):
+        self.assertIsNone(dork_app._SAFE_URL_RE.match("https://crt.sh/ x"))
+        self.assertIsNone(dork_app._SAFE_URL_RE.match("https://crt.sh/\nx"))
+        self.assertIsNotNone(dork_app._SAFE_URL_RE.match("https://crt.sh/ok"))
+
+
+class DorkFirefoxLauncherTests(unittest.TestCase):
+    def test_launcher_is_a_list_of_str_or_none(self):
+        got = dork_app._firefox_launcher()
+        self.assertTrue(got is None or (isinstance(got, list) and all(isinstance(x, str) for x in got)))
 
 
 if __name__ == "__main__":

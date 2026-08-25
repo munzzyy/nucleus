@@ -6,7 +6,7 @@ You had three piles of security work that never talked to each other: the OSINT 
 
 The design constraint was to match how the rest of your stack already works: a small stdlib-only Python server bound to loopback, serving a hardened local web UI, with zero dependencies to audit. Same shape as coleos-hub and the old osint-console. That keeps the security surface tiny and means there's nothing to `pip install` and vet.
 
-"One app, but it can be many" is solved by making one shared server core and thin consoles on top of it. It started as three security consoles; it's now five — the same two toolbelt consoles most machines want (a developer kit and a live system monitor) ride the exact same core. Run them together on one box and the launcher + switcher make it feel like a single app. Copy the repo to more machines and run one console on each; they still cross-link over loopback.
+"One app, but it can be many" is solved by making one shared server core and thin consoles on top of it. It started as three security consoles; it's now six — two toolbelt consoles most machines want (a developer kit and a live system monitor) and a search-dork generator all ride the exact same core. Run them together on one box and the launcher + switcher make it feel like a single app. Copy the repo to more machines and run one console on each; they still cross-link over loopback.
 
 ## Pieces
 
@@ -16,7 +16,7 @@ The design constraint was to match how the rest of your stack already works: a s
                        │  strict CSP, same-origin only │
                        └──────────────┬──────────────┘
                                       │ each tab talks ONLY to its own origin
-   hub :8890   recon :8900   redcell :8910   bastion :8920   devkit :8930   systems :8940   coleos-hub :4747
+   hub :8890   recon :8900   redcell :8910   bastion :8920   devkit :8930   systems :8940   dork :8950   coleos-hub :4747
         │           │             │               │              │              │            (external)
         └──────────── all import shared/common.py ──────────────────────────────┘
                         (one server core, one set of guards)
@@ -111,7 +111,7 @@ On top of that base, `shared/static/nucleus.js` provides one small **result kit*
 - `N.announce(msg)` — a shared visually-hidden `aria-live` region; every `N.toast` also announces.
 - `N.stateCard(kind, msg)` — honest loading / empty / error blocks, so a failure renders red (`var(--bad)`) with an alert role instead of a muted dash.
 
-`nucleus.js` also holds the cross-console furniture: the switcher (with live sibling health dots), the keyboard shortcuts (`g` + a letter to jump, `/` to focus a console's main input, `1`–`6` for the six pages), and the **command palette**. Ctrl-K / Cmd-K opens a fuzzy launcher whose entries are computed at open time from two sources: one "Go to <console>" per sibling, and one entry per `.section-title` and card heading on the current page (scroll-into-view), plus any commands a console registers via `N.registerCommand({label, run, section})`. When the query is empty it shows a most-recently-used list first (persisted through `N.remember("cmd-mru")`). Because it discovers sections from the DOM, it works on every console with zero per-console registration — a new tool that adds a heading is reachable from the palette for free. Both the palette and the `?` help overlay trap focus (Tab/Shift-Tab cycle within) and restore focus to the previously-focused element on close. It's exposed as `N.openCommandPalette()` / `N.closeCommandPalette()`.
+`nucleus.js` also holds the cross-console furniture: the switcher (with live sibling health dots), the keyboard shortcuts (`g` + a letter to jump, `/` to focus a console's main input, `1`–`7` for the seven pages), and the **command palette**. Ctrl-K / Cmd-K opens a fuzzy launcher whose entries are computed at open time from two sources: one "Go to <console>" per sibling, and one entry per `.section-title` and card heading on the current page (scroll-into-view), plus any commands a console registers via `N.registerCommand({label, run, section})`. When the query is empty it shows a most-recently-used list first (persisted through `N.remember("cmd-mru")`). Because it discovers sections from the DOM, it works on every console with zero per-console registration — a new tool that adds a heading is reachable from the palette for free. Both the palette and the `?` help overlay trap focus (Tab/Shift-Tab cycle within) and restore focus to the previously-focused element on close. It's exposed as `N.openCommandPalette()` / `N.closeCommandPalette()`.
 
 ## Extending it
 

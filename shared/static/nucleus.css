@@ -17,6 +17,7 @@
   --bastion: #38d39f;     /* defensive green */
   --devkit: #f2a541;      /* developer amber */
   --systems: #31c8d6;     /* systems cyan */
+  --dork: #e879f9;        /* search magenta */
   --warn: #ffb454;
   --ok: #38d39f;
   --bad: #ff5c72;
@@ -48,6 +49,7 @@ body[data-accent="redcell"] { --accent: var(--redcell); }
 body[data-accent="bastion"] { --accent: var(--bastion); }
 body[data-accent="devkit"]  { --accent: var(--devkit); }
 body[data-accent="systems"] { --accent: var(--systems); }
+body[data-accent="dork"]    { --accent: var(--dork); }
 
 /* ---- topbar + opsec bar wrapper ----
    Both sit inside one sticky wrapper, stacked in normal document flow
@@ -195,6 +197,7 @@ td.mono, .mono { font-family: var(--mono); }
   opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
 #toast.bad { border-color: var(--bad); } #toast.ok { border-color: var(--ok); }
+#toast.warn { border-color: var(--warn); }
 
 /* ---- misc ---- */
 .spinner { width: 15px; height: 15px; border: 2px solid var(--txt-faint); border-top-color: var(--accent);

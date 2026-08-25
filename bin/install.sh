@@ -40,7 +40,7 @@ Icon=nucleus
 Terminal=false
 StartupWMClass=Nucleus
 Categories=Security;Network;Development;Utility;System;
-Keywords=osint;pentest;security;opsec;recon;devtools;encode;hash;jwt;system;monitor;
+Keywords=osint;pentest;security;opsec;recon;devtools;encode;hash;jwt;system;monitor;dork;
 EOF
 echo "   • menu entry: Nucleus (native app, one click)"
 

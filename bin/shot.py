@@ -6,7 +6,7 @@ their async fetches, so it captures an empty shell. This drives Firefox over
 Marionette instead: navigate, wait for the app to settle (or a fixed delay),
 then grab a full-page screenshot. Stdlib only.
 
-Usage: python3 bin/shot.py <url> <out.png> [wait_seconds]
+Usage: python3 bin/shot.py <url> <out.png> [wait_seconds] [width] [height]
 """
 import base64
 import json
@@ -62,10 +62,12 @@ class Marionette:
 
 def main():
     if len(sys.argv) < 3:
-        print("usage: shot.py <url> <out.png> [wait_seconds]", file=sys.stderr)
+        print("usage: shot.py <url> <out.png> [wait_seconds] [width] [height]", file=sys.stderr)
         return 2
     url, out = sys.argv[1], sys.argv[2]
     wait = float(sys.argv[3]) if len(sys.argv) > 3 else 3.0
+    width = int(sys.argv[4]) if len(sys.argv) > 4 else 1440
+    height = int(sys.argv[5]) if len(sys.argv) > 5 else 2200
 
     ff = shutil.which("firefox")
     if not ff:
@@ -74,7 +76,7 @@ def main():
     profile = tempfile.mkdtemp(prefix="nuc-shot-")
     proc = subprocess.Popen(
         [ff, "--headless", "--marionette", "--profile", profile,
-         "--window-size", "1440,2200", "about:blank"],
+         "--window-size", f"{width},{height}", "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
@@ -90,7 +92,7 @@ def main():
             print("marionette never came up", file=sys.stderr)
             return 4
         client.command("WebDriver:NewSession", {})
-        client.command("WebDriver:SetWindowRect", {"width": 1440, "height": 2200, "x": 0, "y": 0})
+        client.command("WebDriver:SetWindowRect", {"width": width, "height": height, "x": 0, "y": 0})
         client.command("WebDriver:Navigate", {"url": url})
         time.sleep(wait)  # let async fetches paint (in-script sleep is fine)
         res = client.command("WebDriver:TakeScreenshot", {"full": True, "hash": False})

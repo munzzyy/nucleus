@@ -37,6 +37,7 @@ APPS = {
     "bastion": "consoles.bastion.app",
     "devkit": "consoles.devkit.app",
     "systems": "consoles.systems.app",
+    "dork": "consoles.dork.app",
 }
 BASE_PORT = {c["slug"]: c["port"] for c in common.CONSOLES}
 
@@ -403,6 +404,67 @@ def main():
               st == 200 and isinstance(tot, (int, float)) and tot > 0, str(j)[:120])
         st, j = jget(port, "/api/systems/disks")
         check("systems disks reachable", st == 200, str(j)[:120])
+
+    # ---- dork (pure string logic; POST builds the query set, no network) ----
+    if "dork" in servers:
+        print("\nDork:")
+        port = servers["dork"][1]
+        st, j = jget(port, "/api/dork", method="POST", body={"domain": "gomoon.ai"})
+        cats = j.get("categories") if isinstance(j, dict) else None
+        check("dork builds a set", st == 200 and isinstance(cats, list) and len(cats) >= 5, str(j)[:160])
+        check("dork counts dorks + sources",
+              isinstance(j, dict) and j.get("count", 0) > 20 and len(j.get("sources") or []) > 5, str(j)[:120])
+        check("dork derives apex + brand",
+              isinstance(j, dict) and j.get("apex") == "gomoon.ai" and j.get("brand") == "gomoon", str(j)[:120])
+        # a URL is normalized down to its host, not rejected
+        st, j = jget(port, "/api/dork", method="POST", body={"domain": "https://app.gomoon.ai/login?x=1"})
+        check("dork normalizes a full URL", st == 200 and isinstance(j, dict) and j.get("host") == "app.gomoon.ai", str(j)[:120])
+        # junk input is a clean 400, not a 500
+        st, j = jget(port, "/api/dork", method="POST", body={"domain": "not a domain"})
+        check("dork rejects junk with 400", st == 400, str(j)[:120])
+        # POST-only, and CSRF-guarded like every mutating route
+        st, _ = req(port, "/api/dork?domain=example.com", method="GET")
+        check("dork not GET-reachable", st in (404, 405), f"got {st}")
+        noorigin = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/dork", method="POST", data=b'{"domain":"example.com"}',
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(noorigin, timeout=5) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("dork POST without Origin refused", code == 403, f"got {code}")
+
+        # per-engine translation rides along in the response
+        st, j = jget(port, "/api/dork", method="POST", body={"domain": "gomoon.ai"})
+        cats0 = j.get("categories") if isinstance(j, dict) else None
+        d0 = cats0[0]["dorks"][0] if (cats0 and cats0[0].get("dorks")) else {}
+        check("dork carries per-engine variants",
+              isinstance(d0.get("eng"), dict) and "yandex" in d0.get("eng", {}), str(d0)[:140])
+
+        # ---- /api/open (the Firefox launcher) — only the reject paths, so no
+        # browser is ever spawned during the smoke run ----
+        st, j = jget(port, "/api/open", method="POST", body={"targets": []})
+        check("open rejects empty targets (400)", st == 400, f"got {st}")
+        st, j = jget(port, "/api/open", method="POST", body={"targets": [{"url": "https://evil.example.net/x"}]})
+        check("open rejects a non-allowlisted source host (400)", st == 400, str(j)[:120])
+        st, j = jget(port, "/api/open", method="POST", body={"targets": [{"engine": "nope", "query": "x"}]})
+        check("open rejects an unknown engine (400)", st == 400, str(j)[:120])
+        big = [{"engine": "google", "query": f"q{i}"} for i in range(60)]
+        st, j = jget(port, "/api/open", method="POST", body={"targets": big})
+        check("open caps the target count (400)", st == 400, str(j)[:120])
+        st, _ = req(port, "/api/open", method="GET")
+        check("open not GET-reachable", st in (404, 405), f"got {st}")
+        noorigin2 = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/open", method="POST",
+            data=b'{"targets":[{"engine":"google","query":"x"}]}',
+            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(noorigin2, timeout=5) as r:
+                code2 = r.status
+        except urllib.error.HTTPError as e:
+            code2 = e.code
+        check("open POST without Origin refused (CSRF)", code2 == 403, f"got {code2}")
 
     # ---- hub (control panel overview v2: honest per-source status keys) ----
     if "hub" in servers:

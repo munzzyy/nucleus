@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dork — Nucleus</title>
+<link rel="stylesheet" href="/shared/nucleus.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-app="dork" data-auto-shell data-accent="dork">
+
+<div class="wrap">
+  <div class="page-head">
+    <h1>Dork <span class="tag">search recon</span></h1>
+    <p>Give it a website. It builds the full professional dork set a pro would run during passive
+      recon — attack surface, exposed files, config &amp; secrets, login panels, API docs, cloud
+      &amp; DevOps leaks, off-domain code/paste leaks, people OSINT, tech fingerprinting, and
+      parameter hunting — every query one click away across Google, Bing, DuckDuckGo, Yandex, and
+      Brave, plus direct links into the specialist sources operators can't reach (cert transparency,
+      Shodan, GitHub code search, the Wayback Machine). With <b>Links → Firefox</b> on, any dork —
+      or a whole category — opens straight into real Firefox tabs.</p>
+  </div>
+
+  <div class="card auth-note" role="note">
+    <strong>Passive recon only.</strong> Every result here is content a search engine already indexed —
+    building the queries touches nothing. <em>Running</em> them, and acting on anything they surface, is
+    only authorized against assets you own or have written permission to test (a pentest scope, a bug-bounty
+    program). If a dork reveals a live secret, report it — don't use it.
+  </div>
+
+  <div class="card">
+    <form id="dork-form">
+      <div class="row">
+        <div class="field grow">
+          <label for="dork-domain">Target website</label>
+          <input type="text" id="dork-domain" name="domain" autocomplete="off" spellcheck="false"
+                 placeholder="e.g. gomoon.ai  ·  example.com  ·  app.target.co.uk">
+        </div>
+        <div class="field w160">
+          <label for="dork-brand">Brand / org <span class="faint">(optional)</span></label>
+          <input type="text" id="dork-brand" name="keyword" autocomplete="off" spellcheck="false"
+                 placeholder="auto from domain">
+        </div>
+        <div class="field w160">
+          <label for="dork-engine">Primary engine</label>
+          <select id="dork-engine" name="engine">
+            <option value="google" selected>Google</option>
+            <option value="bing">Bing</option>
+            <option value="duckduckgo">DuckDuckGo</option>
+            <option value="yandex">Yandex</option>
+            <option value="brave">Brave</option>
+          </select>
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="submit" id="dork-btn">Generate</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div id="dork-status" class="mt faint hidden" aria-live="polite"></div>
+
+  <div id="dork-meta" class="dork-meta mt hidden" aria-live="polite"></div>
+
+  <!-- Copy-all / export bar, populated once a set is generated. -->
+  <div id="dork-toolbar" class="mt hidden"></div>
+
+  <div id="dork-results" class="mt"></div>
+
+  <div id="dork-sources-wrap" class="hidden">
+    <div class="section-title">Specialist sources</div>
+    <p class="sub">Direct deep links Google operators can't reach — certificate transparency, host
+      scan data, code search, and archives. These open the source with your target pre-loaded.</p>
+    <div id="dork-sources" class="pivot-grid mt"></div>
+  </div>
+
+  <div class="section-title">Operator cheat sheet</div>
+  <div class="card">
+    <details id="dork-cheatsheet">
+      <summary>Search operators — what each one does</summary>
+      <div class="cheat-grid mt">
+        <div><code>site:</code><span>restrict to one domain — scopes everything</span></div>
+        <div><code>inurl:</code><span>term appears in the URL path</span></div>
+        <div><code>intitle:</code><span>term in the page &lt;title&gt;</span></div>
+        <div><code>intext:</code><span>term in the page body</span></div>
+        <div><code>filetype: / ext:</code><span>restrict to a file extension</span></div>
+        <div><code>"exact phrase"</code><span>quotes force an exact match</span></div>
+        <div><code>-term</code><span>exclude results containing term</span></div>
+        <div><code>OR / |</code><span>either term matches</span></div>
+        <div><code>*</code><span>wildcard for an unknown word in a phrase</span></div>
+        <div><code>before: / after:</code><span>date-bound results (Google)</span></div>
+      </div>
+      <p class="sub mt">The skill is <em>stacking</em> them: <code>site:target.com filetype:env intext:"api_key"</code>
+        is a completely different question than any part alone.</p>
+      <p class="sub mt">No engine actually speaks Google's dialect, so each dork is <b>translated per engine</b>
+        before it opens: Bing and Brave want <code>inbody:</code> not <code>intext:</code>; Yandex calls
+        filetype <code>mime:</code> and title <code>title:</code>, and has no <code>inurl:</code> at all;
+        DuckDuckGo reliably honors only <code>site:</code>. When an engine has no equivalent for an
+        operator a dork uses, its link is dimmed and marked <code>~</code> — the query still runs, but
+        that operator is ignored, so trust the result less. <code>before:</code>/<code>after:</code> are
+        Google-only. Dead operators (<code>cache:</code>, <code>link:</code>, <code>related:</code>) are
+        left out on purpose — Google dropped them.</p>
+    </details>
+  </div>
+</div>
+
+<script src="/shared/nucleus.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
