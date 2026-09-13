@@ -833,6 +833,189 @@
   N.openCommandPalette = openCommandPalette;
   N.closeCommandPalette = closeCommandPalette;
 
+  // --- inline security glossary --------------------------------------------
+  // One shared term -> plain-English map so SPF/DMARC/DNSSEC/etc mean something
+  // to someone who isn't a security person. N.glossary(term) returns a small
+  // "?" chip you drop next to a jargon word; N.glossaryScan walks headings and
+  // wires chips automatically. `bad` is a second sentence on what a failing
+  // result actually means, shown only where it's useful.
+  const GLOSSARY = {
+    SPF: { full: "Sender Policy Framework",
+      def: "A DNS record listing which mail servers are allowed to send email for a domain.",
+      bad: "With no SPF, anyone can forge email that looks like it came from this domain." },
+    DMARC: { full: "Domain-based Message Authentication",
+      def: "A DNS policy telling receiving servers what to do with mail that fails SPF or DKIM.",
+      bad: "With no DMARC, spoofed mail from this domain won't be rejected." },
+    DKIM: { full: "DomainKeys Identified Mail",
+      def: "A cryptographic signature on outgoing mail that proves it really came from the domain and wasn't altered.",
+      bad: "Without DKIM, receivers can't verify a message's sender or that it's untampered." },
+    DNSSEC: { full: "DNS Security Extensions",
+      def: "Signatures on DNS records that let a resolver verify the answers weren't forged in transit.",
+      bad: "Unsigned DNS can be spoofed to point visitors at an attacker's server." },
+    "MTA-STS": { full: "Mail Transfer Agent Strict Transport Security",
+      def: "A policy that forces mail sent to a domain to use encrypted, authenticated TLS.",
+      bad: "Without it, mail delivery can be silently downgraded to plaintext and read in transit." },
+    "TLS-RPT": { full: "TLS Reporting",
+      def: "A DNS record asking senders to report failed or downgraded encryption when delivering mail here.",
+      bad: "Missing it just means no visibility into mail-encryption failures." },
+    ASN: { full: "Autonomous System Number",
+      def: "The ID for a network (usually an ISP or host) that announces a block of IPs to the internet.",
+      bad: "" },
+    OFAC: { full: "Office of Foreign Assets Control",
+      def: "The US Treasury office behind the sanctions list; an OFAC hit means an address is on that blocklist.",
+      bad: "A match means transacting with it may be illegal." },
+    JWT: { full: "JSON Web Token",
+      def: "A signed token that carries login or session claims between a client and a server.",
+      bad: "Its contents are readable by anyone; only the signature stops tampering." },
+    CIDR: { full: "Classless Inter-Domain Routing",
+      def: "A compact way to write a range of IP addresses, like 192.168.0.0/24 for 256 of them.",
+      bad: "" },
+    CVE: { full: "Common Vulnerabilities and Exposures",
+      def: "A public ID for one specific known security flaw, like CVE-2021-44228.",
+      bad: "A listed CVE means this software has a documented, exploitable weakness." },
+    RDAP: { full: "Registration Data Access Protocol",
+      def: "The structured, modern replacement for WHOIS that returns who registered a domain or owns an IP block.",
+      bad: "" },
+    WHOIS: { full: "",
+      def: "A public lookup of who registered a domain or owns a block of IP addresses.",
+      bad: "" },
+    CAA: { full: "Certification Authority Authorization",
+      def: "A DNS record naming which certificate authorities may issue TLS certs for a domain.",
+      bad: "With no CAA record, any CA can issue a certificate for the domain." },
+    HSTS: { full: "HTTP Strict Transport Security",
+      def: "A header telling browsers to only ever connect to this site over HTTPS.",
+      bad: "Without it, a first visit can be downgraded to plaintext HTTP and hijacked." },
+  };
+
+  N.glossaryTerm = function (term) {
+    return GLOSSARY[String(term == null ? "" : term).toUpperCase()] || null;
+  };
+
+  let glossSeq = 0;
+  N.glossary = N.termChip = function (term) {
+    const key = String(term == null ? "" : term).toUpperCase();
+    const info = GLOSSARY[key];
+    const wrap = N.el("span", { class: "gloss" });
+    const id = "gloss-pop-" + (++glossSeq);
+    const btn = N.el("button", { type: "button", class: "gloss-chip", text: "?",
+      "aria-label": info ? ("What does " + key + " mean?") : (key + ": no definition"),
+      "aria-expanded": "false", "aria-describedby": id });
+    const pop = N.el("span", { class: "gloss-pop", id: id, role: "tooltip" });
+    if (info) {
+      pop.appendChild(N.el("b", { text: info.full ? key + " — " + info.full : key }));
+      pop.appendChild(N.el("span", { class: "gloss-def", text: info.def }));
+      if (info.bad) pop.appendChild(N.el("span", { class: "gloss-bad", text: info.bad }));
+    } else {
+      pop.appendChild(N.el("span", { class: "gloss-def", text: "No definition available." }));
+    }
+    let pinned = false;
+    // Hover/focus previews it; a click (touch + keyboard) pins it open.
+    wrap.addEventListener("mouseenter", () => wrap.classList.add("open"));
+    wrap.addEventListener("mouseleave", () => { if (!pinned) wrap.classList.remove("open"); });
+    btn.addEventListener("focus", () => wrap.classList.add("open"));
+    btn.addEventListener("blur", () => { pinned = false; btn.setAttribute("aria-expanded", "false"); wrap.classList.remove("open"); });
+    btn.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      pinned = !pinned;
+      btn.setAttribute("aria-expanded", pinned ? "true" : "false");
+      wrap.classList.toggle("open", pinned);
+    });
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && pinned) { pinned = false; btn.setAttribute("aria-expanded", "false"); wrap.classList.remove("open"); }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(pop);
+    return wrap;
+  };
+
+  // Walk headings/labels under `root` and append a chip after any glossary term
+  // that appears as a whole word. Case-sensitive (the terms are uppercase
+  // acronyms) so it can't match inside a lowercase word. Idempotent — it marks
+  // what it has already decorated, so a re-scan after a re-render is safe.
+  const _glossTerms = Object.keys(GLOSSARY).sort((a, b) => b.length - a.length);
+  const _glossRe = new RegExp("(?:^|[^A-Za-z0-9])(" + _glossTerms.join("|") + ")(?![A-Za-z0-9])", "g");
+  N.glossaryScan = function (root, selector) {
+    if (!root) return;
+    N.$$(selector || "h2, h3", root).forEach(el => {
+      if (el.hasAttribute("data-gloss-done")) return;
+      el.setAttribute("data-gloss-done", "1");
+      const text = el.textContent || "";
+      const seen = {};
+      const found = [];
+      _glossRe.lastIndex = 0;
+      let m;
+      while ((m = _glossRe.exec(text)) !== null) {
+        const key = m[1];
+        if (!seen[key]) { seen[key] = true; found.push(key); }
+      }
+      found.forEach(key => {
+        el.appendChild(document.createTextNode(" "));
+        el.appendChild(N.glossary(key));
+      });
+    });
+  };
+
+  // --- reusable confirm modal ----------------------------------------------
+  // Same focus-trap + restore contract as the help/palette overlays. Returns a
+  // promise: true on confirm, false on cancel / backdrop / Esc. Built with N.el
+  // + textContent only. `body` is an array of strings (each becomes a <p>) or
+  // ready-made nodes.
+  N.confirmModal = function (opts) {
+    opts = opts || {};
+    return new Promise(resolve => {
+      const prev = document.activeElement;
+      const overlay = N.el("div", { class: "modal-overlay", role: "dialog",
+        "aria-modal": "true", "aria-label": opts.title || "Confirm" });
+      const panel = N.el("div", { class: "modal-panel" });
+      if (opts.title) panel.appendChild(N.el("h2", { text: opts.title }));
+      (opts.body || []).forEach(b => {
+        panel.appendChild(typeof b === "string" ? N.el("p", { class: "modal-body", text: b }) : b);
+      });
+      const bar = N.el("div", { class: "modal-actions" });
+      const cancel = N.el("button", { type: "button", class: "ghost", text: opts.cancelLabel || "Cancel" });
+      const confirm = N.el("button", { type: "button", class: opts.danger ? "danger" : "", text: opts.confirmLabel || "Confirm" });
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        overlay.remove();
+        restoreFocus(prev);
+        resolve(val);
+      };
+      cancel.addEventListener("click", () => finish(false));
+      confirm.addEventListener("click", () => finish(true));
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(false); });
+      overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); finish(false); } });
+      bar.appendChild(cancel);
+      bar.appendChild(confirm);
+      panel.appendChild(bar);
+      overlay.appendChild(panel);
+      wireTrap(overlay);
+      document.body.appendChild(overlay);
+      confirm.focus();
+    });
+  };
+
+  // --- dismissible command-palette hint ------------------------------------
+  // A one-time nudge that Ctrl-K exists. Remembered per console, so once
+  // dismissed it stays gone. Drops in just under the page heading.
+  N.paletteHint = function () {
+    const store = N.remember("palette-hint");
+    if (store.get(false)) return null;
+    const bar = N.el("div", { class: "palette-hint" });
+    bar.appendChild(N.el("span", { class: "kbd", text: "Ctrl-K" }));
+    bar.appendChild(document.createTextNode(" jump to any tool or console from anywhere"));
+    const x = N.el("button", { type: "button", class: "palette-hint-x", "aria-label": "Dismiss hint", text: "×" });
+    x.addEventListener("click", () => { store.set(true); bar.remove(); });
+    bar.appendChild(x);
+    const wrap = document.querySelector(".wrap");
+    const head = wrap && wrap.querySelector(".page-head");
+    if (head && head.parentNode) head.parentNode.insertBefore(bar, head.nextSibling);
+    else if (wrap) wrap.insertBefore(bar, wrap.firstChild);
+    else document.body.appendChild(bar);
+    return bar;
+  };
+
   function mountShortcuts() {
     if (N._shortcutsWired) return;
     N._shortcutsWired = true;

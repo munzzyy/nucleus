@@ -21,7 +21,15 @@ The security model, in one place because all of it matters:
     crafted token can never address anything outside the sandbox.
   * Sessions are disposable: purge_stale() reaps anything older than
     SESSION_TTL so cleaned copies of private files don't quietly
-    accumulate on disk.
+    accumulate on disk. It runs proactively — a background daemon sweeps
+    on PURGE_INTERVAL and status() sweeps on the way in — so an idle
+    session left open for weeks still expires without any traffic.
+  * Deletion is a best-effort SECURE wipe: every file's bytes are
+    overwritten with os.urandom before the unlink. HONEST CAVEAT: on a
+    copy-on-write / wear-levelled SSD / journalling filesystem the old
+    bytes can still survive underneath; full-disk encryption is the only
+    real guarantee. The overwrite raises the bar, it doesn't promise
+    unrecoverability.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ import json
 import os
 import re
 import secrets
-import shutil
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -49,6 +57,20 @@ except ValueError:
 MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024
 
 SESSION_TTL = 24 * 3600   # seconds a session survives before purge_stale() reaps it
+_last_status_purge = 0.0
+_PURGE_MIN_INTERVAL = 300  # status() is polled often; cap its sweep to once per 5 min
+
+
+def _throttled_purge() -> None:
+    """purge_stale() but rate-limited, so a fast status poll can't hammer the
+    disk sweeping every session on every request. The background _purge_loop
+    handles the long-idle case; this is the belt-and-suspenders on the poll."""
+    global _last_status_purge
+    now = time.time()
+    if now - _last_status_purge >= _PURGE_MIN_INTERVAL:
+        _last_status_purge = now
+        purge_stale()
+PURGE_INTERVAL = 3600     # background sweep cadence — reaps idle sessions with zero traffic
 SHOW_TIMEOUT = 60.0       # mat2 --show budget
 CLEAN_TIMEOUT = 300.0     # mat2 clean budget — a video re-mux can be legitimately slow
 
@@ -233,6 +255,7 @@ def status() -> dict:
     zone) rather than pretending the panel works: a metadata cleaner that
     silently does nothing is worse than no cleaner at all."""
     global _version_cache
+    _throttled_purge()  # proactive but rate-limited so a fast status poll can't hammer disk
     sandbox = common.which("bwrap") is not None
     path = mat2_path()
     if path is None:
@@ -521,16 +544,79 @@ def cleaned_file(token: str) -> tuple[Path, str]:
     return cleaned, cleaned.name
 
 
+_OVERWRITE_CHUNK = 1024 * 1024  # 1 MiB — chunked so a big video doesn't load whole into RAM
+
+
+def _secure_delete_file(path: Path) -> None:
+    """Overwrite a file's bytes with os.urandom, flush+fsync, then unlink.
+
+    Best-effort by design (see the module docstring): a CoW/SSD/journalling
+    filesystem can keep the original blocks alive underneath us — the real
+    guarantee is full-disk encryption. This just makes the plaintext copy on
+    the visible block harder to recover than a bare unlink would. Never
+    raises; a file that can't be opened for rewrite is still unlinked."""
+    if path.is_symlink():
+        # Never follow a symlink — a hostile scrubbed archive can plant one, and
+        # overwriting through it would clobber the link's TARGET (e.g. ~/.bashrc).
+        # Drop the link itself, never its target.
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        size = path.stat().st_size
+        with open(path, "r+b", buffering=0) as f:
+            remaining = size
+            while remaining > 0:
+                n = min(_OVERWRITE_CHUNK, remaining)
+                f.write(os.urandom(n))
+                remaining -= n
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _secure_rmtree(path: Path) -> None:
+    """rmtree that overwrites every file's bytes first. Best-effort and
+    idempotent — a missing tree, or a permission hiccup on one entry, is
+    swallowed rather than raised."""
+    if not path.exists():
+        return
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            _secure_delete_file(Path(root) / name)
+        for name in dirs:
+            d = Path(root) / name
+            try:
+                # A symlinked dir (os.walk doesn't descend it): drop the link,
+                # never rmdir/recurse into its target.
+                d.unlink() if d.is_symlink() else d.rmdir()
+            except OSError:
+                pass
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
 def delete_session(token: str) -> None:
-    """Remove a session and everything in it. Idempotent — deleting a session
-    that's already gone is fine. Raises ValueError only on a malformed token."""
-    shutil.rmtree(_session_dir(token), ignore_errors=True)
+    """Securely remove a session and everything in it. Idempotent — deleting a
+    session that's already gone is fine. Raises ValueError only on a malformed
+    token."""
+    _secure_rmtree(_session_dir(token))
 
 
 def purge_stale(now: Optional[float] = None) -> int:
-    """Reap every session dir older than SESSION_TTL. Best-effort by design —
-    a permission hiccup on one dir must not break an upload — and a no-op when
-    SCRUB_DIR doesn't exist yet. Returns how many dirs were removed."""
+    """Reap every session dir older than SESSION_TTL, securely. Best-effort by
+    design — a permission hiccup on one dir must not break an upload — and a
+    no-op when SCRUB_DIR doesn't exist yet. Returns how many dirs were removed."""
     now = time.time() if now is None else now
     try:
         children = list(SCRUB_DIR.iterdir())
@@ -540,8 +626,23 @@ def purge_stale(now: Optional[float] = None) -> int:
     for child in children:
         try:
             if child.is_dir() and now - child.stat().st_mtime > SESSION_TTL:
-                shutil.rmtree(child, ignore_errors=True)
+                _secure_rmtree(child)
                 removed += 1
         except OSError:
             continue
     return removed
+
+
+def _purge_loop() -> None:
+    while True:
+        time.sleep(PURGE_INTERVAL)
+        try:
+            purge_stale()
+        except Exception:
+            pass  # a background sweep must never take the process down
+
+
+# Start the idle sweeper once, at import. Daemon so it never blocks shutdown;
+# opt out with NUCLEUS_NO_PURGE_THREAD=1 (tests, or single-shot CLI use).
+if not os.environ.get("NUCLEUS_NO_PURGE_THREAD"):
+    threading.Thread(target=_purge_loop, name="scrub-purge", daemon=True).start()

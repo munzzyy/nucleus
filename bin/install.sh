@@ -53,6 +53,16 @@ systemctl --user daemon-reload 2>/dev/null || true
 echo "   • systemd unit installed (not enabled). To autostart on login:"
 echo "       systemctl --user enable --now nucleus.service"
 
+# 5) native-window dependency check (informational — the app runs without it)
+if python3 -c 'import PySide6, PySide6.QtWebEngineWidgets' >/dev/null 2>&1; then
+  echo "   • native window: PySide6 + QtWebEngine present — the desktop app will open a window"
+else
+  echo "   • native window: PySide6/QtWebEngine NOT found — Nucleus still installed and works"
+  echo "       fine in the browser (nucleus up, then open http://127.0.0.1). For the native"
+  echo "       desktop window, install it:  sudo pacman -S pyside6"
+  echo "       (Debian/Ubuntu: sudo apt install python3-pyside6.qtwebengine)"
+fi
+
 echo
 echo "Done. Start it now with:  nucleus up --open"
 echo

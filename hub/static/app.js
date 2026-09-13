@@ -407,7 +407,43 @@
     });
   }
 
+  // ---- first-run onboarding ----------------------------------------------
+  // A dismissible "try one of these in 5 minutes" panel with concrete click
+  // paths, so a first-time visitor knows where to start. Remembered once
+  // dismissed, plus a nod to the Ctrl-K palette.
+  function renderOnboarding() {
+    const host = document.getElementById("hub-onboard");
+    if (!host) return;
+    const store = N.remember("onboard-dismissed");
+    if (store.get(false)) return;
+    const head = N.el("div", { class: "onboard-head" });
+    head.appendChild(N.el("h2", { text: "New here? Try one of these in 5 minutes" }));
+    const dismiss = N.el("button", { type: "button", class: "ghost onboard-x", text: "Dismiss" });
+    dismiss.addEventListener("click", () => { store.set(true); host.replaceChildren(); host.classList.add("hidden"); });
+    head.appendChild(dismiss);
+    host.appendChild(head);
+
+    const paths = [
+      ["Grade a domain's security", "Bastion", 8920],
+      ["Decode or inspect a JWT", "Devkit", 8930],
+      ["See what your machine exposes", "Bastion opsec", 8920],
+      ["Recon a username or email", "Recon", 8900],
+    ];
+    const list = N.el("div", { class: "onboard-paths" });
+    paths.forEach(([what, where, port]) => {
+      const a = N.el("a", { class: "onboard-path", href: url(port) + "/" });
+      a.appendChild(N.el("span", { class: "op-what", text: what }));
+      a.appendChild(N.el("span", { class: "op-where", text: "→ " + where }));
+      list.appendChild(a);
+    });
+    host.appendChild(list);
+    host.appendChild(N.el("p", { class: "faint small m0 mt" },
+      [N.el("span", { class: "kbd", text: "Ctrl-K" }), " jumps to any tool or console from anywhere."]));
+    host.classList.remove("hidden");
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
+    renderOnboarding();
     paintSkeletons();
     wireSearch();
     registerCommands();

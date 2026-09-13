@@ -1116,7 +1116,61 @@
     copyValue(e.target);
   });
 
+  // -- people-OSINT consent gate --------------------------------------------
+  // Before a lookup aimed at a real person (email / username / phone / Discord
+  // ID) we ask once per session to confirm there's a lawful, authorized reason.
+  // Infrastructure lookups (domain / IP / ASN / hash / crypto / MAC / geo) skip
+  // it. The server does the real type detection; this client guess only needs
+  // to be good enough to decide whether to ask.
+  const PERSON_TYPES = { email: 1, username: 1, phone: 1, discord: 1, name: 1 };
+
+  function personConsentGiven() {
+    try { return sessionStorage.getItem("nuc:recon:person-consent") === "1"; }
+    catch (_) { return false; }
+  }
+  function rememberPersonConsent() {
+    try { sessionStorage.setItem("nuc:recon:person-consent", "1"); } catch (_) { /* private mode — ask again next scan */ }
+  }
+
+  function looksLikeInfra(q) {
+    const s = (q || "").trim();
+    if (!s) return true;
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(s)) return true;                 // IPv4
+    if (s.indexOf(":") >= 0 && /^[0-9a-f:]+$/i.test(s)) return true;    // IPv6
+    if (/^as?\d+$/i.test(s)) return true;                              // ASN
+    if (/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(s)) return true;      // MAC
+    if (/^[0-9a-f]{32,}$/i.test(s)) return true;                       // file hash
+    if (/^0x[0-9a-f]{40}$/i.test(s)) return true;                      // ETH address (checksum-cased)
+    if (/^([13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{20,})$/.test(s)) return true; // BTC (case-sensitive)
+    if (/^-?\d{1,3}\.\d+\s*,\s*-?\d{1,3}\.\d+$/.test(s)) return true;    // geo coords
+    if (/^([a-z0-9-]+\.)+[a-z]{2,}$/i.test(s)) return true;             // domain
+    return false;
+  }
+
+  function isPersonScope(q, type) {
+    if (type && type !== "auto") return !!PERSON_TYPES[String(type).toLowerCase()];
+    return !looksLikeInfra(q);
+  }
+
+  function askPersonConsent() {
+    return N.confirmModal({
+      title: "You're about to look up a real person",
+      body: [
+        "This lookup targets an individual — an email, username, phone number, or Discord ID, not a piece of infrastructure.",
+        "Confirm you have a lawful, authorized reason: your own accounts, an investigation you're allowed to run, or research the person has consented to.",
+        "Don't use Nucleus to stalk, harass, dox, or surveil anyone. That's on you, not the tool.",
+      ],
+      confirmLabel: "I have an authorized reason — continue",
+      cancelLabel: "Cancel",
+    });
+  }
+
   async function runScan(q, type) {
+    if (isPersonScope(q, type) && !personConsentGiven()) {
+      const ok = await askPersonConsent();
+      if (!ok) { N.toast("lookup canceled", ""); return; }
+      rememberPersonConsent();
+    }
     scanBtn.disabled = true;
     scanAbort = new AbortController();
     cancelBtn.classList.remove("hidden");
@@ -1172,6 +1226,9 @@
     html += renderDorks(data.dorks);
     results.innerHTML = html;
     markCopyable(results);
+    // Drop a "?" chip next to any jargon heading (SPF, DNSSEC, RDAP, ASN…) so a
+    // non-expert reading a result isn't stranded on the acronym.
+    N.glossaryScan(results, ".module-card h2");
     // The username site grid has interactive controls (filter / found-only)
     // that must be wired after the innerHTML swap.
     if (data.detected_type === "username") wireUsernameControls();
@@ -1243,6 +1300,7 @@
   // (#q=…&type=…) by running that scan straight away; otherwise show the
   // clickable empty state.
   (function initFromEnv() {
+    N.paletteHint();
     const savedType = lastTypeStore.get(null);
     if (savedType && (savedType === "auto" || TYPE_LABEL[savedType])) typeSelect.value = savedType;
     const linked = readHash();

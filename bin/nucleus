@@ -9,6 +9,7 @@
   nucleus firefox [name] open a console in Firefox specifically (default: dork),
                         starting it first if it isn't already running
   nucleus doctor        environment / port sanity check
+  nucleus wipe          securely delete everything sensitive on disk (--yes to skip)
 
 Every console runs on 127.0.0.1 only. Each is also independently launchable
 (`python3 consoles/recon/app.py`) so you can run one per machine if you like —
@@ -227,6 +228,19 @@ def cmd_firefox(args):
     return 0
 
 
+def _probe_native_gui():
+    """(ok, install_hint) for the native-window stack. The desktop app needs
+    both PySide6 and its QtWebEngine widget; either missing means `nucleus app`
+    can't open a window, but headless (`nucleus up` + browser) still works."""
+    try:
+        import PySide6  # noqa: F401
+        from PySide6 import QtWebEngineWidgets  # noqa: F401
+        return True, ""
+    except Exception:
+        # OS package is the reliable route (QtWebEngine pip wheels are fussy).
+        return False, "sudo pacman -S pyside6  (Debian/Ubuntu: apt install python3-pyside6.qtwebengine)"
+
+
 def cmd_doctor(args):
     ok = True
     print("Nucleus doctor\n")
@@ -244,8 +258,78 @@ def cmd_doctor(args):
             ok = False
         busy = _port_busy(PORT[slug])
         print(f"  {slug:8} module {built:28} port {PORT[slug]} {'busy' if busy else 'free'}")
-    print("\n" + ("All good." if ok else "Some consoles are not importable yet."))
+
+    native_ok, hint = _probe_native_gui()
+    print(f"  {'PySide6 + QtWebEngine present — native window (nucleus app) available' if native_ok else 'PySide6 / QtWebEngine ABSENT — native window unavailable'}")
+    if not native_ok:
+        print(f"           install it with: {hint}")
+        print("           the app still runs headless: `nucleus up` then open http://127.0.0.1 in a browser")
+
+    if not ok:
+        print("\nSome consoles are not importable yet.")
+    elif not native_ok:
+        print("\nConsoles OK — headless only (no native window until PySide6/QtWebEngine is installed).")
+    else:
+        print("\nAll good.")
     return 0 if ok else 1
+
+
+def _wipe_targets():
+    """Everything sensitive under var/ (and engine/reports), as concrete paths.
+    Directory contents are listed individually; the container dir itself stays."""
+    var = REPO / "var"
+    items = []
+    for d in (var / "scrub", var / "redcell-out", REPO / "engine" / "reports"):
+        if d.is_dir():
+            items += sorted(d.iterdir())
+    for f in (var / "recon-scans.jsonl", var / "redcell-scans.jsonl"):
+        if f.exists():
+            items.append(f)
+    return items
+
+
+def cmd_wipe(args):
+    """One-gesture panic wipe: securely delete everything sensitive on disk."""
+    # No purge thread for a single-shot CLI run.
+    import os as _os
+    _os.environ["NUCLEUS_NO_PURGE_THREAD"] = "1"
+    from consoles.bastion import scrub
+
+    items = _wipe_targets()
+    if not items:
+        print("Nothing sensitive to wipe (var/scrub, var/redcell-out, engine/reports, scan logs all empty).")
+        return 0
+
+    print("nucleus wipe — SECURELY delete (best-effort: bytes are overwritten with")
+    print("random data before unlink, but on SSD/copy-on-write/journalling filesystems")
+    print("the old bytes can survive underneath — full-disk encryption is the only real")
+    print("guarantee). Will remove:\n")
+    for p in items:
+        print(f"  {p}")
+    print()
+
+    if not args.yes:
+        try:
+            reply = input(f"Delete these {len(items)} item(s)? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted. Nothing removed.")
+            return 1
+
+    removed = 0
+    for p in items:
+        if p.is_dir() and not p.is_symlink():
+            scrub._secure_rmtree(p)
+        else:
+            scrub._secure_delete_file(p)   # symlink-safe: drops the link, never its target
+        if p.is_symlink() or p.exists():
+            print(f"  FAILED  {p}")
+        else:
+            removed += 1
+            print(f"  removed {p}")
+    print(f"\nWiped {removed}/{len(items)} item(s).")
+    return 0
 
 
 def main():
@@ -275,6 +359,10 @@ def main():
 
     dr = sub.add_parser("doctor", help="environment sanity check")
     dr.set_defaults(func=cmd_doctor)
+
+    wp = sub.add_parser("wipe", help="securely delete everything sensitive on disk (scrub sessions, scan logs, reports)")
+    wp.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    wp.set_defaults(func=cmd_wipe)
 
     args = p.parse_args()
     if not getattr(args, "func", None):

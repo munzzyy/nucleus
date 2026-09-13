@@ -51,6 +51,7 @@ from shared import common
 from shared import apikeys
 from engine import osint_report as report
 from consoles.redcell import runners
+from consoles.redcell import builder as redcell_builder
 from consoles.redcell import wordlists
 from consoles.redcell import hashtools
 from consoles.redcell import webscan
@@ -6043,6 +6044,211 @@ class PostAndTimeoutRobustnessTests(unittest.TestCase):
             timeout=0.6)
         self.assertTrue(r.timed_out)
         self.assertIn("partial", r.stderr)
+
+
+# ==========================================================================
+# Feature 1 — scrub secure delete + proactive idle purge
+# ==========================================================================
+class ScrubSecureDeleteTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.scrub_dir = Path(self._tmp.name).resolve() / "scrub"
+        p = mock.patch.object(scrub, "SCRUB_DIR", self.scrub_dir)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_secure_delete_overwrites_bytes_before_unlink(self):
+        # Negative control: a bare unlink leaves the original plaintext on the
+        # block. Hold unlink so we can read the file back and prove the bytes
+        # were scrambled first.
+        self.scrub_dir.mkdir(parents=True)
+        f = self.scrub_dir / "secret.bin"
+        original = b"TOPSECRET-GPS-51.5074N" * 500
+        f.write_bytes(original)
+        with mock.patch.object(Path, "unlink", autospec=True) as unlink:
+            scrub._secure_delete_file(f)
+        self.assertTrue(unlink.called)          # it still unlinks
+        after = f.read_bytes()
+        self.assertEqual(len(after), len(original))
+        self.assertNotEqual(after, original)    # ...but not before overwriting
+        f.unlink()
+
+    def test_secure_rmtree_removes_nested_tree(self):
+        root = self.scrub_dir / "sess"
+        (root / "sub").mkdir(parents=True)
+        (root / "a.bin").write_bytes(b"x" * 100)
+        (root / "sub" / "b.bin").write_bytes(b"y" * 100)
+        scrub._secure_rmtree(root)
+        self.assertFalse(root.exists())
+        scrub._secure_rmtree(root)  # idempotent — a gone tree must not raise
+
+    def test_secure_delete_does_not_follow_symlink(self):
+        # A hostile scrubbed archive can plant a symlink; secure-delete must drop
+        # the link, never overwrite its target (would clobber e.g. ~/.bashrc).
+        self.scrub_dir.mkdir(parents=True, exist_ok=True)
+        target = self.scrub_dir / "precious.txt"
+        target.write_text("PRECIOUS")
+        link = self.scrub_dir / "evil-link.txt"
+        link.symlink_to(target)
+        scrub._secure_delete_file(link)
+        self.assertFalse(link.is_symlink() or link.exists())   # the link is gone
+        self.assertTrue(target.exists())                        # the target survives
+        self.assertEqual(target.read_text(), "PRECIOUS")        # and was NOT overwritten
+
+    def test_status_purges_stale_proactively(self):
+        # Negative control: before the fix, status() never purged, so an idle
+        # session outlived its TTL. Now a status poll reaps it even with mat2
+        # missing (the purge runs before the availability gate).
+        old = scrub.create_session("old.png", b"x")
+        old_dir = scrub._session_dir(old["token"])
+        past = time.time() - scrub.SESSION_TTL - 120
+        os.utime(old_dir, (past, past))
+        real_which = common.which
+        with mock.patch.object(common, "which",
+                               side_effect=lambda n: None if n == "mat2" else real_which(n)):
+            scrub.status()
+        self.assertFalse(old_dir.exists())
+
+
+# ==========================================================================
+# Feature 2 — redcell AD/internal command builders (build only, never run)
+# ==========================================================================
+class AdBuilderTests(unittest.TestCase):
+    AD_TOOLS = ("netexec", "getuserspns", "getnpusers", "secretsdump", "smbmap", "evilwinrm")
+
+    def test_ad_builders_registered(self):
+        for tool in self.AD_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertIn(tool, redcell_builder.BUILDERS)
+
+    def test_ad_builders_produce_a_command(self):
+        params = {"target": "10.0.0.5", "login": "svc", "password": "pw",
+                  "domain": "corp.local", "dc_ip": "10.0.0.1", "action": "shares"}
+        for tool in self.AD_TOOLS:
+            with self.subTest(tool=tool):
+                cmd = redcell_builder.BUILDERS[tool]["build"](params)
+                self.assertTrue(cmd)
+                self.assertEqual(cmd.split()[0], {"getuserspns": "GetUserSPNs.py",
+                    "getnpusers": "GetNPUsers.py", "secretsdump": "secretsdump.py",
+                    "netexec": "nxc", "smbmap": "smbmap", "evilwinrm": "evil-winrm"}[tool])
+
+    def test_hash_option_used_for_pass_the_hash(self):
+        cmd = redcell_builder.BUILDERS["netexec"]["build"](
+            {"target": "10.0.0.5", "login": "admin", "hash": "aad3b:31d6cfe0"})
+        self.assertIn("-H", cmd.split())
+
+    def test_ad_builder_injection_stays_one_inert_arg(self):
+        import shlex
+        evil = "10.0.0.5'; rm -rf ~ #"
+        for tool in self.AD_TOOLS:
+            with self.subTest(tool=tool):
+                cmd = redcell_builder.BUILDERS[tool]["build"]({
+                    "target": evil, "login": evil, "password": evil,
+                    "domain": evil, "dc_ip": evil})
+                tokens = shlex.split(cmd)
+                self.assertNotIn("rm", tokens, tool)
+                self.assertNotIn(";", tokens, tool)
+
+    def test_builder_module_never_imports_exec_paths(self):
+        # Structural guarantee: no top-level import of subprocess and no call to
+        # run_tool anywhere (the words appear in the docstring; the code must not).
+        src = Path(redcell_builder.__file__).read_text()
+        self.assertIsNone(re.search(r"^\s*import subprocess", src, re.M))
+        self.assertNotIn("run_tool(", src)
+        self.assertFalse(hasattr(redcell_builder, "subprocess"))
+
+    def test_handle_build_marks_not_executed(self):
+        req = common.Request("POST", "/api/build", {}, {},
+                             json.dumps({"tool": "smbmap",
+                                         "params": {"target": "10.0.0.5"}}).encode(),
+                             "127.0.0.1")
+        resp = redcell_builder.handle_build(req)
+        payload = json.loads(resp.body)
+        self.assertIn("NOT executed", payload["note"])
+        self.assertTrue(payload["command"])
+
+
+# ==========================================================================
+# Feature 3 — bin/nucleus: wipe command + honest doctor
+# ==========================================================================
+def _load_nucleus_cli():
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    path = str(common.REPO_ROOT / "bin" / "nucleus")
+    loader = SourceFileLoader("nucleus_cli", path)
+    spec = importlib.util.spec_from_loader("nucleus_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class NucleusCliTests(unittest.TestCase):
+    def setUp(self):
+        self.cli = _load_nucleus_cli()
+
+    def test_doctor_is_headless_only_when_native_gui_absent(self):
+        # Negative control: old doctor printed "All good." regardless of the
+        # native stack. Now, with PySide6/QtWebEngine absent, it must say
+        # headless-only and NOT print an unqualified "All good."
+        import io, contextlib
+        buf = io.StringIO()
+        with mock.patch.object(self.cli, "_probe_native_gui", return_value=(False, "sudo pacman -S pyside6")), \
+             contextlib.redirect_stdout(buf):
+            self.cli.cmd_doctor(mock.Mock())
+        out = buf.getvalue()
+        self.assertIn("headless", out.lower())
+        self.assertNotIn("\nAll good.", out)
+        self.assertIn("sudo pacman -S pyside6", out)
+
+    def test_doctor_all_good_when_native_gui_present(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with mock.patch.object(self.cli, "_probe_native_gui", return_value=(True, "")), \
+             contextlib.redirect_stdout(buf):
+            self.cli.cmd_doctor(mock.Mock())
+        self.assertIn("All good.", buf.getvalue())
+
+    def test_wipe_securely_removes_sensitive_files(self):
+        import io, contextlib
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        (repo / "var" / "scrub" / "sess").mkdir(parents=True)
+        (repo / "var" / "scrub" / "sess" / "f.bin").write_bytes(b"secret")
+        (repo / "var" / "redcell-out").mkdir(parents=True)
+        (repo / "var" / "redcell-out" / "out.txt").write_text("loot")
+        (repo / "engine" / "reports").mkdir(parents=True)
+        (repo / "engine" / "reports" / "r.md").write_text("report")
+        (repo / "var" / "recon-scans.jsonl").write_text("{}\n")
+        (repo / "var" / "redcell-scans.jsonl").write_text("{}\n")
+        with mock.patch.object(self.cli, "REPO", repo):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = self.cli.cmd_wipe(mock.Mock(yes=True))
+        self.assertEqual(rc, 0)
+        self.assertFalse((repo / "var" / "scrub" / "sess").exists())
+        self.assertFalse((repo / "var" / "redcell-out" / "out.txt").exists())
+        self.assertFalse((repo / "engine" / "reports" / "r.md").exists())
+        self.assertFalse((repo / "var" / "recon-scans.jsonl").exists())
+        self.assertFalse((repo / "var" / "redcell-scans.jsonl").exists())
+        # container dirs survive; only their contents are wiped
+        self.assertTrue((repo / "var" / "scrub").is_dir())
+
+    def test_wipe_aborts_without_confirmation(self):
+        import io, contextlib
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        (repo / "var" / "redcell-out").mkdir(parents=True)
+        (repo / "var" / "redcell-out" / "out.txt").write_text("loot")
+        with mock.patch.object(self.cli, "REPO", repo), \
+             mock.patch("builtins.input", return_value="n"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = self.cli.cmd_wipe(mock.Mock(yes=False))
+        self.assertEqual(rc, 1)
+        self.assertTrue((repo / "var" / "redcell-out" / "out.txt").exists())  # untouched
 
 
 if __name__ == "__main__":

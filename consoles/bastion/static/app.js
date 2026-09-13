@@ -363,6 +363,9 @@
       const chips = severityChips(j.findings, findingsEl);
       if (chips) chipsHost.replaceChildren(chips);
     }
+    // A "?" chip next to any jargon in a finding (SPF, DMARC, DNSSEC, CAA,
+    // HSTS, MTA-STS, DKIM…) so the grade explains itself to a non-expert.
+    if (findingsEl) N.glossaryScan(findingsEl, ".ftitle");
   }
 
   // Deep link: #domain=example.com makes an assessment shareable and reopens it
@@ -890,6 +893,7 @@
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    N.paletteHint();
     loadAnonymity();
     // Pauses while the tab is hidden and catches up on focus (shared helper),
     // instead of pinging the opsec oracles forever behind a background tab.

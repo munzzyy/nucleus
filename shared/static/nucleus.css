@@ -311,3 +311,62 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 @media print {
   .topbar-wrap, #toast { display: none !important; }
 }
+
+/* ---- inline security glossary (N.glossary / N.glossaryScan) ----
+   A "?" chip you drop next to a jargon term; hover/focus previews the
+   definition, click pins it. Popover is a positioned sibling, no JS layout. */
+.gloss { position: relative; display: inline-flex; vertical-align: middle; }
+.gloss-chip { all: unset; box-sizing: border-box; cursor: help;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; margin-left: 5px; border-radius: 50%;
+  border: 1px solid var(--line-2); background: var(--bg-2);
+  color: var(--txt-dim); font-family: var(--sans); font-size: 10px; font-weight: 700;
+  line-height: 1; }
+.gloss-chip:hover, .gloss-chip:focus-visible { color: var(--accent); border-color: var(--accent); }
+.gloss-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gloss-pop { position: absolute; top: calc(100% + 7px); left: 0; z-index: 220;
+  width: max-content; max-width: 280px; padding: 10px 12px;
+  background: var(--bg-3); border: 1px solid var(--line-2); border-radius: 8px;
+  box-shadow: var(--shadow); color: var(--txt);
+  font-size: 12.5px; font-weight: 400; line-height: 1.45; text-transform: none; letter-spacing: normal;
+  display: none; }
+.gloss.open .gloss-pop { display: block; }
+.gloss-pop b { display: block; margin-bottom: 4px; font-size: 12px; color: var(--accent); }
+.gloss-pop .gloss-def { display: block; }
+.gloss-pop .gloss-bad { display: block; margin-top: 6px; color: var(--warn); }
+/* Near the right edge a fixed left:0 popover would clip; flip it. */
+.gloss:last-child .gloss-pop { left: auto; right: 0; }
+
+/* ---- reusable confirm modal (N.confirmModal) ---- */
+.modal-overlay { position: fixed; inset: 0; z-index: 230;
+  background: rgba(4,7,12,.72); display: flex; align-items: center;
+  justify-content: center; padding: 20px; }
+.modal-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
+  border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 22px 26px; max-width: 460px; width: 100%; }
+.modal-panel h2 { margin: 0 0 12px; font-size: 16px; }
+.modal-panel .modal-body { margin: 0 0 10px; color: var(--txt-dim); font-size: 13.5px; line-height: 1.5; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+
+/* ---- command-palette hint (N.paletteHint) ---- */
+.palette-hint { display: inline-flex; align-items: center; gap: 8px;
+  margin: -8px 0 18px; padding: 6px 10px 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg-1);
+  color: var(--txt-dim); font-size: 12.5px; }
+.palette-hint-x { all: unset; cursor: pointer; margin-left: 2px; padding: 0 4px;
+  color: var(--txt-faint); font-size: 15px; line-height: 1; border-radius: 4px; }
+.palette-hint-x:hover, .palette-hint-x:focus-visible { color: var(--txt); }
+.palette-hint-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---- hub first-run onboarding panel ---- */
+.onboard { margin-bottom: 20px; border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.onboard-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.onboard-head h2 { margin: 0; }
+.onboard-x { padding: 6px 12px; font-size: 12px; }
+.onboard-paths { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px; margin-top: 14px; }
+.onboard-path { display: flex; flex-direction: column; gap: 3px; padding: 12px 14px;
+  border: 1px solid var(--line-2); border-radius: 8px; background: var(--bg-1); color: var(--txt); }
+.onboard-path:hover { border-color: var(--accent); text-decoration: none; background: var(--bg-2); }
+.onboard-path .op-what { font-weight: 600; }
+.onboard-path .op-where { color: var(--txt-faint); font-size: 12px; }
