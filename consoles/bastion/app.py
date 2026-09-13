@@ -135,6 +135,7 @@ def h_scrub_upload(req: common.Request) -> common.Response:
     return common.Response.json({
         "token": sess["token"], "name": sess["name"], "size": sess["size"], "ext": ext,
         "metadata": result["metadata"], "notes": result["notes"],
+        "risk": result.get("risk"),
         "sandbox": common.which("bwrap") is not None,
     })
 

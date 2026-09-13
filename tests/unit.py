@@ -44,6 +44,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from consoles.recon import detect
+from consoles.recon import sources as recon_sources
+from consoles.recon import phonedata as recon_phonedata
+from consoles.recon import lookups
 from shared import common
 from shared import apikeys
 from engine import osint_report as report
@@ -3935,10 +3938,11 @@ class FetchSetCookiePreservationTests(unittest.TestCase):
         try:
             url = f"http://127.0.0.1:{srv.server_address[1]}/"
             # Pin the SSRF resolver to loopback so fetch will talk to the test
-            # server (the guard otherwise refuses 127.0.0.1) — same technique
-            # the stresstest keep-alive tests use.
-            with mock.patch.object(common, "_resolve_public",
-                                   return_value=("127.0.0.1", socket.AF_INET)):
+            # server (the guard otherwise refuses 127.0.0.1). fetch() connects
+            # over the validated-IP list from _ordered_public_ips, so that's
+            # the seam to pin here.
+            with mock.patch.object(common, "_ordered_public_ips",
+                                   return_value=["127.0.0.1"]):
                 status, _body, headers = common.fetch(url, timeout=5)
         finally:
             srv.shutdown()
@@ -3951,6 +3955,24 @@ class FetchSetCookiePreservationTests(unittest.TestCase):
         self.assertEqual(names, ["session", "tracking"])
         # The Expires comma inside cookie #1 must NOT have split it into two.
         self.assertIn("Expires=Wed, 09 Jun 2027", cookies[0])
+
+    def test_fetch_falls_through_to_next_ip_when_first_refuses(self):
+        # The IPv6-fallthrough fix: when the first validated address refuses
+        # the connection (a dead IPv6 route is the common cause), fetch must
+        # try the next one instead of failing the whole request. 127.0.0.2 has
+        # nothing listening on the test port, so it refuses instantly; fetch
+        # should fall through to 127.0.0.1 where the server is.
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _TwoCookieHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/"
+            with mock.patch.object(common, "_ordered_public_ips",
+                                   return_value=["127.0.0.2", "127.0.0.1"]):
+                status, _body, _headers = common.fetch(url, timeout=5)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(status, 200)
 
     def test_single_valued_headers_stay_plain_strings(self):
         # Backward-compat: a non-repeated header is still a bare string, not a
@@ -4525,6 +4547,785 @@ class DorkFirefoxLauncherTests(unittest.TestCase):
     def test_launcher_is_a_list_of_str_or_none(self):
         got = dork_app._firefox_launcher()
         self.assertTrue(got is None or (isinstance(got, list) and all(isinstance(x, str) for x in got)))
+
+
+# ==========================================================================
+# consoles/recon/detect.py — the two new selector types (ASN, Discord)
+# ==========================================================================
+class AsnDiscordClassifyTests(unittest.TestCase):
+    def test_asn_prefix_forms_classify_as_asn(self):
+        self.assertEqual(detect.classify("AS15169"), ("asn", "AS15169"))
+        self.assertEqual(detect.classify("as15169"), ("asn", "AS15169"))
+
+    def test_asn_does_not_steal_a_bare_number(self):
+        # No "AS" prefix -> not an ASN (a bare integer is a phone/discord/username).
+        self.assertNotEqual(detect.classify("15169")[0], "asn")
+
+    def test_discord_snowflake_classifies(self):
+        self.assertEqual(detect.classify("175928847299117063"), ("discord", "175928847299117063"))
+
+    def test_discord_does_not_steal_a_real_phone(self):
+        # E.164 tops out at 15 digits; a phone must stay a phone.
+        self.assertEqual(detect.classify("+14155552671")[0], "phone")
+        self.assertEqual(detect.classify("4155552671")[0], "phone")
+
+    def test_sixteen_digits_is_not_discord(self):
+        self.assertNotEqual(detect.classify("1234567890123456")[0], "discord")
+
+    def test_asn_and_discord_normalize_for_forced_type(self):
+        self.assertEqual(detect.normalize_for("asn", "15169"), "AS15169")
+        self.assertEqual(detect.normalize_for("asn", "as15169"), "AS15169")
+        self.assertEqual(detect.normalize_for("discord", " 175928847299117063 "), "175928847299117063")
+
+    def test_asn_and_discord_validate(self):
+        self.assertTrue(detect.validate("asn", "AS15169"))
+        self.assertFalse(detect.validate("asn", "15169"))       # missing AS prefix
+        self.assertFalse(detect.validate("asn", "ASxyz"))
+        self.assertTrue(detect.validate("discord", "175928847299117063"))
+        self.assertFalse(detect.validate("discord", "123"))     # too short
+        self.assertFalse(detect.validate("discord", "1234567890123456789012"))  # too long
+
+    def test_asn_and_discord_are_valid_types(self):
+        self.assertIn("asn", detect.VALID_TYPES)
+        self.assertIn("discord", detect.VALID_TYPES)
+
+    def test_asn_pivots_and_dorks_build(self):
+        self.assertTrue(any("bgp" in p["url"] for p in detect.pivots_for("asn", "AS15169")))
+        self.assertTrue(detect.dorks_for("asn", "AS15169"))
+        self.assertTrue(detect.pivots_for("discord", "175928847299117063"))
+        self.assertTrue(detect.dorks_for("discord", "175928847299117063"))
+
+
+# ==========================================================================
+# consoles/recon/sources.py — Discord snowflake is decoded entirely offline.
+# ==========================================================================
+class DiscordSnowflakeTests(unittest.TestCase):
+    def test_known_snowflake_decodes_to_known_creation_time(self):
+        r = recon_sources.discord_snowflake("175928847299117063")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["created_utc"].startswith("2016-04-30T11:18:25"))
+        self.assertEqual(r["worker_id"], 1)
+        self.assertEqual(r["process_id"], 0)
+        self.assertEqual(r["increment"], 7)
+
+    def test_epoch_snowflake_is_the_discord_epoch(self):
+        r = recon_sources.discord_snowflake("0" * 17)  # 17 zeros -> value 0
+        # value 0 -> 2015-01-01, the Discord epoch.
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["created_utc"].startswith("2015-01-01"))
+
+    def test_non_snowflake_is_rejected(self):
+        self.assertFalse(recon_sources.discord_snowflake("123")["ok"])
+        self.assertFalse(recon_sources.discord_snowflake("notdigits")["ok"])
+        self.assertFalse(recon_sources.discord_snowflake("1" * 25)["ok"])
+
+
+# ==========================================================================
+# consoles/recon/sources.py — network-source PARSERS, exercised offline by
+# mocking the single _get() seam with canned provider payloads.
+# ==========================================================================
+def _mk_get(status, obj=None, body=None, err=None):
+    """Build a stand-in for sources._get returning one canned response."""
+    if body is None:
+        body = json.dumps(obj).encode("utf-8") if obj is not None else b""
+    return lambda *a, **k: (status, body, {}, err)
+
+
+class SourcesParserTests(unittest.TestCase):
+    def test_certspotter_extracts_and_scopes_subdomains(self):
+        payload = [
+            {"dns_names": ["api.github.com", "*.github.com", "github.com"]},
+            {"dns_names": ["evil.example.org"]},
+        ]
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            names, err = recon_sources.certspotter_subdomains("github.com")
+        self.assertIsNone(err)
+        self.assertIn("api.github.com", names)
+        self.assertIn("github.com", names)
+        self.assertNotIn("evil.example.org", names)     # out of scope
+        self.assertNotIn("*.github.com", names)          # wildcard stripped
+
+    def test_certspotter_non_200_is_error_not_crash(self):
+        with mock.patch.object(recon_sources, "_get", _mk_get(429)):
+            names, err = recon_sources.certspotter_subdomains("github.com")
+        self.assertEqual(names, set())
+        self.assertIsNotNone(err)
+
+    def test_rapiddns_parses_hostnames_from_html(self):
+        html = b"<td>a.github.com</td><td>sub.b.github.com</td> junk c.notgithub.com"
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, body=html)):
+            names, err = recon_sources.rapiddns_subdomains("github.com")
+        self.assertIsNone(err)
+        self.assertIn("a.github.com", names)
+        self.assertIn("sub.b.github.com", names)
+        self.assertNotIn("c.notgithub.com", names)
+
+    def test_hudsonrock_person_infected(self):
+        payload = {"message": "infected", "total_user_services": 10,
+                   "stealers": [{"date_compromised": "2026-01-01", "computer_name": "PC",
+                                 "operating_system": "Win", "antiviruses": ["Defender"],
+                                 "top_logins": ["a***@x"], "top_passwords": ["p***1"],
+                                 "total_user_services": 10}]}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.hudsonrock_email("victim@example.com")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["infected"])
+        self.assertEqual(r["stealer_count"], 1)
+        self.assertEqual(r["stealers"][0]["computer_name"], "PC")
+
+    def test_hudsonrock_person_clean(self):
+        payload = {"message": "not associated", "stealers": []}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.hudsonrock_username("someuser")
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["infected"])
+        self.assertEqual(r["stealer_count"], 0)
+
+    def test_hudsonrock_rejects_bad_input_without_calling(self):
+        # A malformed selector never reaches the network.
+        self.assertFalse(recon_sources.hudsonrock_email("not-an-email")["ok"])
+        self.assertFalse(recon_sources.hudsonrock_username("bad name!")["ok"])
+
+    def test_hudsonrock_domain_shape(self):
+        payload = {"total": 5, "employees": 2, "users": 3, "third_parties": 0,
+                   "totalStealers": 999,
+                   "data": {"clients_urls": [{"url": "https://x/login", "occurrence": 4, "type": "User"}],
+                            "employees_urls": []}}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.hudsonrock_domain("example.com")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["users"], 3)
+        self.assertEqual(len(r["client_urls"]), 1)
+        self.assertEqual(r["client_urls"][0]["occurrence"], 4)
+
+    def test_gravatar_profile_parses_and_filters_hidden_accounts(self):
+        payload = {"entry": [{"displayName": "Jane Doe", "preferredUsername": "jane",
+                              "currentLocation": "NYC", "job_title": "Eng", "company": "Acme",
+                              "pronouns": "she/her", "aboutMe": "hi", "profileUrl": "https://gravatar.com/jane",
+                              "thumbnailUrl": "http://x/av",
+                              "accounts": [{"name": "GitHub", "url": "https://github.com/jane",
+                                            "username": "jane", "verified": True, "shortname": "github",
+                                            "is_hidden": False},
+                                           {"name": "Secret", "is_hidden": True}]}]}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.gravatar_profile("jane@example.com")
+        self.assertTrue(r["exists"])
+        self.assertEqual(r["display_name"], "Jane Doe")
+        self.assertEqual(len(r["accounts"]), 1)          # hidden one dropped
+        self.assertEqual(r["accounts"][0]["name"], "GitHub")
+
+    def test_gravatar_404_means_no_profile(self):
+        with mock.patch.object(recon_sources, "_get", _mk_get(404)):
+            r = recon_sources.gravatar_profile("nobody@example.com")
+        self.assertFalse(r["exists"])
+        self.assertIsNone(r["error"])
+
+    def test_ripestat_ip_maps_asn_and_holder(self):
+        ni = {"status": "ok", "data": {"asns": ["15169"], "prefix": "8.8.8.0/24"}}
+        ov = {"status": "ok", "data": {"holder": "GOOGLE"}}
+        side = [(200, json.dumps(ni).encode(), {}, None), (200, json.dumps(ov).encode(), {}, None)]
+        with mock.patch.object(recon_sources, "_get", side_effect=side):
+            r = recon_sources.ripestat_ip("8.8.8.8")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["asns"], ["15169"])
+        self.assertEqual(r["prefix"], "8.8.8.0/24")
+        self.assertEqual(r["holder"], "GOOGLE")
+
+    def test_isc_ip_extracts_threatfeeds(self):
+        payload = {"ip": {"attacks": 5, "count": 10, "asname": "GOOGLE", "ascountry": "US",
+                          "asabusecontact": "abuse@x", "network": "8.8.8.0/24",
+                          "threatfeeds": {"miner": {}, "openresolver": {}}, "comment": "c"}}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.isc_ip("8.8.8.8")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["attacks"], 5)
+        self.assertEqual(r["reports"], 10)
+        self.assertCountEqual(r["threatfeeds"], ["miner", "openresolver"])
+
+    def test_asn_scan_holder_and_prefix_split(self):
+        ov = {"status": "ok", "data": {"holder": "GOOGLE", "announced": True, "block": {"desc": "ARIN"}}}
+        pfx = {"status": "ok", "data": {"prefixes": [{"prefix": "8.8.8.0/24"}, {"prefix": "2001:db8::/32"}]}}
+        side = [(200, json.dumps(ov).encode(), {}, None), (200, json.dumps(pfx).encode(), {}, None)]
+        with mock.patch.object(recon_sources, "_get", side_effect=side):
+            r = recon_sources.asn_scan("AS15169")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["holder"], "GOOGLE")
+        self.assertEqual(r["prefix_count"], 2)
+        self.assertEqual(r["prefixes_v4"], ["8.8.8.0/24"])
+        self.assertEqual(r["prefixes_v6"], ["2001:db8::/32"])
+
+    def test_mempool_btc_balance_math(self):
+        payload = {"chain_stats": {"funded_txo_sum": 200_000_000, "spent_txo_sum": 100_000_000, "tx_count": 5},
+                   "mempool_stats": {"tx_count": 1}}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.mempool_btc("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["balance_btc"], 1.0)
+        self.assertEqual(r["total_received_btc"], 2.0)
+        self.assertEqual(r["total_sent_btc"], 1.0)
+        self.assertEqual(r["tx_count"], 5)
+        self.assertEqual(r["pending_tx"], 1)
+
+    def test_mempool_rejects_non_btc(self):
+        self.assertFalse(recon_sources.mempool_btc("0xabc")["ok"])
+
+    def test_wayback_urls_and_subdomains(self):
+        payload = [["original"], ["http://github.com/"], ["https://api.github.com/x"]]
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            r = recon_sources.wayback_urls("github.com")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["count"], 2)
+        self.assertIn("api.github.com", r["subdomains"])
+
+    def test_every_source_degrades_on_unreachable(self):
+        # A dead transport (status None) must yield an error field, never raise.
+        with mock.patch.object(recon_sources, "_get", _mk_get(None, err="boom")):
+            self.assertIsNotNone(recon_sources.certspotter_subdomains("github.com")[1])
+            self.assertFalse(recon_sources.hudsonrock_email("a@b.com")["ok"])
+            self.assertFalse(recon_sources.hudsonrock_domain("example.com")["ok"])
+            self.assertFalse(recon_sources.ripestat_ip("8.8.8.8")["ok"])
+            self.assertFalse(recon_sources.isc_ip("8.8.8.8")["ok"])
+            self.assertFalse(recon_sources.asn_scan("AS15169")["ok"])
+            self.assertFalse(recon_sources.mempool_btc("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")["ok"])
+            self.assertIsNone(recon_sources.gravatar_profile("a@b.com")["exists"])
+
+
+class OfacSanctionsTests(unittest.TestCase):
+    def setUp(self):
+        recon_sources._ofac_mem.clear()   # the module caches lists in-process
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        recon_sources._ofac_mem.clear()
+
+    def test_sanctioned_membership_both_ways(self):
+        listing = b"0xaaa\n0xBBB\n# a comment\n\n"
+        with mock.patch.object(recon_sources, "VAR_DIR", Path(self._tmp)), \
+             mock.patch.object(recon_sources, "_get", _mk_get(200, body=listing)):
+            hit = recon_sources.ofac_sanctioned("0xAAA", "ETH")     # case-insensitive
+            miss = recon_sources.ofac_sanctioned("0xccc", "ETH")
+        self.assertTrue(hit["checked"])
+        self.assertTrue(hit["sanctioned"])
+        self.assertTrue(miss["checked"])
+        self.assertFalse(miss["sanctioned"])
+
+    def test_btc_maps_to_xbt_list_file(self):
+        seen = {}
+
+        def fake_get(url, *a, **k):
+            seen["url"] = url
+            return 200, b"1abc\n", {}, None
+
+        with mock.patch.object(recon_sources, "VAR_DIR", Path(self._tmp)), \
+             mock.patch.object(recon_sources, "_get", fake_get):
+            recon_sources.ofac_sanctioned("1ABC", "BTC")
+        self.assertIn("XBT", seen["url"])      # Bitcoin is filed as XBT upstream
+
+    def test_unsupported_chain_is_not_checked(self):
+        r = recon_sources.ofac_sanctioned("Dabc", "DOGE")
+        self.assertFalse(r["checked"])
+
+
+class DnssecStatusTests(unittest.TestCase):
+    """DNSSEC is judged on record TYPE, not on "the answer section was
+    non-empty". A DoH answer carries the whole chain the resolver walked, so an
+    unfiltered check reports a CNAME'd host as signed."""
+
+    @staticmethod
+    def _typed(**by_rtype):
+        """dns_query stand-in returning per-record-type answers."""
+        def fake(name, rtype, timeout=None):
+            return by_rtype.get(rtype, [])
+        return fake
+
+    def test_signed_requires_dnskey_and_ds(self):
+        with mock.patch.object(recon_sources.common, "dns_query", self._typed(
+                DNSKEY=[{"type": 48, "data": "key"}], DS=[{"type": 43, "data": "ds"}])):
+            r = recon_sources.dnssec_status("example.com")
+        self.assertTrue(r["signed"])
+        self.assertTrue(r["ds_present"])
+        self.assertEqual(r["dnskey_count"], 1)
+
+    def test_dnskey_without_ds_is_not_a_full_chain(self):
+        with mock.patch.object(recon_sources.common, "dns_query", self._typed(
+                DNSKEY=[{"type": 48, "data": "key"}], DS=[])):
+            r = recon_sources.dnssec_status("example.com")
+        self.assertFalse(r["signed"])
+        self.assertTrue(r["dnskey_present"])
+        self.assertIsNotNone(r["note"])
+
+    def test_unsigned_zone(self):
+        with mock.patch.object(recon_sources.common, "dns_query", self._typed()):
+            r = recon_sources.dnssec_status("example.com")
+        self.assertFalse(r["signed"])
+        self.assertFalse(r["dnskey_present"])
+
+    def test_cname_answers_are_not_counted_as_ds_or_dnskey(self):
+        # The real bug: asking for DS on a CNAME'd host (www.github.com) comes
+        # back with a CNAME record (type 5). A truthiness check on the answer
+        # list reported that as "DS present" and therefore "DNSSEC signed".
+        cname = [{"type": 5, "data": "elsewhere.example.net."}]
+        with mock.patch.object(recon_sources.common, "dns_query",
+                               self._typed(DNSKEY=cname, DS=cname)):
+            r = recon_sources.dnssec_status("www.example.com")
+        self.assertFalse(r["signed"])
+        self.assertFalse(r["ds_present"])
+        self.assertEqual(r["dnskey_count"], 0)
+        self.assertEqual(r["ds_count"], 0)
+
+    def test_lookup_failure_is_flagged_not_reported_as_unsigned(self):
+        def boom(name, rtype, timeout=None):
+            raise OSError("resolver down")
+        with mock.patch.object(recon_sources.common, "dns_query", boom):
+            r = recon_sources.dnssec_status("example.com")
+        self.assertTrue(r["unreachable"])
+        self.assertFalse(r["signed"])
+        self.assertIn("unknown", (r["note"] or ""))
+
+
+# ==========================================================================
+# shared/common.py — the IPv4/IPv6 fallthrough ordering helper.
+# ==========================================================================
+class DetectAuditRegressionTests(unittest.TestCase):
+    """detect.py defects confirmed by the 2026-08-30 adversarial audit."""
+
+    def test_basic_auth_url_is_not_scanned_as_an_email(self):
+        # The password used to be shipped to XposedOrNot / HudsonRock /
+        # Gravatar because the whole URL matched the email regex.
+        kind, value = detect.classify("https://admin:hunter2@intranet.example.com/panel")
+        self.assertEqual(kind, "domain")
+        self.assertEqual(value, "intranet.example.com")
+        self.assertNotIn("hunter2", value)
+
+    def test_credentials_never_survive_into_the_scanned_value(self):
+        for raw in ("https://user:pass@example.com/x", "http://tok:sec@a.example.com"):
+            _kind, value = detect.classify(raw)
+            self.assertNotIn("pass", value)
+            self.assertNotIn("sec", value)
+            self.assertNotIn("@", value)
+
+    def test_at_prefixed_handle_classifies_and_validates(self):
+        kind, value = detect.classify("@munzzyy")
+        self.assertEqual((kind, value), ("username", "munzzyy"))
+        self.assertTrue(detect.validate(kind, value))
+        self.assertEqual(detect.normalize_for("username", "@munzzyy"), "munzzyy")
+
+    def test_url_with_port_or_fragment_resolves_to_the_domain(self):
+        for raw in ("https://example.com:8080/admin", "https://example.com/x#frag",
+                    "http://example.com:443/"):
+            kind, value = detect.classify(raw)
+            self.assertEqual((kind, value), ("domain", "example.com"), raw)
+            self.assertTrue(detect.validate(kind, value), raw)
+
+    def test_dotted_quad_is_never_scanned_as_a_phone(self):
+        # "." and "-" are legal phone punctuation, so a malformed IPv4 that
+        # ipaddress rejected fell through into the phone branch.
+        for raw in ("192.168.001.1", "999.1.1.1", "010.1.1.1"):
+            self.assertNotEqual(detect.classify(raw)[0], "phone", raw)
+        self.assertEqual(detect.classify("8.8.8.8")[0], "ip")
+
+    def test_ordinary_selectors_still_classify(self):
+        self.assertEqual(detect.classify("jane@example.com")[0], "email")
+        self.assertEqual(detect.classify("+14152345678")[0], "phone")
+        self.assertEqual(detect.classify("(415) 234-5678")[0], "phone")
+        self.assertEqual(detect.classify("torvalds")[0], "username")
+        self.assertEqual(detect.classify("example.com")[0], "domain")
+
+
+class AuditRegressionTests(unittest.TestCase):
+    """Locks in the fixes for defects an adversarial audit confirmed on
+    2026-08-30. Each test fails against the pre-fix code."""
+
+    def test_subdomain_scope_matches_on_a_label_boundary(self):
+        # "notexample.com" ends with "example.com" but is a different
+        # registration; it used to be merged in AND fed to the takeover checker.
+        d = "example.com"
+        for bad in ("notexample.com", "myexample.com", "evilexample.com"):
+            self.assertFalse(bad == d or bad.endswith("." + d), bad)
+        for good in ("example.com", "api.example.com", "a.b.example.com"):
+            self.assertTrue(good == d or good.endswith("." + d), good)
+
+    def test_rdap_short_jcard_entry_does_not_raise(self):
+        # A registry returning a truncated or non-list jCard property used to
+        # raise IndexError/TypeError outside _safe_fetch and sink the whole
+        # domain scan. Mirrors the guarded parse in domain_scan.
+        for vcard in ([["fn"]], [["fn", {}, "text"]], ["notalist"], [None], [{"fn": 1}]):
+            registrar = None
+            for field in vcard:
+                if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
+                    registrar = field[3]
+            self.assertIsNone(registrar)
+        ok = [["fn", {}, "text", "Registrar Inc"]]
+        got = None
+        for field in ok:
+            if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
+                got = field[3]
+        self.assertEqual(got, "Registrar Inc")
+
+    def test_ripestat_non_ok_status_returns_none(self):
+        payload = {"status": "error", "data": {"holder": "should not be used"}}
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, payload)):
+            self.assertIsNone(recon_sources._ripestat("as-overview", "AS1"))
+
+    def test_get_catches_httpexception(self):
+        # common.fetch drives http.client directly; BadStatusLine is not an
+        # OSError and used to escape _get's "never raises" contract.
+        def boom(*a, **k):
+            raise http.client.BadStatusLine("garbage")
+        with mock.patch.object(recon_sources.common, "fetch", boom):
+            status, body, hdrs, err = recon_sources._get("https://example.com/")
+        self.assertIsNone(status)
+        self.assertTrue(err)
+
+    def test_rapiddns_regex_is_linear_on_a_hostile_body(self):
+        # The old nested-quantifier pattern backtracked catastrophically on a
+        # long run of hostname-legal characters. This body would hang it.
+        hostile = ("a" * 60 + "-") * 400 + " nothing-here"
+        body = hostile.encode()
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, body=body)):
+            t0 = time.monotonic()
+            names, err = recon_sources.rapiddns_subdomains("example.com")
+            elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 5.0, f"regex took {elapsed:.1f}s -- looks like backtracking")
+        self.assertEqual(names, set())
+
+    def test_rapiddns_still_extracts_real_hostnames(self):
+        body = b"<td>api.example.com</td><td>a.b.example.com</td><td>notexample.com</td>"
+        with mock.patch.object(recon_sources, "_get", _mk_get(200, body=body)):
+            names, err = recon_sources.rapiddns_subdomains("example.com")
+        self.assertIn("api.example.com", names)
+        self.assertIn("a.b.example.com", names)
+        self.assertNotIn("notexample.com", names)
+
+    def test_ofac_stale_cache_is_reported_not_laundered(self):
+        tmp = tempfile.mkdtemp()
+        recon_sources._ofac_mem.clear()
+        cache = Path(tmp) / "ofac_XBT.txt"
+        cache.write_text("1abc\n", encoding="utf-8")
+        old = time.time() - 40 * 86400
+        os.utime(cache, (old, old))
+        try:
+            # live fetch fails -> falls back to the 40-day-old copy on disk
+            with mock.patch.object(recon_sources, "VAR_DIR", Path(tmp)), \
+                 mock.patch.object(recon_sources, "_get", _mk_get(None, err="down")):
+                r = recon_sources.ofac_sanctioned("1zzz", "BTC")
+            self.assertTrue(r["checked"])
+            self.assertTrue(r["stale"], "a stale list must be flagged, not reported as current")
+            self.assertIn("day", (r["note"] or ""))
+        finally:
+            recon_sources._ofac_mem.clear()
+
+
+class FetchHopBudgetTests(unittest.TestCase):
+    def test_multi_ip_retry_shares_one_hop_budget(self):
+        # Each candidate used to get a FRESH `timeout`, so N dead addresses cost
+        # N x timeout. They must share one budget instead.
+        attempts = []
+
+        def slow_refuse(addr, timeout=None):
+            attempts.append(timeout)
+            time.sleep(0.25)
+            raise ConnectionRefusedError("nope")
+
+        ips = ["203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"]
+        with mock.patch.object(common, "_ordered_public_ips", return_value=ips), \
+             mock.patch.object(common.socket, "create_connection", slow_refuse):
+            t0 = time.monotonic()
+            with self.assertRaises(OSError):
+                common.fetch("http://example.com/", timeout=0.6)
+            elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.6, f"hop took {elapsed:.2f}s -- budget is per-candidate again")
+        # Later attempts must be handed a SHRINKING budget, never the full one.
+        self.assertTrue(all(t is None or t <= 0.6 for t in attempts), attempts)
+        if len(attempts) > 1:
+            self.assertLess(attempts[-1], attempts[0])
+
+
+class OrderedPublicIpsTests(unittest.TestCase):
+    def test_ipv4_comes_before_ipv6(self):
+        with mock.patch.object(common, "resolve_public_ips",
+                               return_value=["2606:4700::1", "1.1.1.1", "2606:4700::2", "8.8.8.8"]):
+            got = common._ordered_public_ips("example.com")
+        self.assertEqual(got, ["1.1.1.1", "8.8.8.8", "2606:4700::1", "2606:4700::2"])
+
+    def test_passes_through_validation_error(self):
+        # A non-public answer still raises out of resolve_public_ips — the
+        # ordering helper must not swallow the SSRF rejection.
+        with mock.patch.object(common, "resolve_public_ips", side_effect=ValueError("non-public")):
+            with self.assertRaises(ValueError):
+                common._ordered_public_ips("rebind.example.com")
+
+
+# ==========================================================================
+# consoles/recon/phonedata.py — offline phone-number intelligence.
+# ==========================================================================
+class PhoneDataTests(unittest.TestCase):
+    def _an(self, raw):
+        # Mirror how phone_scan feeds it: derive area code + US region from the
+        # existing NANP tables, then analyze.
+        import re as _re
+        d = _re.sub(r"[^\d+]", "", raw)
+        ac = lookups._nanp_area_code(d)
+        return recon_phonedata.analyze(raw, ac, lookups.nanp_region(ac))
+
+    def test_flag_from_iso2(self):
+        self.assertEqual(recon_phonedata._flag("US"), "\U0001F1FA\U0001F1F8")
+        self.assertEqual(recon_phonedata._flag("GB"), "\U0001F1EC\U0001F1E7")
+        self.assertEqual(recon_phonedata._flag("xx".upper()), "\U0001F1FD\U0001F1FD")
+        self.assertEqual(recon_phonedata._flag("USA"), "")   # not 2 letters
+
+    def test_us_geographic_number(self):
+        a = self._an("+14152345678")
+        self.assertTrue(a["ok"])
+        self.assertEqual(a["country"]["name"], "United States")
+        self.assertEqual(a["country"]["iso2"], "US")
+        self.assertEqual(a["number_type"], "Geographic")
+        self.assertEqual(a["national_format"], "(415) 234-5678")
+        self.assertEqual(a["international_format"], "+1 415-234-5678")
+        self.assertEqual(a["e164"], "+14152345678")
+        self.assertEqual(a["nanp"]["region"], "California")
+        self.assertEqual(a["nanp"]["timezone"], "America/Los_Angeles")
+        self.assertIn("local_time", a["nanp"])
+        self.assertTrue(a["valid"])
+
+    def test_bare_ten_digits_treated_as_nanp(self):
+        a = self._an("4152345678")
+        self.assertEqual(a["e164"], "+14152345678")
+        self.assertEqual(a["country"]["iso2"], "US")
+
+    def test_toll_free_and_premium(self):
+        self.assertEqual(self._an("+18005551234")["number_type"], "Toll-free")
+        self.assertEqual(self._an("+18885551234")["number_type"], "Toll-free")
+        self.assertEqual(self._an("+19005551234")["number_type"], "Premium rate")
+
+    def test_555_exchange_flagged_directory(self):
+        self.assertEqual(self._an("+12125551234")["number_type"], "Directory / fictional")
+
+    def test_split_state_timezone_is_flagged_approx(self):
+        a = self._an("+13055551234")   # Florida
+        self.assertEqual(a["nanp"]["region"], "Florida")
+        self.assertTrue(a["nanp"].get("timezone_approx"))
+        self.assertTrue(any("time zone" in n for n in a["notes"]))
+
+    def test_el_paso_area_code_override_to_mountain(self):
+        a = self._an("+19152345678")   # El Paso, TX -> Mountain, not Central
+        self.assertEqual(a["nanp"]["timezone"], "America/Denver")
+
+    def test_canada_area_code_resolves_canada(self):
+        a = self._an("+14162345678")
+        self.assertEqual(a["country"]["name"], "Canada")
+        self.assertEqual(a["country"]["iso2"], "CA")
+
+    def test_caribbean_nanp_resolves_country(self):
+        a = self._an("+18762345678")   # Jamaica
+        self.assertEqual(a["country"]["name"], "Jamaica")
+        self.assertEqual(a["country"]["iso2"], "JM")
+
+    def test_international_numbers_resolve_country_and_flag(self):
+        uk = self._an("+441613960000")
+        self.assertEqual(uk["country"]["name"], "United Kingdom")
+        self.assertEqual(uk["country"]["flag"], recon_phonedata._flag("GB"))
+        self.assertEqual(uk["country"]["calling_code"], "44")
+        fr = self._an("+33142685300")
+        self.assertEqual(fr["country"]["iso2"], "FR")
+        india = self._an("+919876543210")
+        self.assertEqual(india["country"]["iso2"], "IN")
+
+    def test_longest_prefix_country_match(self):
+        # +212 (Morocco) must not be read as +21 or +2.
+        self.assertEqual(self._an("+212612345678")["country"]["iso2"], "MA")
+        # +7 (Russia) is a 1-digit code.
+        self.assertEqual(self._an("+79161234567")["country"]["iso2"], "RU")
+
+    def test_too_short_is_rejected(self):
+        a = self._an("12345")
+        self.assertFalse(a["ok"])
+        self.assertIn("error", a)
+
+    def test_unknown_country_code_degrades(self):
+        a = self._an("+9991234567")
+        self.assertTrue(a["ok"])
+        self.assertIsNone(a["country"])
+        self.assertEqual(a["number_type"], "Unknown")
+
+
+class PhoneDataAuditRegressionTests(unittest.TestCase):
+    """Defects an adversarial audit confirmed on 2026-08-30."""
+
+    def _an(self, raw):
+        import re as _re
+        d = _re.sub(r"[^\d+]", "", raw)
+        ac = lookups._nanp_area_code(d)
+        return recon_phonedata.analyze(raw, ac, lookups.nanp_region(ac))
+
+    def test_malformed_plus1_never_renders_a_different_number(self):
+        # The worst bug in the module: an over-long +1 number was force-fed
+        # through digits[-10:], shifting the country code into the area code
+        # and DISPLAYING A DIFFERENT PHONE NUMBER as if it were the input.
+        a = self._an("+112345678901")
+        self.assertTrue(a["ok"])
+        self.assertFalse(a["valid"])
+        self.assertIsNone(a["e164"])
+        self.assertIsNone(a["international_format"])
+        self.assertNotIn("(234)", a["national_format"])
+        self.assertEqual(a["national_format"], "112345678901")
+
+    def test_trunk_zero_after_country_code_is_stripped(self):
+        a = self._an("+44 (0)20 7946 0958")
+        self.assertEqual(a["e164"], "+442079460958")
+        self.assertFalse(a["national_format"].startswith("00"))
+        self.assertTrue(a["valid"])
+
+    def test_italy_keeps_its_leading_zero(self):
+        a = self._an("+390612345678")
+        self.assertEqual(a["e164"], "+390612345678")
+
+    def test_no_invented_trunk_prefix_for_countries_without_one(self):
+        for num in ("+34612345678", "+4791234567"):
+            a = self._an(num)
+            self.assertFalse(a["national_format"].startswith("0"), num)
+
+    def test_plus7_splits_kazakhstan_from_russia(self):
+        self.assertEqual(self._an("+77012345678")["country"]["iso2"], "KZ")
+        self.assertEqual(self._an("+79161234567")["country"]["iso2"], "RU")
+
+    def test_unplaceable_country_code_is_not_stamped_valid(self):
+        a = self._an("+9991234567")
+        self.assertIsNone(a["valid"], "an unplaceable number must be unknown, not valid")
+
+    def test_bare_ten_digits_with_impossible_nanp_shape_is_not_us(self):
+        # A foreign domestic number written with a trunk 0 used to be given a
+        # US flag and a US state.
+        a = self._an("0612345678")
+        self.assertIsNone(a["country"])
+        # ...but a real NANP number still resolves.
+        self.assertEqual(self._an("4152345678")["country"]["iso2"], "US")
+
+    def test_area_code_zone_override_is_not_flagged_approximate(self):
+        exact = self._an("+19152345678")      # El Paso, explicit override
+        self.assertEqual(exact["nanp"]["timezone"], "America/Denver")
+        self.assertIsNone(exact["nanp"].get("timezone_approx"))
+        approx = self._an("+13055551234")     # Florida, dominant-zone guess
+        self.assertTrue(approx["nanp"].get("timezone_approx"))
+
+    def test_cc_table_has_no_duplicate_keys(self):
+        # A duplicate key in a dict literal is silently dropped by Python.
+        src = Path(recon_phonedata.__file__).read_text(encoding="utf-8")
+        block = src.split("_CC: dict[str, tuple[str, str]] = {", 1)[1].split("\n}", 1)[0]
+        keys = re.findall(r'"(\d{1,4})":', block)
+        dupes = {k for k in keys if keys.count(k) > 1}
+        self.assertFalse(dupes, f"duplicate calling codes in _CC: {sorted(dupes)}")
+
+
+class PhoneScanIntegrationTests(unittest.TestCase):
+    def test_phone_scan_includes_offline_analysis_without_a_key(self):
+        # The whole point of this change: a keyless phone scan now returns real
+        # parsed data in `analysis`, not just a country guess.
+        with mock.patch.object(lookups.apikeys, "get_key", return_value=""):
+            r = lookups.phone_scan("+14152345678")
+        self.assertIn("analysis", r)
+        self.assertTrue(r["analysis"]["ok"])
+        self.assertEqual(r["analysis"]["country"]["iso2"], "US")
+        self.assertEqual(r["analysis"]["number_type"], "Geographic")
+        self.assertFalse(r["lookup"]["configured"])   # no key, but analysis still populated
+
+
+# ==========================================================================
+# consoles/bastion/scrub.py — metadata risk classification.
+# The point of this classifier: mat2 CANNOT remove a container's mandatory
+# fields (an MP4 keeps codec id, bitrate, handler), so judging a clean by
+# "zero fields remain" reports every successfully scrubbed video as a failure.
+# ==========================================================================
+class ScrubRiskClassifyTests(unittest.TestCase):
+    def test_location_keys(self):
+        for key in ("GPSLatitude", "GPSLongitude", "GPSPosition", "LocationInformation",
+                    "GPSAltitude", "SubjectLocation"):
+            self.assertEqual(scrub.classify_key(key), scrub.RISK_LOCATION, key)
+
+    def test_identity_keys(self):
+        for key in ("Artist", "Author", "Copyright", "By-line", "Comment", "Title",
+                    "LastModifiedBy", "Creator"):
+            self.assertEqual(scrub.classify_key(key), scrub.RISK_IDENTITY, key)
+
+    def test_device_keys(self):
+        for key in ("Make", "Model", "SerialNumber", "LensSerialNumber", "HostComputer"):
+            self.assertEqual(scrub.classify_key(key), scrub.RISK_DEVICE, key)
+
+    def test_software_and_time_keys(self):
+        self.assertEqual(scrub.classify_key("Software"), scrub.RISK_SOFTWARE)
+        self.assertEqual(scrub.classify_key("Encoder"), scrub.RISK_SOFTWARE)
+        self.assertEqual(scrub.classify_key("CreateDate"), scrub.RISK_TIME)
+        self.assertEqual(scrub.classify_key("ModifyDate"), scrub.RISK_TIME)
+
+    def test_structural_keys_are_not_sensitive(self):
+        # These are the fields mat2 must leave behind in an MP4/JPEG. If any of
+        # them classified as sensitive, a cleaned video would report as failed.
+        for key in ("AverageBitrate", "BufferSize", "CompatibleBrands", "CompressorID",
+                    "CompressorName", "GraphicsMode", "HandlerDescription", "HandlerType",
+                    "HandlerVendorID", "MajorBrand", "MaxBitrate", "MediaDataOffset",
+                    "MediaDataSize", "MediaHeaderVersion", "MinorVersion", "MovieDataOffset",
+                    "MovieHeaderVersion", "NextTrackID", "OpColor", "SourceImageHeight",
+                    "SourceImageWidth", "TimeScale", "TrackHeaderVersion", "TrackID",
+                    "TrackLayer", "VideoFrameRate", "ImageWidth", "ImageHeight",
+                    "ExifByteOrder", "YCbCrPositioning", "ColorComponents", "EncodingProcess",
+                    "BitsPerSample", "XResolution", "YResolution", "ResolutionUnit"):
+            self.assertEqual(scrub.classify_key(key), scrub.RISK_STRUCTURAL, key)
+
+    def test_structural_wins_over_sensitive_substring(self):
+        # "CompressorID" contains "id"/"compressor" and "HandlerVendorID" contains
+        # "vendor"; "VideoFrameRate" contains "date"(no) but "MediaDataOffset"
+        # contains "data". Structural must be checked first or these misfire.
+        self.assertFalse(scrub.classify_key("CompressorID") in scrub.SENSITIVE_RISKS)
+        self.assertFalse(scrub.classify_key("HandlerVendorID") in scrub.SENSITIVE_RISKS)
+        self.assertFalse(scrub.classify_key("MediaDataOffset") in scrub.SENSITIVE_RISKS)
+
+    def test_unknown_key_is_unknown_not_sensitive(self):
+        # Unknown must not block the clean verdict (that would recreate the
+        # false-failure bug) but is surfaced for review.
+        self.assertEqual(scrub.classify_key("ZzzQuuxField"), scrub.RISK_UNKNOWN)
+        self.assertNotIn(scrub.RISK_UNKNOWN, scrub.SENSITIVE_RISKS)
+
+    def test_empty_and_garbage_keys_do_not_raise(self):
+        for key in ("", None, "   ", "!!!", "\x00\x01"):
+            self.assertIsInstance(scrub.classify_key(key), str)
+
+    def test_annotate_marks_sensitive(self):
+        pairs = [{"key": "GPSLatitude", "value": "37 deg"}, {"key": "CompressorID", "value": "avc1"}]
+        out = scrub.annotate(pairs)
+        self.assertTrue(out[0]["sensitive"])
+        self.assertEqual(out[0]["risk"], scrub.RISK_LOCATION)
+        self.assertFalse(out[1]["sensitive"])
+        self.assertEqual(out[0]["value"], "37 deg")   # original fields preserved
+
+    def test_risk_summary_headline_flags(self):
+        pairs = [{"key": "GPSLatitude", "value": "x"}, {"key": "Make", "value": "Canon"},
+                 {"key": "Artist", "value": "Cole"}, {"key": "TimeScale", "value": "600"}]
+        s = scrub.risk_summary(pairs)
+        self.assertEqual(s["sensitive_count"], 3)
+        self.assertEqual(s["structural_count"], 1)
+        self.assertTrue(s["has_location"])
+        self.assertTrue(s["has_device"])
+        self.assertTrue(s["has_identity"])
+        self.assertIn("GPSLatitude", s["sensitive_keys"])
+
+    def test_risk_summary_on_already_annotated_is_stable(self):
+        pairs = [{"key": "GPSLatitude", "value": "x"}]
+        once = scrub.risk_summary(scrub.annotate(pairs))
+        twice = scrub.risk_summary(pairs)
+        self.assertEqual(once["sensitive_count"], twice["sensitive_count"])
+
+    def test_a_scrubbed_video_field_set_reads_as_privacy_clean(self):
+        # The exact residual field set mat2 0.15 leaves in a cleaned MP4.
+        residual = [{"key": k, "value": "x"} for k in (
+            "AverageBitrate", "BufferSize", "CompatibleBrands", "CompressorID", "GraphicsMode",
+            "HandlerDescription", "HandlerType", "HandlerVendorID", "MajorBrand", "MaxBitrate",
+            "MediaDataOffset", "MediaDataSize", "MediaHeaderVersion", "MinorVersion",
+            "MovieDataOffset", "MovieHeaderVersion", "NextTrackID", "OpColor",
+            "SourceImageHeight", "SourceImageWidth", "TimeScale", "TrackHeaderVersion",
+            "TrackID", "TrackLayer", "VideoFrameRate")]
+        s = scrub.risk_summary(residual)
+        self.assertEqual(s["sensitive_count"], 0,
+                         f"a cleaned video must read as privacy-clean; flagged: {s['sensitive_keys']}")
 
 
 if __name__ == "__main__":

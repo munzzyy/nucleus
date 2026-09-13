@@ -56,6 +56,10 @@ def _scan(req):
             modules["crypto"] = lookups.crypto_scan(normalized)
         elif kind == "mac":
             modules["mac"] = lookups.mac_scan(normalized)
+        elif kind == "asn":
+            modules["asn"] = lookups.asn_scan(normalized)
+        elif kind == "discord":
+            modules["discord"] = lookups.discord_scan(normalized)
         elif kind in ("name", "company"):
             modules[kind] = lookups.wikipedia_scan(normalized)
         # image / geo have no live module -- pivots + dorks below are the

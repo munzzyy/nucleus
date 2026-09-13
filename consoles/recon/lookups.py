@@ -26,14 +26,16 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from shared import apikeys, common
+from consoles.recon import sources
+from consoles.recon import phonedata
 
 FETCH_TIMEOUT = 5.0
 KEYED_TIMEOUT = 6.0
 DNS_TIMEOUT = 5.0
 USERNAME_SITE_TIMEOUT = 6.0
-USERNAME_CONCURRENCY = 24  # WMN adds hundreds of candidate sites -- needs real
+USERNAME_CONCURRENCY = 32  # WMN adds hundreds of candidate sites -- needs real
                             # throughput to cover a useful sample inside the budget
-USERNAME_BUDGET = 25.0  # overall wall-clock cap for the whole username scan
+USERNAME_BUDGET = 30.0  # overall wall-clock cap for the whole username scan
 
 VAR_DIR = Path(__file__).resolve().parents[2] / "var"
 HISTORY_FILE = VAR_DIR / "recon-scans.jsonl"
@@ -393,6 +395,13 @@ def username_scan(u: str) -> dict:
             "took_ms": round((time.monotonic() - t0) * 1000),
         }
 
+    # HudsonRock infostealer check runs alongside the site sweep (it's one
+    # independent request), so it costs no extra wall-clock -- collected at the
+    # end. A different question from "does an account exist": has a machine
+    # logged into services under this handle been infected by an info-stealer.
+    hr_ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    hr_future = hr_ex.submit(sources.hudsonrock_username, u)
+
     wmn_sites, dataset_label = _wmn_checkable_sites()
     tasks: list[tuple[str, object]] = [(name, (lambda fn=fn: fn(u))) for name, fn in SITES]
     if wmn_sites:
@@ -454,10 +463,20 @@ def username_scan(u: str) -> dict:
 
     order = {name: i for i, (name, _) in enumerate(tasks)}
     results.sort(key=lambda r: order.get(r["site"], 10**9))
+
+    try:
+        infostealer = hr_future.result(timeout=max(0.1, sources.SLOW_TIMEOUT))
+    except Exception as e:
+        infostealer = {"ok": False, "infected": None, "stealer_count": 0,
+                       "stealers": [], "error": f"{type(e).__name__}: {e}"}
+    finally:
+        hr_ex.shutdown(wait=False, cancel_futures=True)
+
     return {
         "input": u,
         "sites": results,
         "github": github_enrich,
+        "infostealer": infostealer,
         "found_count": sum(1 for r in results if r["found"] is True),
         "not_found_count": sum(1 for r in results if r["found"] is False),
         "unknown_count": sum(1 for r in results if r["found"] is None),
@@ -556,6 +575,14 @@ def email_scan(email: str) -> dict:
     domain = email.split("@", 1)[1] if "@" in email else ""
     result: dict = {"input": email, "domain": domain}
 
+    # Two independent enrichments kicked off up front so they overlap the rest
+    # of the scan instead of adding their own serial latency: a full Gravatar
+    # profile (real name + verified linked social accounts from the email hash)
+    # and HudsonRock's infostealer-infection check.
+    _enrich_ex = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    _grav_future = _enrich_ex.submit(sources.gravatar_profile, email)
+    _hr_future = _enrich_ex.submit(sources.hudsonrock_email, email)
+
     # XposedOrNot -- simple breach list
     status, body, _, err = _safe_fetch(
         f"https://api.xposedornot.com/v1/check-email/{quote(email, safe='')}", timeout=FETCH_TIMEOUT)
@@ -649,6 +676,17 @@ def email_scan(email: str) -> dict:
 
     result["keyed"] = keyed
     result["unlock"] = unlock
+
+    try:
+        result["gravatar_profile"] = _grav_future.result(timeout=sources.SLOW_TIMEOUT)
+    except Exception as e:
+        result["gravatar_profile"] = {"exists": None, "error": f"{type(e).__name__}: {e}"}
+    try:
+        result["infostealer"] = _hr_future.result(timeout=sources.SLOW_TIMEOUT)
+    except Exception as e:
+        result["infostealer"] = {"ok": False, "infected": None, "stealer_count": 0,
+                                 "stealers": [], "error": f"{type(e).__name__}: {e}"}
+    _enrich_ex.shutdown(wait=False, cancel_futures=True)
     return result
 
 
@@ -740,6 +778,16 @@ def domain_scan(domain: str) -> dict:
     d = domain.lower().strip(".")
     result: dict = {"input": d}
 
+    # New keyless enrichments, all independent of the DNS/HTTP work below, so
+    # fire them off up front and collect at the end -- they overlap the rest of
+    # the scan instead of stacking their latency onto it. CertSpotter + RapidDNS
+    # feed the subdomain merge; Wayback + HudsonRock become their own sections.
+    _dom_ex = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    _certspotter_future = _dom_ex.submit(sources.certspotter_subdomains, d)
+    _rapiddns_future = _dom_ex.submit(sources.rapiddns_subdomains, d)
+    _wayback_future = _dom_ex.submit(sources.wayback_urls, d)
+    _hr_domain_future = _dom_ex.submit(sources.hudsonrock_domain, d)
+
     # DNS
     dns: dict = {}
     dns_unreachable: list[str] = []
@@ -757,6 +805,10 @@ def domain_scan(domain: str) -> dict:
     # not silently as "none".
     result["dns_unreachable"] = dns_unreachable
 
+    # DNSSEC: DNSKEY (already fetched above) + a DS record at the parent means
+    # a real signed chain of trust, not just self-published keys.
+    result["dnssec"] = sources.dnssec_status(d, dns.get("DNSKEY"))
+
     # RDAP whois (rdap.org redirects to the right RIR/registry; urllib follows it)
     status, body, _, err = _safe_fetch(f"https://rdap.org/domain/{quote(d, safe='')}", timeout=FETCH_TIMEOUT)
     if status == 200:
@@ -765,9 +817,14 @@ def domain_scan(domain: str) -> dict:
         for ent in data.get("entities") or []:
             if "registrar" in (ent.get("roles") or []):
                 vcard = ent.get("vcardArray")
-                if isinstance(vcard, list) and len(vcard) > 1:
+                if isinstance(vcard, list) and len(vcard) > 1 and isinstance(vcard[1], list):
                     for field in vcard[1]:
-                        if field and field[0] == "fn":
+                        # A jCard property is [name, params, type, value]. A
+                        # registry that returns a short or non-list entry used
+                        # to raise IndexError/TypeError here, and this runs
+                        # outside _safe_fetch's guard, so it took the WHOLE
+                        # domain scan down with it.
+                        if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
                             registrar_name = field[3]
         result["whois"] = {
             "ok": True, "handle": data.get("handle"), "status": data.get("status"),
@@ -803,7 +860,12 @@ def domain_scan(domain: str) -> dict:
         for row in rows:
             for n in (row.get("name_value") or "").split("\n"):
                 n = n.strip().lstrip("*.").lower()
-                if n and n.endswith(d):
+                # Scope on a label boundary, not a bare suffix: "notexample.com"
+                # ends with "example.com" but is a different registration, and
+                # a name that lands here also gets DNS-probed by the takeover
+                # checker, so an out-of-scope host is a scope violation, not
+                # just a wrong count.
+                if n and (n == d or n.endswith("." + d)):
                     crt_names.add(n)
         crt_error = None
     else:
@@ -824,7 +886,7 @@ def domain_scan(domain: str) -> dict:
             for line in text.splitlines():
                 host, _, ip = line.partition(",")
                 host = host.strip().lower()
-                if host and host.endswith(d):
+                if host and (host == d or host.endswith("." + d)):   # label boundary, see crt.sh above
                     ht_hosts.append({"host": host, "ip": ip.strip()})
     else:
         ht_error = err or f"HTTP {status}"
@@ -836,11 +898,25 @@ def domain_scan(domain: str) -> dict:
     if securitytrails_key:
         st_names, st_error = _securitytrails_subdomains(d, securitytrails_key)
 
-    merged_names = crt_names | {h["host"] for h in ht_hosts} | st_names
+    # CertSpotter (clean CT JSON, unlike crt.sh's flaky dumps) + RapidDNS
+    # (passive DNS). Collected from the futures started at the top.
+    try:
+        cs_names, cs_error = _certspotter_future.result(timeout=sources.SLOW_TIMEOUT + 2)
+    except Exception as e:
+        cs_names, cs_error = set(), f"{type(e).__name__}: {e}"
+    try:
+        rd_names, rd_error = _rapiddns_future.result(timeout=sources.SLOW_TIMEOUT + 2)
+    except Exception as e:
+        rd_names, rd_error = set(), f"{type(e).__name__}: {e}"
+
+    merged_names = (crt_names | {h["host"] for h in ht_hosts} | st_names | cs_names | rd_names)
     result["subdomains"] = {
-        "ok": bool(merged_names) or (crt_error is None and ht_error is None),
-        "count": len(merged_names), "names": sorted(merged_names)[:300],
+        "ok": bool(merged_names) or (crt_error is None and ht_error is None
+                                     and cs_error is None and rd_error is None),
+        "count": len(merged_names), "names": sorted(merged_names)[:400],
         "crt_sh": {"ok": crt_error is None, "count": len(crt_names), "error": crt_error},
+        "certspotter": {"ok": cs_error is None, "count": len(cs_names), "error": cs_error},
+        "rapiddns": {"ok": rd_error is None, "count": len(rd_names), "error": rd_error},
         "hackertarget": {"ok": ht_error is None, "count": len(ht_hosts),
                           "hosts": ht_hosts[:150], "error": ht_error},
         "securitytrails": {"ok": bool(securitytrails_key) and st_error is None,
@@ -978,6 +1054,30 @@ def domain_scan(domain: str) -> dict:
 
     result["keyed"] = keyed
     result["unlock"] = unlock
+
+    # Wayback historical URLs (also a side source of subdomains) + HudsonRock's
+    # org-level infostealer exposure, collected from the futures started up top.
+    try:
+        wb = _wayback_future.result(timeout=sources.SLOW_TIMEOUT + 2)
+    except Exception as e:
+        wb = {"ok": False, "count": 0, "urls": [], "subdomains": [], "error": f"{type(e).__name__}: {e}"}
+    result["wayback_urls"] = wb
+    # Fold any subdomains Wayback surfaced into the subdomain set too. Dedupe
+    # against the FULL merged set, not against result["names"] -- that list was
+    # already truncated to 400, so a name beyond the cut looked new and got
+    # counted twice without ever appearing in the list.
+    if wb.get("subdomains"):
+        extra = {s for s in wb["subdomains"]
+                 if s and (s == d or s.endswith("." + d)) and s not in merged_names}
+        if extra:
+            merged_names |= extra
+            result["subdomains"]["names"] = sorted(merged_names)[:400]
+            result["subdomains"]["count"] = len(merged_names)
+    try:
+        result["infostealer"] = _hr_domain_future.result(timeout=sources.SLOW_TIMEOUT + 2)
+    except Exception as e:
+        result["infostealer"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    _dom_ex.shutdown(wait=False, cancel_futures=True)
     return result
 
 
@@ -1226,6 +1326,30 @@ def ip_scan(ip: str) -> dict:
 
     result["keyed"] = keyed
     result["unlock"] = unlock
+
+    # Keyless network intel: RIPEstat (announcing ASN + covering prefix + AS
+    # holder) and SANS ISC (attack reports, network abuse contact, threat
+    # feeds). Run together so they add roughly one call's latency, not two.
+    # NOT a `with` block: Executor.__exit__ calls shutdown(wait=True), which
+    # joins both workers no matter what the .result(timeout=) guards said, so
+    # a hung source would still block the scan for its full socket timeout and
+    # then be reported as "timed out". Shutting down without waiting is what
+    # actually makes the budget below mean something (same pattern the other
+    # scans in this file use).
+    _ip_ex = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        _ripe_f = _ip_ex.submit(sources.ripestat_ip, ip)
+        _isc_f = _ip_ex.submit(sources.isc_ip, ip)
+        try:
+            result["ripestat"] = _ripe_f.result(timeout=sources.SLOW_TIMEOUT)
+        except Exception as e:
+            result["ripestat"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        try:
+            result["isc"] = _isc_f.result(timeout=sources.SLOW_TIMEOUT)
+        except Exception as e:
+            result["isc"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _ip_ex.shutdown(wait=False, cancel_futures=True)
     return result
 
 
@@ -1398,6 +1522,12 @@ def phone_scan(number: str) -> dict:
         "us_region": nanp_region(area_code),
     }
 
+    # Rich offline analysis -- country + flag, clean formats, line type, and for
+    # NANP numbers the state, time zone and current local time. This is what
+    # makes a keyless phone scan actually show data (every keyless phone API
+    # now demands a key), so it runs regardless of whether a key is set.
+    result["analysis"] = phonedata.analyze(number, area_code, result["us_region"])
+
     api_key = apikeys.get_key("NUMLOOKUP_API_KEY")
     if not api_key:
         result["lookup"] = {
@@ -1466,7 +1596,7 @@ def _vt_hash_lookup(h: str, key: str) -> dict:
     return {"ok": False, "error": _keyed_note(status, err)}
 
 
-def _malwarebazaar_lookup(h: str) -> dict:
+def _malwarebazaar_lookup(h: str, key: str = "") -> dict:
     """abuse.ch MalwareBazaar get_info -- keyless, a second known-sample oracle
     alongside CIRCL. POSTs the query through the same SSRF-guarded fetch every
     other call here uses. Degrades to an error field, never raises. When the
@@ -1475,9 +1605,22 @@ def _malwarebazaar_lookup(h: str) -> dict:
     has been tightening this endpoint toward auth-required; if a key ever
     becomes mandatory the request just degrades to an error note here.)"""
     body = urlencode({"query": "get_info", "hash": h}).encode("utf-8")
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if key:
+        headers["Auth-Key"] = key
     status, resp, _, err = _safe_fetch(
         "https://mb-api.abuse.ch/api/v1/", timeout=FETCH_TIMEOUT, max_bytes=300_000,
-        data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        data=body, headers=headers)
+    # abuse.ch closed this endpoint to anonymous callers. Without a key that's
+    # not a failure on our side, so say what it actually needs instead of
+    # showing "HTTP 401" on every single hash scan forever.
+    if status in (401, 403) and not key:
+        return {"ok": False, "known": None, "error": None,
+                "needs_key": True,
+                "note": "MalwareBazaar now requires a free abuse.ch Auth-Key. "
+                        "Add ABUSECH_API_KEY in Settings to turn this source back on."}
+    if status in (401, 403):
+        return {"ok": False, "known": None, "error": "abuse.ch rejected the Auth-Key"}
     if status == 200:
         data = _json_or_none(resp) or {}
         qs = data.get("query_status")
@@ -1532,10 +1675,13 @@ def hash_scan(h: str) -> dict:
     # key). CIRCL leans on the NSRL known-GOOD corpus; MalwareBazaar is a
     # known-BAD malware corpus, so the two answer different questions and are
     # worth running side by side.
-    result["malwarebazaar"] = _malwarebazaar_lookup(h)
+    result["malwarebazaar"] = _malwarebazaar_lookup(h, apikeys.get_key("ABUSECH_API_KEY"))
 
     keyed: dict = {}
     unlock: list[str] = []
+    if result["malwarebazaar"].get("needs_key"):
+        unlock.append("Add a free abuse.ch key in Settings to re-enable the MalwareBazaar "
+                      "known-malware lookup (it stopped serving anonymous requests).")
     key = apikeys.get_key("VT_API_KEY")
     if key:
         keyed["virustotal"] = _vt_hash_lookup(h, key)
@@ -1622,6 +1768,21 @@ def _partial_ethplorer_parse(text: str) -> tuple[dict, list[dict], bool]:
 # 7. Crypto address -- BTC via blockchain.info, ETH via Ethplorer
 # ==========================================================================
 def crypto_scan(addr: str) -> dict:
+    """Balance/activity for a BTC or ETH address, plus a mempool.space
+    cross-check for BTC and an OFAC sanctions-list membership check for both.
+    The core balance lookup is unchanged; the sanctions + mempool fields are
+    layered on so they can't perturb the existing return shapes."""
+    result = _crypto_core(addr)
+    chain = result.get("chain")
+    if chain == "BTC":
+        result["mempool"] = sources.mempool_btc(addr)
+        result["sanctions"] = sources.ofac_sanctioned(addr, "BTC")
+    elif chain == "ETH":
+        result["sanctions"] = sources.ofac_sanctioned(addr, "ETH")
+    return result
+
+
+def _crypto_core(addr: str) -> dict:
     if addr.lower().startswith("0x"):
         status, body, _, err = _safe_fetch(
             f"https://api.ethplorer.io/getAddressInfo/{quote(addr, safe='')}?apiKey=freekey",
@@ -1700,6 +1861,18 @@ def mac_scan(mac: str) -> dict:
 
 
 # ==========================================================================
+# 8b. ASN -- RIPEstat holder/registry + announced prefixes (keyless).
+# 8c. Discord snowflake -- account-creation time decoded offline.
+# ==========================================================================
+def asn_scan(asn: str) -> dict:
+    return sources.asn_scan(asn)
+
+
+def discord_scan(snowflake: str) -> dict:
+    return sources.discord_snowflake(snowflake)
+
+
+# ==========================================================================
 # 9. Wikipedia summary -- for name/company/topic selectors
 # ==========================================================================
 def wikipedia_scan(term: str) -> dict:
@@ -1774,6 +1947,12 @@ def _summarize_scan(kind: str, scan: dict) -> str:
             return mod.get("vendor") or "vendor unknown"
         if kind in ("name", "company"):
             return "Wikipedia match" if mod.get("found") else "no Wikipedia match"
+        if kind == "asn":
+            holder = mod.get("holder") or "unknown holder"
+            n = mod.get("prefix_count")
+            return f"{holder} - {n} prefixes" if n is not None else str(holder)
+        if kind == "discord":
+            return f"created {(mod.get('created_utc') or '?')[:10]}" if mod.get("ok") else "not a snowflake"
     except Exception:
         pass
     return f"{kind} scan"

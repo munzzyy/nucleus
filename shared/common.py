@@ -343,6 +343,25 @@ def _resolve_public(host: str) -> tuple[str, int]:
     return ip, family
 
 
+def _ordered_public_ips(host: str) -> list[str]:
+    """Every validated public IP for `host`, IPv4 first.
+
+    `resolve_public_ips()` has already confirmed every address is public
+    (raising on any that isn't), so this ordering is purely about connecting
+    reliably: `fetch()` tries these in turn and stops at the first that
+    accepts, so a dual-stack box whose IPv6 route is dead — or a host whose
+    first DNS record points at an address that refuses — falls through to a
+    working one instead of failing the whole fetch. IPv4 goes first because a
+    broken-IPv6 box is the common case; a genuinely IPv6-only host still works
+    (its v4 list is simply empty). Whichever address wins, it came from the
+    guard's validated set, so the SSRF guarantee is unchanged.
+    """
+    ips = resolve_public_ips(host)
+    v4 = [ip for ip in ips if ipaddress.ip_address(ip).version == 4]
+    v6 = [ip for ip in ips if ipaddress.ip_address(ip).version == 6]
+    return v4 + v6
+
+
 def _arm_deadline(sock: socket.socket, deadline: float) -> None:
     """Set `sock`'s timeout to whatever's left before `deadline`, or raise
     TimeoutError if that's already <= 0. Call this right before every
@@ -446,7 +465,9 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
     method = "POST" if data is not None else "GET"
     current = url
     body_data = data
-    origin_host = (urlparse(url).hostname or "").lower()
+    _origin = urlparse(url)
+    origin_host = (_origin.hostname or "").lower()
+    origin_scheme = (_origin.scheme or "").lower()
     for _hop in range(_MAX_REDIRECTS + 1):
         u = urlparse(current)
         if u.scheme not in ("http", "https"):
@@ -454,7 +475,9 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
         host = u.hostname or ""
         if not host:
             raise ValueError("no host in url")
-        ip, _family = _resolve_public(host)  # validates + pins
+        candidates = _ordered_public_ips(host)  # all validated public, v4 first
+        if not candidates:
+            raise ValueError(f"unresolvable host: {host}")
         port = u.port or (443 if u.scheme == "https" else 80)
         path = u.path or "/"
         if u.query:
@@ -464,24 +487,62 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
                        "Connection": "close"}
         # Caller headers may carry API keys. Only send them to the ORIGINAL host —
         # if a redirect points anywhere else, drop them so a key can never ride a
-        # 3xx to an attacker-chosen host.
-        if host.lower() == origin_host:
+        # 3xx to an attacker-chosen host. The SCHEME has to match too: a same-host
+        # https -> http redirect would otherwise put the key on the wire in
+        # cleartext, which is exactly what an on-path attacker would ask for.
+        # (Downgrades are allowed to proceed; they just travel without the key.)
+        if host.lower() == origin_host and (u.scheme.lower() == origin_scheme
+                                            or origin_scheme != "https"):
             for k, v in (headers or {}).items():
                 req_headers[k] = v
 
-        deadline = time.monotonic() + timeout  # fresh cumulative budget for this hop
-        sock = socket.create_connection((ip, port), timeout=timeout)
-        wrapped = None  # set below for https — a DIFFERENT object holding the real fd
+        # Connect to the first address that accepts us. Every candidate came
+        # from resolve_public_ips() and is confirmed public, so trying them in
+        # turn keeps the SSRF guarantee while surviving a dead IPv6 route (or
+        # any single dead record) instead of failing the whole fetch on it. A
+        # connection that ESTABLISHES then errors later is NOT retried — only
+        # connect/handshake failures fall through — so a POST body is never
+        # sent twice.
+        conn = sock = wrapped = None
+        deadline = 0.0
+        connect_err = None
+        # ONE budget for the whole hop, shared across every candidate address.
+        # Giving each candidate a fresh `timeout` made a hop with N addresses
+        # cost up to N x timeout of wall clock, so a caller asking for 5s could
+        # sit for 20s. Each attempt gets whatever is left.
+        hop_deadline = time.monotonic() + timeout
+        for ip in candidates:
+            remaining = hop_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            deadline = hop_deadline
+            try:
+                sock = socket.create_connection((ip, port), timeout=remaining)
+                if u.scheme == "https":
+                    _arm_deadline(sock, deadline)  # handshake gets whatever's left, not a fresh window
+                    ctx = ssl.create_default_context()
+                    conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+                    wrapped = ctx.wrap_socket(sock, server_hostname=host)  # NEW object holding the real fd
+                    conn.sock = _DeadlineSock(wrapped, deadline)
+                else:
+                    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+                    conn.sock = _DeadlineSock(sock, deadline)
+                break
+            except OSError as e:
+                connect_err = e
+                for s in (wrapped, sock):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                conn = sock = wrapped = None
+                continue
+        if conn is None:
+            # Exhausted every validated address — re-raise the last connect
+            # error (an OSError, as before) so callers keep catching the same type.
+            raise connect_err if connect_err is not None else ValueError(f"unresolvable host: {host}")
         try:
-            if u.scheme == "https":
-                _arm_deadline(sock, deadline)  # handshake gets whatever's left, not a fresh window
-                ctx = ssl.create_default_context()
-                conn = http.client.HTTPSConnection(host, port, timeout=timeout)
-                wrapped = ctx.wrap_socket(sock, server_hostname=host)
-                conn.sock = _DeadlineSock(wrapped, deadline)
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=timeout)
-                conn.sock = _DeadlineSock(sock, deadline)
             conn.request(method, path, body=body_data, headers=req_headers)
             resp = conn.getresponse()
             status = resp.status

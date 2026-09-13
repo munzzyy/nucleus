@@ -39,6 +39,7 @@
     username: "Username", email: "Email", domain: "Domain", ip: "IP address",
     phone: "Phone", name: "Name", company: "Company", crypto: "Crypto address",
     image: "Image URL", geo: "Geo coordinates", hash: "File hash", mac: "MAC address",
+    asn: "ASN", discord: "Discord ID",
   };
 
   function pill(kind, text) {
@@ -70,6 +71,16 @@
 
   function boolStr(v) {
     return v === true ? "yes" : v === false ? "no" : "";
+  }
+
+  // A "count" from a third-party API is only a number by convention. String
+  // also has .toLocaleString(), so `provider.count.toLocaleString()` happily
+  // returns an attacker's markup verbatim and it lands in innerHTML. Coerce
+  // and drop anything non-finite: safe by construction, and a bad value shows
+  // as blank instead of as HTML.
+  function num(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n.toLocaleString() : "";
   }
 
   // -- pivot chips: turn a discovered entity Nucleus can itself scan into a
@@ -131,6 +142,49 @@
   function keyedCard(title, obj, rows) {
     const body = keyedBody(obj, rows);
     return body ? card(title, body) : "";
+  }
+
+  // HudsonRock infostealer exposure — same shape for both email and username
+  // lookups (a person got popped by an infostealer, here's what it grabbed).
+  // The provider already masks logins/passwords before it ever reaches us
+  // (e.g. "S******8"), so we render those as-is but small and unlabeled-loud —
+  // they're a sample, not a real credential leak, and shouldn't read like one.
+  function infostealerBlock(o) {
+    if (!o) return "";
+    if (o.ok === false) return card("Infostealer exposure (HudsonRock)", `<p class="faint">${esc(o.error || "check failed")}</p>`);
+    if (o.error) return card("Infostealer exposure (HudsonRock)", `<p class="faint">${esc(o.error)}</p>`);
+    if (o.infected === false) {
+      return card("Infostealer exposure (HudsonRock)", `<p class="ok">no infostealer infection on file (HudsonRock)</p>`);
+    }
+    if (o.infected !== true) return "";
+    // Built as a list and joined, so the markup can't end up unbalanced (the
+    // old inline-ternary version emitted a stray </span> when corporate
+    // services were present but personal ones were not).
+    const svc = [];
+    if (num(o.total_user_services)) svc.push(num(o.total_user_services) + " personal service(s)");
+    if (num(o.total_corporate_services)) svc.push(num(o.total_corporate_services) + " corporate service(s)");
+    const summary = `<div class="badge-row">
+        ${pill("bad", `${num(o.stealer_count)} infection(s)`)}
+        ${svc.length ? `<span class="faint">${svc.join(" · ")}</span>` : ""}
+      </div>`;
+    const rows = (o.stealers || []).map(s => {
+      const logins = (s.top_logins || []).filter(Boolean);
+      const passwords = (s.top_passwords || []).filter(Boolean);
+      let sample = "";
+      if (logins.length || passwords.length) {
+        sample = `<p class="faint small mt">provider-masked sample (values are redacted by HudsonRock)`
+          + (logins.length ? `<br>logins: ${logins.map(esc).join(", ")}` : "")
+          + (passwords.length ? `<br>passwords: ${passwords.map(esc).join(", ")}` : "")
+          + `</p>`;
+      }
+      return `<div class="breach-row">
+          <div class="name">${esc(s.computer_name || "unknown machine")}</div>
+          <div class="meta">${esc(s.date_compromised || "")}${s.operating_system ? " · " + esc(s.operating_system) : ""}${s.stealer_family ? " · " + esc(s.stealer_family) : ""}</div>
+          ${(s.antiviruses || []).length ? `<div class="classes">${s.antiviruses.map(a => `<span class="tag">${esc(a)}</span>`).join("")}</div>` : ""}
+          ${sample}
+        </div>`;
+    }).join("");
+    return card(`Infostealer exposure — ${o.stealer_count} infection(s)`, summary + rows);
   }
 
   function renderUnlock(unlock) {
@@ -243,7 +297,42 @@
         ["Created", m.github.created_at], ["Blog", m.github.blog], ["Location", m.github.location],
       ]));
     }
-    return card("Username", summary + controls + grid + sampleNote) + githubCard;
+    return card("Username", summary + controls + grid + sampleNote) + githubCard + infostealerBlock(m.infostealer);
+  }
+
+  // Gravatar's public profile API — when it exists it's a strong identity
+  // anchor (real name, employer, verified linked accounts). Each linked
+  // account is itself a pivot: re-scan the handle on its own site.
+  function gravatarProfileCard(gp) {
+    if (!gp) return "";
+    if (gp.error) return card("Gravatar profile", `<p class="faint">${esc(gp.error)}</p>`);
+    if (!gp.exists) return "";
+    // CSP here is img-src 'self' data: — no external images load, so the
+    // avatar is a link out rather than a broken/blocked <img>.
+    const avatarLink = gp.avatar
+      ? `<a class="gravatar-avatar-link" href="${esc(N.safeUrl(gp.avatar))}" target="_blank" rel="noopener noreferrer">view avatar</a>` : "";
+    const nameLine = [gp.job_title, gp.company].filter(Boolean).join(" @ ");
+    const accounts = (gp.accounts || []).map(a => {
+      const link = a.url
+        ? `<a href="${esc(N.safeUrl(a.url))}" target="_blank" rel="noopener noreferrer">${esc(a.name || a.shortname || "link")}</a>`
+        : esc(a.name || a.shortname || "link");
+      return `<div class="pivot-row">
+          <span class="pivot-val">${link}${a.username ? ` — @${esc(a.username)}` : ""}${a.verified ? " ✓" : ""}</span>
+          ${a.username ? pivotChip(a.username, "username") : ""}
+        </div>`;
+    }).join("");
+    const body = `<div class="gravatar-identity">
+        <div class="gravatar-identity-text">
+          <div class="name">${esc(gp.display_name || gp.username || "")}</div>
+          ${nameLine ? `<div class="sub">${esc(nameLine)}</div>` : ""}
+          ${gp.location ? `<div class="sub">${esc(gp.location)}</div>` : ""}
+          ${gp.pronouns ? `<div class="faint small">${esc(gp.pronouns)}</div>` : ""}
+        </div>
+        ${avatarLink}
+      </div>`
+      + (gp.about ? `<p class="sub mt">${esc(gp.about)}</p>` : "")
+      + (accounts ? `<div class="mt subdomain-list">${accounts}</div>` : "");
+    return card("Gravatar profile", body);
   }
 
   function renderEmail(m) {
@@ -267,7 +356,7 @@
       breachList = an.breaches.slice(0, 25).map(b => `
         <div class="breach-row">
           <div class="name">${esc(b.name || "unknown")} <span class="faint">— ${esc(b.domain || "")}</span></div>
-          <div class="meta">${esc(b.year || "")} · ${b.records ? b.records.toLocaleString() + " records" : ""}
+          <div class="meta">${esc(b.year || "")} · ${num(b.records) ? num(b.records) + " records" : ""}
             · password risk: ${esc(b.password_risk || "unknown")} · verified: ${esc(String(b.verified))}</div>
           <div class="classes">${(b.data_classes || []).slice(0, 10).map(c => `<span class="tag">${esc(c)}</span>`).join("")}</div>
         </div>`).join("");
@@ -291,6 +380,8 @@
     }
 
     return card("Email", summary + breachList + renderUnlock(m.unlock))
+      + gravatarProfileCard(m.gravatar_profile)
+      + infostealerBlock(m.infostealer)
       + keyedCard("Hunter.io verifier", k.hunter, [
           ["Result", k.hunter && k.hunter.result], ["Score", k.hunter && k.hunter.score],
           ["Disposable", k.hunter && boolStr(k.hunter.disposable)],
@@ -353,16 +444,58 @@
     const crtSrc = subs.crt_sh || {};
     const htSrc = subs.hackertarget || {};
     const stSrc = subs.securitytrails || {};
+    const csSrc = subs.certspotter || {};
+    const rdSrc = subs.rapiddns || {};
     const stPart = stSrc.error != null || stSrc.count
       ? `, SecurityTrails: ${stSrc.count || 0}${stSrc.error ? ` (${esc(stSrc.error)})` : ""}` : "";
+    const csPart = csSrc.error != null || csSrc.count
+      ? `, certspotter: ${csSrc.count || 0}${csSrc.error ? ` (${esc(csSrc.error)})` : ""}` : "";
+    const rdPart = rdSrc.error != null || rdSrc.count
+      ? `, rapiddns: ${rdSrc.count || 0}${rdSrc.error ? ` (${esc(rdSrc.error)})` : ""}` : "";
     const nTakeover = Math.min((subs.names || []).length, TAKEOVER_MAX_SUBS);
     const takeoverBtn = (subs.names || []).length
       ? `<button type="button" class="ghost mt sub-takeover-btn">Check these ${nTakeover} for takeover</button>`
       : "";
     const subsHtml = (subs.names || []).length
       ? `<p class="faint mb">${subs.count} unique name(s) — crt.sh: ${crtSrc.count || 0}${crtSrc.error ? ` (${esc(crtSrc.error)})` : ""}, `
-        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}</p>${pivotList(subs.names, "domain")}${takeoverBtn}`
-      : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}${stPart}</p>`;
+        + `hackertarget: ${htSrc.count || 0}${htSrc.error ? ` (${esc(htSrc.error)})` : ""}${stPart}${csPart}${rdPart}</p>${pivotList(subs.names, "domain")}${takeoverBtn}`
+      : `<p class="faint">crt.sh: ${esc(crtSrc.error || "unavailable")} · hackertarget: ${esc(htSrc.error || "unavailable")}${stPart}${csPart}${rdPart}</p>`;
+
+    const dnssec = m.dnssec || {};
+    const dnssecHtml = `<div class="badge-row">
+        ${pill(dnssec.signed ? "ok" : "warn", dnssec.signed ? "DNSSEC signed" : "not signed")}
+        ${dnssec.dnskey_count ? `<span class="faint">${dnssec.dnskey_count} DNSKEY record(s)</span>` : ""}
+      </div>` + (dnssec.note ? `<p class="faint small">${esc(dnssec.note)}</p>` : "");
+
+    const wu = m.wayback_urls || {};
+    let wbUrlsHtml;
+    if (wu.ok && (wu.urls || []).length) {
+      wbUrlsHtml = `<p class="faint mb">${wu.count} historical URL(s) on record (showing ${wu.urls.length})</p>`
+        + `<div class="subdomain-list wayback-list">${wu.urls.map(u =>
+            `<div><a href="${esc(N.safeUrl(u))}" target="_blank" rel="noopener noreferrer">${esc(u)}</a></div>`).join("")}</div>`;
+    } else {
+      wbUrlsHtml = `<p class="faint">${esc(wu.error || "no historical URLs on record")}</p>`;
+    }
+
+    const dinf = m.infostealer || {};
+    let dinfHtml;
+    if (dinf.error) {
+      dinfHtml = `<p class="faint">${esc(dinf.error)}</p>`;
+    } else if (dinf.ok === false) {
+      dinfHtml = `<p class="faint">${esc(dinf.error || "check failed")}</p>`;
+    } else if (dinf.total) {
+      const urlLine = (u) => `<div>${esc(u.url)} <span class="faint">(seen ${num(u.occurrence)}${u.type ? `, ${esc(u.type)}` : ""} time(s))</span></div>`;
+      dinfHtml = `<div class="badge-row">
+          ${pill("warn", `${num(dinf.total)} compromised credential(s)`)}
+          <span class="faint">${num(dinf.employees || 0)} employee(s) · ${num(dinf.users || 0)} user(s) · ${num(dinf.third_parties || 0)} third-part(y/ies)</span>
+        </div>`
+        + (dinf.employee_urls && dinf.employee_urls.length
+            ? `<p class="faint mb mt">Employee-side URLs seen in stealer logs</p><div class="subdomain-list">${dinf.employee_urls.map(urlLine).join("")}</div>` : "")
+        + (dinf.client_urls && dinf.client_urls.length
+            ? `<p class="faint mb mt">Customer / user-side URLs seen in stealer logs</p><div class="subdomain-list">${dinf.client_urls.map(urlLine).join("")}</div>` : "");
+    } else {
+      dinfHtml = `<p class="ok">no infostealer exposure on file (HudsonRock)</p>`;
+    }
 
     const us = m.urlscan || {};
     let urlscanHtml;
@@ -402,6 +535,7 @@
 
     return [
       card("DNS", dnsHtml + renderUnlock(m.unlock)),
+      card("DNSSEC", dnssecHtml),
       card("WHOIS (RDAP)", whoisHtml),
       keyedCard("WhoisXML WHOIS", k.whoisxml, [
         ["Registrar", k.whoisxml && k.whoisxml.registrar], ["Created", k.whoisxml && k.whoisxml.created],
@@ -415,6 +549,8 @@
       card("urlscan.io recent scans", urlscanHtml),
       card("AlienVault OTX reputation", otxHtml),
       card("Wayback Machine", wbHtml),
+      card("Historical URLs (Wayback)", wbUrlsHtml),
+      card("Infostealer exposure (org, HudsonRock)", dinfHtml),
       keyedCard("VirusTotal (domain reputation)", k.virustotal, [
         ["Malicious", k.virustotal && k.virustotal.malicious], ["Suspicious", k.virustotal && k.virustotal.suspicious],
         ["Harmless", k.virustotal && k.virustotal.harmless], ["Reputation", k.virustotal && k.virustotal.reputation],
@@ -470,11 +606,37 @@
       ? kv([["Pulse count", otx.pulse_count], ["Pulse names", (otx.pulse_names || []).join(", ") || "none"]])
       : `<p class="faint">${esc(otx.error || "unavailable")}</p>`;
 
+    const ripe = m.ripestat || {};
+    const ripeHtml = ripe.ok
+      ? kv([
+          ["Announcing ASN(s)", (ripe.asns || []).length
+            ? raw((ripe.asns || []).map(a => pivotValue("AS" + a, "asn")).join(", ")) : ""],
+          ["Covering prefix", ripe.prefix],
+          ["AS holder", ripe.holder],
+        ])
+      : `<p class="faint">${esc(ripe.error || "unavailable")}</p>`;
+
+    const isc = m.isc || {};
+    let iscHtml;
+    if (isc.ok) {
+      const feedPills = (isc.threatfeeds || []).map(f => pill("warn", f)).join(" ");
+      iscHtml = kv([
+        ["Attacks", isc.attacks], ["Reports", isc.reports],
+        ["AS name", isc.asname], ["AS country", isc.ascountry],
+        ["Abuse contact", isc.abuse_contact], ["Network", isc.network],
+      ]) + (feedPills ? `<div class="badge-row mt">${feedPills}</div>` : "")
+        + (isc.comment ? `<p class="faint small mt">${esc(isc.comment)}</p>` : "");
+    } else {
+      iscHtml = `<p class="faint">${esc(isc.error || "unavailable")}</p>`;
+    }
+
     return [
       card("InternetDB (Shodan)", idbHtml),
       card("Geolocation", geoHtml),
       card("Reverse DNS", rdnsHtml),
       card("RDAP netblock", rdapHtml),
+      card("RIPEstat routing", ripeHtml),
+      card("SANS ISC threat intel", iscHtml),
       card("Tor (Onionoo)", torHtml),
       card("AlienVault OTX reputation", otxHtml),
       keyedCard("IPinfo", k.ipinfo, [
@@ -515,16 +677,38 @@
   }
 
   function renderPhone(m) {
+    const a = m.analysis || {};
     const l = m.lookup || {};
     const k = m.keyed || {};
-    const top = kv([
-      ["Country (guess)", m.country_guess || "unknown"],
-      ["US region (area code)", m.us_region ? `${m.us_region} (${m.area_code})` : ""],
-      ["Digits", m.digit_count],
-    ]);
+    const c = a.country || {};
+
+    // The offline analysis is the headline -- it shows real data with no key.
+    let analysisHtml;
+    if (a.ok) {
+      const validTxt = a.valid === true ? "yes" : a.valid === false ? "no" : "unknown";
+      const rows = [
+        ["Country", c.name ? `${c.flag ? c.flag + " " : ""}${c.name}${c.calling_code ? ` (+${c.calling_code})` : ""}` : "unknown"],
+        ["Number type", a.number_type],
+        ["Valid (structure)", validTxt],
+        ["E.164", a.e164],
+        ["National format", a.national_format],
+        ["International format", a.international_format],
+      ];
+      const n = a.nanp || {};
+      if (n.region) rows.push(["Region", `${n.region}${n.area_code ? ` (area code ${n.area_code})` : ""}`]);
+      if (n.timezone) rows.push(["Time zone", n.timezone + (n.timezone_approx ? " (approx.)" : "")]);
+      if (n.local_time) rows.push(["Local time now", n.local_time]);
+      analysisHtml = kv(rows);
+      if (a.notes && a.notes.length) {
+        analysisHtml += `<div class="phone-notes mt">${a.notes.map(t => `<p class="faint">${esc(t)}</p>`).join("")}</div>`;
+      }
+    } else {
+      analysisHtml = `<p class="bad">${esc(a.error || "could not parse this number")}</p>`;
+    }
+
     let lookupHtml;
     if (!l.configured) {
-      lookupHtml = `<p class="faint">${esc(l.note)}</p>`;
+      lookupHtml = `<p class="faint">${esc(l.note || "add a NumLookupAPI key in Settings for live carrier and line-type data")}</p>`;
     } else if (l.ok) {
       lookupHtml = kv([
         ["Valid", l.valid === true ? "yes" : l.valid === false ? "no" : "unknown"],
@@ -534,8 +718,10 @@
     } else {
       lookupHtml = `<p class="bad">${esc(l.error || "lookup failed")}</p>`;
     }
-    return card("Phone", top + lookupHtml + renderUnlock(m.unlock))
-      + keyedCard("IPQualityScore", k.ipqs, [
+
+    return card("Phone number", analysisHtml)
+      + card("Live carrier lookup (NumLookupAPI)", lookupHtml + renderUnlock(m.unlock))
+      + keyedCard("IPQualityScore (fraud + carrier)", k.ipqs, [
           ["Valid", k.ipqs && boolStr(k.ipqs.valid)], ["Active", k.ipqs && boolStr(k.ipqs.active)],
           ["Carrier", k.ipqs && k.ipqs.carrier], ["Line type", k.ipqs && k.ipqs.line_type],
           ["Fraud score", k.ipqs && k.ipqs.fraud_score], ["Risky", k.ipqs && boolStr(k.ipqs.risky)],
@@ -588,16 +774,41 @@
         ]);
   }
 
+  // OFAC hit is the one crypto finding that needs to read as urgent rather
+  // than as another kv row — a sanctioned address changes what you can legally
+  // do next, so it gets its own loud banner instead of blending into the card.
+  function sanctionsBanner(s) {
+    if (!s) return "";
+    if (s.error) return `<p class="faint small mt">sanctions check: ${esc(s.error)}</p>`;
+    if (!s.checked) return `<p class="faint small mt">sanctions check not run</p>`;
+    if (s.sanctioned === true) {
+      return `<div class="sanctions-banner bad mt">
+          <strong>OFAC SANCTIONED ADDRESS</strong>
+          <span>${esc(s.source || "OFAC SDN")}${s.note ? " — " + esc(s.note) : ""}</span>
+        </div>`;
+    }
+    return `<p class="ok small mt">not on OFAC list${s.source ? ` (${esc(s.source)})` : ""}</p>`;
+  }
+
   function renderCrypto(m) {
     if (!m.ok) return card("Crypto address", `<p class="bad">${esc(m.error || "lookup failed")}</p>`);
     if (m.chain === "BTC") {
+      const mp = m.mempool || {};
+      const mpHtml = mp.ok
+        ? kv([
+            ["mempool.space balance", `${mp.balance_btc} BTC`],
+            ["mempool.space received/sent", `${mp.total_received_btc} / ${mp.total_sent_btc} BTC`],
+            ["mempool.space tx count", mp.tx_count],
+            ["Pending tx", mp.pending_tx],
+          ])
+        : (mp.error ? `<p class="faint small">mempool.space: ${esc(mp.error)}</p>` : "");
       return card("Crypto address (Bitcoin)", kv([
         ["Balance", `${m.balance_btc} BTC`],
         ["Total received", `${m.total_received_btc} BTC`],
         ["Total sent", `${m.total_sent_btc} BTC`],
         ["Transaction count", m.n_tx],
         ["Note", m.note],
-      ]));
+      ]) + mpHtml + sanctionsBanner(m.sanctions));
     }
     const tokens = (m.tokens || []).map(t => `${t.name || "?"} (${t.symbol || "?"})`).join(", ");
     return card("Crypto address (Ethereum)", kv([
@@ -607,13 +818,40 @@
       ["Token count", m.token_count],
       ["Tokens", tokens],
       ["Note", m.note],
-    ]));
+    ]) + sanctionsBanner(m.sanctions));
   }
 
   function renderMac(m) {
     if (m.error) return card("MAC vendor lookup", `<p class="bad">${esc(m.error)}</p>`);
     return card("MAC vendor lookup (macvendors.com)", kv([
       ["Vendor", m.known ? m.vendor : "unknown"],
+      ["Note", m.note],
+    ]));
+  }
+
+  function renderAsn(m) {
+    if (m.ok === false || m.error) return card("ASN", `<p class="bad">${esc(m.error || "lookup failed")}</p>`);
+    const v4 = (m.prefixes_v4 || []).slice(0, 25);
+    const v6 = (m.prefixes_v6 || []).slice(0, 25);
+    return card("ASN " + (m.asn || m.input || ""), kv([
+      ["Holder", m.holder],
+      ["Registry", m.registry],
+      ["Announced", boolStr(m.announced)],
+      ["Total prefixes", m.prefix_count],
+    ]) + (v4.length ? `<p class="faint mb mt">IPv4 prefixes (sample)</p>${list(v4)}` : "")
+      + (v6.length ? `<p class="faint mb mt">IPv6 prefixes (sample)</p>${list(v6)}` : ""));
+  }
+
+  // Discord snowflake IDs encode their own creation timestamp — no network
+  // call needed, it's just bit math on the ID. created_utc is already an
+  // ISO string from the server; render it plainly rather than reformatting.
+  function renderDiscord(m) {
+    if (m.ok === false || m.error) return card("Discord ID", `<p class="bad">${esc(m.error || "decode failed")}</p>`);
+    return card("Discord ID", kv([
+      ["Created", m.created_utc],
+      ["Worker ID", m.worker_id],
+      ["Process ID", m.process_id],
+      ["Increment", m.increment],
       ["Note", m.note],
     ]));
   }
@@ -632,6 +870,7 @@
     username: renderUsername, email: renderEmail, domain: renderDomain,
     ip: renderIp, phone: renderPhone, hash: renderHash, crypto: renderCrypto,
     mac: renderMac, name: renderWikipedia, company: renderWikipedia,
+    asn: renderAsn, discord: renderDiscord,
   };
 
   // -- copy / export toolbar (built from the shared kit) ---------------------

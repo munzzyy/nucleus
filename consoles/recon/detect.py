@@ -17,7 +17,7 @@ from urllib.parse import quote, quote_plus
 VALID_TYPES = (
     "username", "email", "domain", "ip", "phone",
     "name", "company", "crypto", "image", "geo",
-    "hash", "mac",
+    "hash", "mac", "asn", "discord",
 )
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -34,6 +34,12 @@ _MAC_RE = re.compile(
     r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$|^(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$"
 )
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,39}$")
+# Autonomous System number: "AS15169" / "as15169" (the AS prefix disambiguates
+# it from a bare integer, which would look like a phone or a Discord ID).
+_ASN_RE = re.compile(r"^AS\d{1,10}$", re.I)
+# Discord snowflake: a 17-20 digit ID (account / message / server). Longer than
+# any phone number, so it can't collide with one.
+_DISCORD_RE = re.compile(r"^\d{17,20}$")
 _IMAGE_EXT_RE = re.compile(r"\.(jpe?g|png|gif|webp|bmp|svg|tiff?)(?:[?#].*)?$", re.I)
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){1,4}$")
 _COMPANY_SUFFIXES = (
@@ -63,7 +69,12 @@ def classify(raw: str) -> tuple[str, str]:
     except ValueError:
         pass
 
-    if _EMAIL_RE.match(s):
+    # An email can't contain a path or a scheme. Without this, a URL carrying
+    # basic-auth credentials ("https://admin:hunter2@intranet.example.com/x")
+    # matches _EMAIL_RE and gets scanned AS AN EMAIL, which ships the password
+    # off to XposedOrNot, HudsonRock, Gravatar and friends. Check the URL shape
+    # first and let the host fall through to the domain branch below.
+    if _EMAIL_RE.match(s) and "/" not in s and ":" not in s.split("@", 1)[0]:
         return "email", s.lower()
 
     # MAC before hash/username: colon form isn't a valid username character
@@ -85,13 +96,31 @@ def classify(raw: str) -> tuple[str, str]:
     if _GEO_RE.match(s):
         return "geo", re.sub(r"\s+", "", s)
 
+    # ASN before the username fallback -- "AS15169" is a legal username string,
+    # so it has to be claimed here or it'd fall through to a username scan.
+    if _ASN_RE.match(s):
+        return "asn", "AS" + re.sub(r"\D", "", s)
+
+    # Discord snowflake: 17-20 pure digits. A phone tops out at 15 digits and
+    # the phone branch below caps at 15, so this can't steal a real phone; claim
+    # it before the username fallback (a bare digit run is a legal username).
+    if _DISCORD_RE.match(s):
+        return "discord", s
+
     # URL forms: image if it looks like a media file, otherwise treat the
     # host as a domain target.
     rest, had_scheme = _strip_scheme(s)
     if had_scheme or ("/" in s and _DOMAIN_RE.match(s.split("/", 1)[0])):
         host_and_path = rest if had_scheme else s
-        host = host_and_path.split("/", 1)[0].split("?", 1)[0]
+        host = host_and_path.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
         path = host_and_path[len(host):]
+        # Drop userinfo and the port before the host is matched. Keeping them
+        # made _DOMAIN_RE fail on perfectly ordinary recon input
+        # ("https://example.com:8080/admin"), which then fell through to the
+        # username branch and 400'd.
+        if "@" in host:
+            host = host.rsplit("@", 1)[1]
+        host = host.split(":", 1)[0]
         if _IMAGE_EXT_RE.search(path or host_and_path):
             return "image", s if had_scheme else f"https://{s}"
         if _DOMAIN_RE.match(host):
@@ -102,7 +131,12 @@ def classify(raw: str) -> tuple[str, str]:
 
     digits = re.sub(r"[^\d+]", "", s)
     digit_count = len(re.sub(r"\D", "", digits))
-    if digit_count >= 7 and digit_count <= 15 and re.match(r"^[\d\s()+.\-]+$", s):
+    # "." and "-" are legal phone punctuation, which means a dotted quad that
+    # ipaddress already rejected above (a zero-padded or out-of-range IPv4 like
+    # 192.168.001.1 or 999.1.1.1) otherwise lands here and gets scanned as a
+    # phone number. Anything shaped like an IPv4 is not a phone number.
+    looks_like_ipv4 = re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", s) is not None
+    if 7 <= digit_count <= 15 and re.match(r"^[\d\s()+.\-]+$", s) and not looks_like_ipv4:
         return "phone", digits
 
     if re.search(r"\s", s):
@@ -116,6 +150,12 @@ def classify(raw: str) -> tuple[str, str]:
 
     if _USERNAME_RE.match(s):
         return "username", s
+
+    # "@handle" is how people actually write a username. Strip the sigil so it
+    # scans instead of failing validation (which is the same _USERNAME_RE, so
+    # anything that doesn't match here is rejected upstream by design).
+    if s.startswith("@") and _USERNAME_RE.match(s[1:]):
+        return "username", s[1:]
 
     # Fall through: treat as a username anyway (best-effort single token).
     return "username", s
@@ -137,6 +177,13 @@ def normalize_for(kind: str, raw: str) -> str:
         return re.sub(r"\s+", "", s)
     if kind in ("hash", "mac"):
         return s.lower()
+    if kind == "asn":
+        digits = re.sub(r"\D", "", s)
+        return f"AS{digits}" if digits else s.upper()
+    if kind == "discord":
+        return re.sub(r"\D", "", s)
+    if kind == "username":
+        return s[1:] if s.startswith("@") else s
     return s
 
 
@@ -148,6 +195,8 @@ _FORMAT_RE = {
     "name": _NAME_RE,
     "hash": _HASH_RE,
     "mac": _MAC_RE,
+    "asn": _ASN_RE,
+    "discord": _DISCORD_RE,
 }
 
 
@@ -317,6 +366,23 @@ def pivots_for(kind: str, value: str) -> list[dict]:
             {"title": "Wikimapia", "url": f"http://wikimapia.org/#lang=en&lat={lat}&lon={lng}&z=16"},
         ]
 
+    if kind == "asn":
+        num = re.sub(r"\D", "", v)
+        return [
+            {"title": f"bgp.he.net — AS{num}", "url": f"https://bgp.he.net/AS{num}"},
+            {"title": f"bgp.tools — AS{num}", "url": f"https://bgp.tools/as/{num}"},
+            {"title": "RIPEstat", "url": f"https://stat.ripe.net/AS{num}"},
+            {"title": "PeeringDB", "url": f"https://www.peeringdb.com/asn/{num}"},
+            {"title": "Shodan ASN search", "url": f"https://www.shodan.io/search?query=asn%3AAS{num}"},
+        ]
+
+    if kind == "discord":
+        return [
+            {"title": "DiscordLookup", "url": f"https://discordlookup.com/user/{qv}"},
+            {"title": "Snowflake reference (Discord docs)",
+             "url": "https://discord.com/developers/docs/reference#snowflakes"},
+        ]
+
     return []
 
 
@@ -397,6 +463,18 @@ def dorks_for(kind: str, value: str) -> list[dict]:
     if kind == "mac":
         return [
             _dork("Exact mention", f'"{v}"'),
+        ]
+
+    if kind == "asn":
+        return [
+            _dork("Exact mention", f'"{v}"'),
+            _dork("Abuse / netblock references", f'"{v}" (abuse OR netblock OR prefix OR peering)'),
+        ]
+
+    if kind == "discord":
+        return [
+            _dork("Exact ID", f'"{v}"'),
+            _dork("Server / invite mentions", f'"{v}" (discord OR invite OR guild)'),
         ]
 
     return []

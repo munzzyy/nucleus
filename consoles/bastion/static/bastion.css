@@ -121,6 +121,22 @@
 .meta-table tr:last-child td { border-bottom: none; }
 .meta-table td.mkey { color: var(--txt-dim); white-space: nowrap; width: 1%; }
 .meta-table td.mval { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; color: var(--txt); }
+
+/* Risk labels on metadata rows. Identifying categories are colored by how
+   directly they point at a person; structural container fields stay quiet so
+   a cleaned video doesn't look alarming. */
+.meta-table td.mrisk { width: 1%; white-space: nowrap; padding-right: 4px; }
+.risk-badge { display: inline-block; font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--txt-faint); }
+.risk-badge.risk-location { border-color: color-mix(in srgb, var(--bad) 55%, transparent); color: var(--bad); }
+.risk-badge.risk-identity { border-color: color-mix(in srgb, var(--bad) 40%, transparent); color: var(--bad); }
+.risk-badge.risk-device { border-color: color-mix(in srgb, var(--warn) 50%, transparent); color: var(--warn); }
+.risk-badge.risk-time,
+.risk-badge.risk-software { border-color: color-mix(in srgb, var(--warn) 35%, transparent); color: var(--warn); }
+.risk-badge.risk-structural { color: var(--txt-faint); }
+.risk-badge.risk-unknown { border-color: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent); }
+.meta-table tr.meta-sensitive td.mkey { color: var(--txt); }
+.file-card .fc-removed { font-size: 12.5px; color: var(--ok); word-break: break-word; }
 .meta-more { margin-top: 8px; padding: 6px 10px; font-size: 12px; }
 
 /* ---- print (Save as PDF via window.print(), from the report result) ----

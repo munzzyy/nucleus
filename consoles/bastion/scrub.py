@@ -65,6 +65,136 @@ MAX_VALUE_CHARS = 2000
 
 _META_NAME = "meta.json"  # per-session bookkeeping file — records the original's name/size
 
+# --------------------------------------------------------------------------
+# Metadata risk classification
+#
+# Not all metadata identifies you. A JPEG's GPS coordinates and camera serial
+# absolutely do; an MP4's codec id and bitrate do not — and mat2 CANNOT remove
+# the latter, because the container format requires those fields to exist (it
+# says so itself: "has some mandatory metadata fields; mat2 filled them with
+# standard data"). Judging a clean purely by "zero fields remain" therefore
+# reports every successfully-scrubbed video as a failure, which is both wrong
+# and the kind of wrong that makes someone distrust a working privacy tool.
+#
+# So we classify each field. `sensitive` categories are the ones that can tie a
+# file to a person, a place, a device or a moment; `structural` is the codec /
+# geometry / container bookkeeping that is safe to leave. Anything we don't
+# recognize is `unknown` — deliberately NOT counted as clean-blocking (that
+# would resurrect the false-failure problem) but surfaced for review, so the
+# UI can be honest about what it couldn't vouch for.
+# --------------------------------------------------------------------------
+RISK_LOCATION = "location"
+RISK_IDENTITY = "identity"
+RISK_DEVICE = "device"
+RISK_TIME = "time"
+RISK_SOFTWARE = "software"
+RISK_STRUCTURAL = "structural"
+RISK_UNKNOWN = "unknown"
+
+# Categories that mean "this can identify someone". Ordered most-alarming first.
+SENSITIVE_RISKS = (RISK_LOCATION, RISK_IDENTITY, RISK_DEVICE, RISK_TIME, RISK_SOFTWARE)
+
+# Matched against the lowercased key. Structural is checked FIRST so a
+# container field like "CompressorID" can't be caught by the device patterns.
+_STRUCTURAL_PATTERNS = (
+    "imagewidth", "imageheight", "sourceimagewidth", "sourceimageheight",
+    "xresolution", "yresolution", "resolutionunit", "bitspersample", "bitdepth",
+    "colorcomponents", "colorspace", "encodingprocess", "ycbcr", "jfif",
+    "exifbyteorder", "filetype", "mimetype", "megapixels", "aspectratio",
+    "compressorid", "compressorname", "graphicsmode", "opcolor", "handlertype",
+    "handlerdescription", "handlervendorid", "majorbrand", "minorversion",
+    "compatiblebrands", "mediadataoffset", "mediadatasize", "mediaheaderversion",
+    "moviedataoffset", "moviedatasize", "movieheaderversion", "trackheaderversion",
+    "trackid", "tracklayer", "nexttrackid", "timescale", "duration", "framerate",
+    "videoframerate", "audioformat", "audiochannels", "audiobitspersample",
+    "audiosamplerate", "samplerate", "channels", "averagebitrate", "maxbitrate",
+    "buffersize", "avgbitrate", "matrixstructure", "mediatimescale", "mediaduration",
+    "preferredrate", "preferredvolume", "previewtime", "previewduration",
+    "postertime", "selectiontime", "selectionduration", "currenttime",
+    "rotation", "orientation", "interlace", "planarconfiguration", "photometric",
+    "compression", "quality", "progressive", "numberofframes", "pixelformat",
+    "chromasubsampling", "videocodec", "audiocodec", "codec", "container",
+    "balance", "graphicsmodecolor", "opcolorred", "opcolorgreen", "opcolorblue",
+)
+
+# Substring patterns per sensitive category (checked in this order).
+_SENSITIVE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (RISK_LOCATION, (
+        "gps", "location", "geo", "coordinate", "latitude", "longitude",
+        "altitude", "destbearing", "subjectlocation", "country", "city",
+        "province", "state", "sublocation",
+    )),
+    (RISK_IDENTITY, (
+        "artist", "author", "creator", "owner", "copyright", "by-line", "byline",
+        "credit", "contact", "email", "url", "website", "rights", "usageterms",
+        "personinimage", "lastmodifiedby", "company", "manager", "producer",
+        "writer", "director", "publisher", "source", "supplier", "licensor",
+        "user", "name", "title", "description", "comment", "keywords", "subject",
+        "caption", "headline", "instructions", "note", "album", "performer",
+        "composer", "encodedby", "grouping", "lyrics", "identifier",
+    )),
+    (RISK_DEVICE, (
+        "make", "model", "serial", "bodyserial", "lens", "camera", "hostcomputer",
+        "devicemanufacturer", "devicemodel", "firmware", "internalserial",
+        "ownername", "cameraid", "imei", "deviceid", "scanner",
+    )),
+    (RISK_TIME, (
+        "date", "time", "year", "timestamp", "createdate", "modifydate",
+    )),
+    (RISK_SOFTWARE, (
+        "software", "encoder", "creatortool", "processingsoftware", "application",
+        "generator", "producedby", "toolkit", "writername", "encodingtool",
+        "historysoftwareagent", "xmptoolkit",
+    )),
+)
+
+
+def classify_key(key: str) -> str:
+    """Risk category for one metadata key. Structural (harmless container
+    bookkeeping) wins over everything so codec/geometry fields are never
+    mistaken for device fingerprints; otherwise the first matching sensitive
+    category wins; anything unrecognized is `unknown`."""
+    k = re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+    if not k:
+        return RISK_UNKNOWN
+    for pat in _STRUCTURAL_PATTERNS:
+        if pat in k:
+            return RISK_STRUCTURAL
+    for risk, patterns in _SENSITIVE_PATTERNS:
+        for pat in patterns:
+            if pat in k:
+                return risk
+    return RISK_UNKNOWN
+
+
+def annotate(pairs: list[dict]) -> list[dict]:
+    """Copy of `pairs` with `risk` + `sensitive` on every entry. Pure."""
+    out = []
+    for p in pairs or []:
+        risk = classify_key(p.get("key", ""))
+        out.append({**p, "risk": risk, "sensitive": risk in SENSITIVE_RISKS})
+    return out
+
+
+def risk_summary(pairs: list[dict]) -> dict:
+    """Counts by category for an annotated (or raw) pair list, plus the
+    headline flags the UI leads with."""
+    annotated = pairs if (pairs and "risk" in pairs[0]) else annotate(pairs)
+    counts: dict = {}
+    for p in annotated:
+        counts[p["risk"]] = counts.get(p["risk"], 0) + 1
+    sensitive = [p for p in annotated if p.get("sensitive")]
+    return {
+        "counts": counts,
+        "sensitive_count": len(sensitive),
+        "structural_count": counts.get(RISK_STRUCTURAL, 0),
+        "unknown_count": counts.get(RISK_UNKNOWN, 0),
+        "has_location": counts.get(RISK_LOCATION, 0) > 0,
+        "has_identity": counts.get(RISK_IDENTITY, 0) > 0,
+        "has_device": counts.get(RISK_DEVICE, 0) > 0,
+        "sensitive_keys": [p["key"] for p in sensitive][:50],
+    }
+
 # Cached once per process: the formats list and version string never change
 # under us, and status() is polled by the UI.
 _exts_cache: Optional[frozenset] = None
@@ -297,7 +427,8 @@ def inspect(token: str) -> dict:
     if r.returncode != 0:
         return {"error": "mat2 could not inspect this file: " + _run_summary(r)}
     pairs, notes = parse_show(r.stdout)
-    return {"metadata": pairs, "notes": notes}
+    annotated = annotate(pairs)
+    return {"metadata": annotated, "notes": notes, "risk": risk_summary(annotated)}
 
 
 def clean(token: str, lightweight: bool = False, unknown_members: str = "abort") -> dict:
@@ -321,6 +452,16 @@ def clean(token: str, lightweight: bool = False, unknown_members: str = "abort")
         return {"error": "mat2 is not installed — install it with `sudo pacman -S mat2`"}
     fpath, meta = _original(token)
     size_before = int(meta.get("size") or fpath.stat().st_size)
+
+    # Snapshot the BEFORE state so the result can show exactly which fields
+    # went away. Re-reading here (rather than trusting whatever the upload
+    # returned) keeps clean() self-contained and correct even if the caller
+    # never inspected, and it's the same one-subprocess cost as --show.
+    before_pairs: list[dict] = []
+    before = common.run_tool([path, "--show", str(fpath)], timeout=SHOW_TIMEOUT)
+    if not before.timed_out and before.returncode == 0:
+        before_pairs = annotate(parse_show(before.stdout)[0])
+
     argv = [path]
     if lightweight:
         argv.append("-L")
@@ -337,13 +478,33 @@ def clean(token: str, lightweight: bool = False, unknown_members: str = "abort")
     if show.timed_out or show.returncode != 0:
         return {"error": "cleaned, but the re-check failed: " + _run_summary(show)}
     pairs, notes = parse_show(show.stdout)
+    after_pairs = annotate(pairs)
+
+    # What actually went away, by key. This is the reassurance that matters:
+    # "GPSLatitude, Make, Model, Artist removed" beats any verdict word.
+    after_keys = {p["key"] for p in after_pairs}
+    removed = [p for p in before_pairs if p["key"] not in after_keys]
+    remaining_sensitive = [p for p in after_pairs if p.get("sensitive")]
+
     return {
         "cleaned_name": cleaned.name,   # sanitized original with ".cleaned" inserted
         "size_before": size_before,
         "size_after": cleaned.stat().st_size,
-        "metadata_after": pairs,
+        "metadata_after": after_pairs,
         "notes": notes,
-        "clean": len(pairs) == 0,
+        # Strict verdict: nothing at all is left. Kept as-is for callers that
+        # already read it.
+        "clean": len(after_pairs) == 0,
+        # The verdict that's actually correct for formats with mandatory
+        # fields: no field that could identify a person, place, device or
+        # moment survives. A scrubbed MP4 keeps its codec id and bitrate and
+        # is still, in every sense a user cares about, clean.
+        "privacy_clean": len(remaining_sensitive) == 0,
+        "removed": [{"key": p["key"], "risk": p["risk"]} for p in removed][:MAX_PAIRS],
+        "removed_count": len(removed),
+        "remaining_sensitive": [{"key": p["key"], "risk": p["risk"]} for p in remaining_sensitive][:MAX_PAIRS],
+        "risk_before": risk_summary(before_pairs),
+        "risk_after": risk_summary(after_pairs),
     }
 
 

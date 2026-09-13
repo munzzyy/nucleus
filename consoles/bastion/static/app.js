@@ -456,12 +456,40 @@
     ]);
   }
 
-  function metadataTable(pairs) {
+  // Risk labels come from scrub.classify_key server-side. "structural" is the
+  // codec/geometry bookkeeping a container format requires — it identifies
+  // nobody, so it's styled as quiet rather than as a warning.
+  const RISK_LABEL = {
+    location: "location", identity: "identity", device: "device",
+    time: "time", software: "software", structural: "structural", unknown: "unknown",
+  };
+
+  function riskBadge(risk) {
+    const r = RISK_LABEL[risk] ? risk : "unknown";
+    return N.el("span", { class: "risk-badge risk-" + r, text: RISK_LABEL[r] });
+  }
+
+  // Danger first: mat2 emits fields alphabetically, which buries GPS under
+  // "AverageBitrate". Sorting by what a field exposes puts the reason you
+  // opened this panel at the top. Ties keep mat2's original order.
+  const RISK_RANK = { location: 0, identity: 1, device: 2, time: 3, software: 4, unknown: 5, structural: 6 };
+
+  function byRisk(pairs) {
+    return (pairs || []).map((p, i) => [p, i]).sort((a, b) => {
+      const ra = RISK_RANK[a[0].risk] != null ? RISK_RANK[a[0].risk] : 5;
+      const rb = RISK_RANK[b[0].risk] != null ? RISK_RANK[b[0].risk] : 5;
+      return ra - rb || a[1] - b[1];
+    }).map(x => x[0]);
+  }
+
+  function metadataTable(rawPairs) {
+    const pairs = byRisk(rawPairs);
     const wrap = N.el("div", { class: "meta-wrap" });
     const build = (all) => {
       const tbody = N.el("tbody");
       (all ? pairs : pairs.slice(0, 30)).forEach(p => {
-        tbody.appendChild(N.el("tr", {}, [
+        tbody.appendChild(N.el("tr", { class: p.sensitive ? "meta-sensitive" : "" }, [
+          N.el("td", { class: "mrisk" }, [riskBadge(p.risk)]),
           N.el("td", { class: "mkey", text: String(p.key == null ? "" : p.key) }),
           N.el("td", { class: "mval", text: String(p.value == null ? "" : p.value) }),
         ]));
@@ -512,6 +540,19 @@
     }
     if (c.state === "ready" || c.state === "cleaning") {
       noteLines(c.notes).forEach(el => body.appendChild(el));
+      // Lead with what this file gives away about you, not with a field dump.
+      const rk = c.risk || {};
+      if (rk.sensitive_count) {
+        const reveals = [];
+        if (rk.has_location) reveals.push("where it was taken");
+        if (rk.has_device) reveals.push("what device took it");
+        if (rk.has_identity) reveals.push("who made it");
+        body.appendChild(N.el("div", { class: "fc-verdict warn" },
+          [document.createTextNode("⚠ This file reveals "
+            + (reveals.length ? reveals.join(", ") : "identifying details")
+            + " — " + rk.sensitive_count
+            + (rk.sensitive_count === 1 ? " identifying field" : " identifying fields"))]));
+      }
       if ((c.metadata || []).length) body.appendChild(metadataTable(c.metadata));
       else body.appendChild(N.el("p", { class: "muted m0", text: "No metadata found — cleaning will still normalize the file." }));
       const row = N.el("div", { class: "fc-actions" });
@@ -534,17 +575,33 @@
     // cleaned — the re-check verdict, what changed, and the download
     const r = c.result || {};
     const after = r.metadata_after || [];
+    const leftover = r.remaining_sensitive || [];
+    // `clean` is the strict "nothing at all left" read. `privacy_clean` is the
+    // one that matters: formats like MP4 REQUIRE fields such as codec id and
+    // bitrate, so mat2 refills them by design. Judging a video by the strict
+    // flag alone reported every successful scrub as a failure.
     if (r.clean) {
       body.appendChild(N.el("div", { class: "fc-verdict ok", text: "✓ Cleaned — re-checked: no metadata left" }));
+    } else if (r.privacy_clean) {
+      body.appendChild(N.el("div", { class: "fc-verdict ok",
+        text: "✓ Cleaned — every identifying field is gone. " + after.length
+          + (after.length === 1 ? " field remains" : " fields remain")
+          + ", all of it structural (codec, size, timing) that this format requires and that identifies nobody." }));
     } else {
-      body.appendChild(N.el("div", {
-        class: "fc-verdict warn",
-        text: "Cleaned — " + after.length + (after.length === 1 ? " entry remains" : " entries remain")
-          + " (lightweight mode keeps some)",
-      }));
+      body.appendChild(N.el("div", { class: "fc-verdict warn",
+        text: "⚠ Cleaned, but " + leftover.length
+          + (leftover.length === 1 ? " identifying field survived: " : " identifying fields survived: ")
+          + leftover.map(x => x.key).join(", ") }));
+    }
+    if (r.removed_count) {
+      const removedKeys = (r.removed || []).map(x => x.key);
+      body.appendChild(N.el("div", { class: "fc-removed",
+        text: "Removed " + r.removed_count + (r.removed_count === 1 ? " field: " : " fields: ")
+          + removedKeys.slice(0, 12).join(", ")
+          + (removedKeys.length > 12 ? ", and " + (removedKeys.length - 12) + " more" : "") }));
     }
     noteLines(r.notes).forEach(el => body.appendChild(el));
-    if (!r.clean && after.length) body.appendChild(metadataTable(after));
+    if (after.length) body.appendChild(metadataTable(after));
     body.appendChild(N.el("div", {
       class: "fc-sizes faint",
       text: humanSize(r.size_before) + " → " + humanSize(r.size_after)
@@ -615,6 +672,7 @@
       c.ext = j.ext || c.ext;
       c.metadata = j.metadata || [];
       c.notes = j.notes || [];
+      c.risk = j.risk || null;
       if (j.error) {            // tolerated shape: 200 with an error field
         c.error = String(j.error);
         c.state = "error";
@@ -637,7 +695,7 @@
       if (!file.size) { N.toast("skipped " + file.name + " — empty file", "bad"); return; }
       const c = {
         name: file.name, size: file.size, ext: extOf(file.name),
-        token: null, state: "inspecting", metadata: [], notes: [],
+        token: null, state: "inspecting", metadata: [], notes: [], risk: null,
         result: null, error: null, el: null,
       };
       scrubCards.push(c);

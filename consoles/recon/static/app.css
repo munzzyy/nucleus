@@ -128,3 +128,26 @@
    style="" attribute, which the strict CSP dropped (rows rendered with no
    separator); moved here so they actually apply. -- */
 .takeover-row { padding: 8px 0; border-top: 1px solid var(--line); }
+
+/* -- Gravatar identity card. CSP is img-src 'self' data: so the avatar is a
+   link out, not an embedded <img> (an external one would just be blocked). -- */
+.gravatar-identity { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.gravatar-identity-text .name { font-weight: 650; font-size: 15px; }
+.gravatar-identity-text .sub { color: var(--txt-dim); font-size: 12.5px; }
+.gravatar-avatar-link { flex: none; font-size: 12px; color: var(--txt-faint); }
+.gravatar-avatar-link:hover { color: var(--accent); }
+
+/* -- OFAC sanctions banner: this is the one crypto finding that needs to
+   read as urgent rather than blend into a kv row. -- */
+.sanctions-banner {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 10px 14px; border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+  background: color-mix(in srgb, var(--bad) 16%, transparent);
+}
+.sanctions-banner strong { color: var(--bad); letter-spacing: .03em; }
+.sanctions-banner span { color: var(--txt-dim); font-size: 12.5px; }
+
+/* -- capped-height scroll for the Wayback historical-URL dump so 40 links
+   don't blow out the page. -- */
+.wayback-list { max-height: 260px; overflow-y: auto; }
