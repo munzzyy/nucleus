@@ -474,6 +474,111 @@ class _DeadlineSock:
         self._sock.close()
 
 
+def _proxy_config() -> Optional[tuple[str, int]]:
+    """SOCKS5 proxy from NUCLEUS_SOCKS (host:port or socks5://host:port), so all
+    outbound recon can leave through Tor / a VPN's SOCKS port instead of the real
+    IP. None = direct. Any host is accepted (the user set it explicitly); the
+    usual value is a local Tor at 127.0.0.1:9050."""
+    raw = (os.environ.get("NUCLEUS_SOCKS") or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    raw = raw.strip().rstrip("/")
+    if raw.startswith("[") and "]" in raw:            # [ipv6]:port
+        hostpart, _, portpart = raw.partition("]")
+        host, port = hostpart[1:], portpart.lstrip(":") or "1080"
+    elif ":" in raw:
+        host, _, port = raw.rpartition(":")
+    else:
+        host, port = raw, "1080"
+    try:
+        return (host, int(port)) if host else None
+    except ValueError:
+        return None
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("SOCKS5 proxy closed the connection early")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(proxy_host: str, proxy_port: int, dest_host: str, dest_port: int,
+                    timeout: float, dest_is_ip: bool) -> "socket.socket":
+    """TCP to (dest_host, dest_port) THROUGH a no-auth SOCKS5 proxy. A hostname
+    dest is sent as a SOCKS5 domain address (0x03) so the PROXY resolves it —
+    DNS travels through the tunnel and never leaks to a local resolver. Returns
+    the connected socket, ready for TLS/HTTP; raises OSError on any failure."""
+    s = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        s.sendall(b"\x05\x01\x00")                    # VER=5, 1 method, NO-AUTH
+        greet = _recv_exact(s, 2)
+        if greet[0] != 0x05 or greet[1] != 0x00:
+            raise OSError("SOCKS5 proxy rejected the no-auth handshake")
+        if dest_is_ip:
+            ip = ipaddress.ip_address(dest_host)
+            atyp = b"\x01" if ip.version == 4 else b"\x04"
+            addr = ip.packed
+        else:
+            try:
+                host_b = dest_host.encode("idna")
+            except (UnicodeError, ValueError):
+                host_b = dest_host.encode("ascii", "strict")
+            if not 1 <= len(host_b) <= 255:
+                raise OSError("hostname out of range for SOCKS5")
+            atyp, addr = b"\x03", bytes([len(host_b)]) + host_b
+        s.sendall(b"\x05\x01\x00" + atyp + addr + int(dest_port).to_bytes(2, "big"))
+        rep = _recv_exact(s, 4)                        # VER, REP, RSV, ATYP
+        if rep[1] != 0x00:
+            raise OSError(f"SOCKS5 CONNECT refused (reply code {rep[1]})")
+        bnd = rep[3]                                   # drain the bound address
+        if bnd == 0x01:
+            _recv_exact(s, 4 + 2)
+        elif bnd == 0x04:
+            _recv_exact(s, 16 + 2)
+        elif bnd == 0x03:
+            _recv_exact(s, _recv_exact(s, 1)[0] + 2)
+        else:
+            raise OSError("SOCKS5 returned an unknown bound-address type")
+        return s
+    except Exception:
+        try:
+            s.close()
+        except OSError:
+            pass
+        raise
+
+
+def _http_conn_over(sock, host: str, port: int, scheme: str, deadline: float, timeout: float):
+    """Wrap an already-connected socket into an http.client connection with our
+    monotonic-deadline reader — TLS (SNI + cert check on `host`) for https,
+    plain otherwise. Returns (conn, wrapped_or_None). Same wiring whether the
+    socket came from a direct connect or a SOCKS5 tunnel."""
+    if scheme == "https":
+        _arm_deadline(sock, deadline)  # handshake gets whatever's left, not a fresh window
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        wrapped = ctx.wrap_socket(sock, server_hostname=host)  # NEW object holding the real fd
+        conn.sock = _DeadlineSock(wrapped, deadline)
+        return conn, wrapped
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    conn.sock = _DeadlineSock(sock, deadline)
+    return conn, None
+
+
 def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict] = None,
           data: Optional[bytes] = None, allow_hosts: Optional[set] = None,
           max_bytes: int = 2_000_000, follow_redirects: bool = True) -> tuple[int, bytes, dict]:
@@ -506,9 +611,17 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
         host = u.hostname or ""
         if not host:
             raise ValueError("no host in url")
-        candidates = _ordered_public_ips(host)  # all validated public, v4 first
-        if not candidates:
-            raise ValueError(f"unresolvable host: {host}")
+        proxy = _proxy_config()
+        candidates = None
+        if not proxy:
+            candidates = _ordered_public_ips(host)  # all validated public, v4 first
+            if not candidates:
+                raise ValueError(f"unresolvable host: {host}")
+        elif _is_ip_literal(host) and not _ip_is_public(ipaddress.ip_address(host)):
+            # Through a proxy, a hostname is resolved BY the proxy (DNS in the
+            # tunnel, no local leak) so we can't pin an IP we never resolved; a
+            # literal private/loopback/reserved IP target is still refused here.
+            raise ValueError(f"refusing non-public target through proxy: {host}")
         port = u.port or (443 if u.scheme == "https" else 80)
         path = u.path or "/"
         if u.query:
@@ -537,28 +650,19 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
         conn = sock = wrapped = None
         deadline = 0.0
         connect_err = None
-        # ONE budget for the whole hop, shared across every candidate address.
-        # Giving each candidate a fresh `timeout` made a hop with N addresses
-        # cost up to N x timeout of wall clock, so a caller asking for 5s could
-        # sit for 20s. Each attempt gets whatever is left.
+        # ONE budget for the whole hop, shared across every attempt. Giving each
+        # a fresh `timeout` made an N-address hop cost up to N x timeout of wall
+        # clock, so a caller asking for 5s could sit for 20s.
         hop_deadline = time.monotonic() + timeout
-        for ip in candidates:
-            remaining = hop_deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        if proxy:
+            # One tunneled connection; the proxy resolves a hostname dest so DNS
+            # rides the tunnel. (dns_query's own DoH is a fetch(), so it tunnels
+            # through here too when a proxy is set.)
             deadline = hop_deadline
             try:
-                sock = socket.create_connection((ip, port), timeout=remaining)
-                if u.scheme == "https":
-                    _arm_deadline(sock, deadline)  # handshake gets whatever's left, not a fresh window
-                    ctx = ssl.create_default_context()
-                    conn = http.client.HTTPSConnection(host, port, timeout=timeout)
-                    wrapped = ctx.wrap_socket(sock, server_hostname=host)  # NEW object holding the real fd
-                    conn.sock = _DeadlineSock(wrapped, deadline)
-                else:
-                    conn = http.client.HTTPConnection(host, port, timeout=timeout)
-                    conn.sock = _DeadlineSock(sock, deadline)
-                break
+                sock = _socks5_connect(proxy[0], proxy[1], host, port, timeout,
+                                       dest_is_ip=_is_ip_literal(host))
+                conn, wrapped = _http_conn_over(sock, host, port, u.scheme, deadline, timeout)
             except OSError as e:
                 connect_err = e
                 for s in (wrapped, sock):
@@ -568,7 +672,26 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
                         except OSError:
                             pass
                 conn = sock = wrapped = None
-                continue
+        else:
+            for ip in candidates:
+                remaining = hop_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                deadline = hop_deadline
+                try:
+                    sock = socket.create_connection((ip, port), timeout=remaining)
+                    conn, wrapped = _http_conn_over(sock, host, port, u.scheme, deadline, timeout)
+                    break
+                except OSError as e:
+                    connect_err = e
+                    for s in (wrapped, sock):
+                        if s is not None:
+                            try:
+                                s.close()
+                            except OSError:
+                                pass
+                    conn = sock = wrapped = None
+                    continue
         if conn is None:
             # Exhausted every validated address — re-raise the last connect
             # error (an OSError, as before) so callers keep catching the same type.
@@ -605,9 +728,25 @@ def fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT, headers: Optional[dict]
 
 
 _DOH_ENDPOINTS = (
-    ("https://dns.google/resolve", None),
+    # Cloudflare before Google on purpose: don't hand Google a log of every
+    # domain the operator resolves by default. Both are proven JSON-DoH and, when
+    # a proxy is set, these queries ride the tunnel too (dns_query goes via fetch).
     ("https://cloudflare-dns.com/dns-query", "application/dns-json"),
+    ("https://dns.google/resolve", None),
 )
+
+
+def _doh_endpoints():
+    """DoH resolvers, overridable via NUCLEUS_DOH (comma-separated https base
+    URLs) so an operator can point at Quad9, a self-hosted resolver, or anything
+    they trust instead of the defaults. A `dns-query` path speaks
+    application/dns-json; otherwise the google-style JSON echo."""
+    raw = (os.environ.get("NUCLEUS_DOH") or "").strip()
+    if not raw:
+        return _DOH_ENDPOINTS
+    out = [(u.strip(), "application/dns-json" if "dns-query" in u else None)
+           for u in raw.split(",") if u.strip().startswith("https://")]
+    return tuple(out) or _DOH_ENDPOINTS
 
 
 class DNSUnavailable(Exception):
@@ -635,7 +774,7 @@ def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT,
     name = (name or "").strip().rstrip(".")
     if not name:
         return []
-    for base, accept in _DOH_ENDPOINTS:
+    for base, accept in _doh_endpoints():
         url = f"{base}?name={urllib.parse.quote(name)}&type={urllib.parse.quote(rtype)}"
         headers = {"Accept": accept} if accept else {"Accept": "application/json"}
         try:

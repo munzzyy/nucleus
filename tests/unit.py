@@ -5851,6 +5851,136 @@ class OpsecLocalFirstTests(unittest.TestCase):
         self.assertEqual(o["public_ip"], "203.0.113.5")
 
 
+class Socks5ProxyTests(unittest.TestCase):
+    """NUCLEUS_SOCKS routes fetch through a SOCKS5 proxy; a hostname dest is
+    sent as a domain address so DNS resolves in the tunnel (no local leak), and
+    a literal private IP target is still refused."""
+
+    class _FakeSock:
+        def __init__(self, script):
+            self.sent = b""
+            self._buf = bytearray(script)
+
+        def sendall(self, b):
+            self.sent += b
+
+        def recv(self, n):
+            if not self._buf:
+                return b""
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            return out
+
+        def close(self):
+            pass
+
+    _OK = b"\x05\x00\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"  # greeting-ok + connect-ok (IPv4 bound)
+
+    def test_hostname_goes_out_as_domain_type(self):
+        fake = self._FakeSock(self._OK)
+        with mock.patch.object(common.socket, "create_connection", return_value=fake):
+            common._socks5_connect("127.0.0.1", 9050, "target.example", 443, 5, dest_is_ip=False)
+        req = fake.sent[3:]  # after the b"\x05\x01\x00" greeting
+        self.assertEqual(req[:4], b"\x05\x01\x00\x03")  # VER CMD RSV ATYP=domain
+        hlen = req[4]
+        self.assertEqual(req[5:5 + hlen], b"target.example")  # hostname sent -> proxy resolves it
+        self.assertEqual(req[5 + hlen:5 + hlen + 2], (443).to_bytes(2, "big"))
+
+    def test_literal_ip_goes_out_as_ipv4_type(self):
+        fake = self._FakeSock(self._OK)
+        with mock.patch.object(common.socket, "create_connection", return_value=fake):
+            common._socks5_connect("127.0.0.1", 9050, "8.8.8.8", 80, 5, dest_is_ip=True)
+        req = fake.sent[3:]
+        self.assertEqual(req[:4], b"\x05\x01\x00\x01")  # ATYP=IPv4
+        self.assertEqual(req[4:8], bytes([8, 8, 8, 8]))
+
+    def test_connect_refusal_raises(self):
+        fake = self._FakeSock(b"\x05\x00\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # REP=0x02
+        with mock.patch.object(common.socket, "create_connection", return_value=fake):
+            with self.assertRaises(OSError):
+                common._socks5_connect("127.0.0.1", 9050, "x.test", 80, 5, dest_is_ip=False)
+
+    def test_proxy_mode_refuses_literal_private_ip(self):
+        os.environ["NUCLEUS_SOCKS"] = "127.0.0.1:9050"
+        try:
+            with self.assertRaises(ValueError):
+                common.fetch("http://10.0.0.1/")
+        finally:
+            os.environ.pop("NUCLEUS_SOCKS", None)
+
+    def test_end_to_end_through_fake_proxy(self):
+        import select
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "8")
+                self.end_headers()
+                self.wfile.write(b"PROXIED!")
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        hport = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+
+        prox = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        prox.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        prox.bind(("127.0.0.1", 0))
+        prox.listen(1)
+        pport = prox.getsockname()[1]
+
+        def serve_proxy():
+            try:
+                c, _ = prox.accept()
+            except OSError:
+                return
+            try:
+                c.recv(3)                       # greeting VER NMETHODS METHOD
+                c.sendall(b"\x05\x00")
+                hdr = c.recv(4)                 # VER CMD RSV ATYP
+                atyp = hdr[3]
+                if atyp == 0x03:
+                    c.recv(c.recv(1)[0])
+                elif atyp == 0x01:
+                    c.recv(4)
+                else:
+                    c.recv(16)
+                c.recv(2)                       # port
+                c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                up = socket.create_connection(("127.0.0.1", hport))
+                pair = [c, up]
+                while True:
+                    r, _, _ = select.select(pair, [], [], 5)
+                    if not r:
+                        break
+                    stop = False
+                    for s in r:
+                        data = s.recv(65536)
+                        if not data:
+                            stop = True
+                            break
+                        (up if s is c else c).sendall(data)
+                    if stop:
+                        break
+                up.close()
+            finally:
+                c.close()
+
+        threading.Thread(target=serve_proxy, daemon=True).start()
+        self.addCleanup(prox.close)
+
+        os.environ["NUCLEUS_SOCKS"] = f"127.0.0.1:{pport}"
+        try:
+            status, body, _ = common.fetch("http://target.test/", timeout=8)
+        finally:
+            os.environ.pop("NUCLEUS_SOCKS", None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"PROXIED!")
+
+
 class PostAndTimeoutRobustnessTests(unittest.TestCase):
     """run_tool preserves partial stderr on timeout."""
 
