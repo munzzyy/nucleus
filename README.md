@@ -46,6 +46,17 @@ python3 bin/nucleus status         # what's online
 python3 bin/nucleus up --only recon,bastion
 python3 bin/nucleus doctor         # sanity check the environment
 python3 bin/nucleus open bastion   # open one console in the browser
+python3 bin/nucleus wipe           # securely erase all on-disk case data (confirm; --yes to skip)
+```
+
+**Environment knobs** (all optional, all off by default):
+
+```bash
+NUCLEUS_SOCKS=127.0.0.1:9050   # route the app's recon + DNS through Tor / a SOCKS5 proxy
+NUCLEUS_DOH=https://dns.quad9.net/dns-query   # pick your DoH resolver(s), comma-separated
+NUCLEUS_KEYRING=1              # store API keys in the OS keyring, not plaintext var/.env
+NUCLEUS_LOGGING=1              # opt IN to on-disk scan/audit history (off = no trace)
+NUCLEUS_UA="..."              # set the outbound User-Agent for an engagement
 ```
 
 ### Run a console on its own machine
@@ -102,24 +113,34 @@ Authorized / lab / CTF use only.
 - **No shell, ever.** Redcell executes only allow-listed binaries with an argv list (never a string), only after the authorization gate, and logs every run. Aggressive tools are never auto-run.
 - **Read-only on the system.** Bastion and Systems inspect and report; they never run sudo or change system state. Systems reads `/proc` and `/sys` and a short allow-list of read-only commands, nothing more.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it all fits together.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it all fits together, [`THREAT_MODEL.md`](THREAT_MODEL.md) for what it does and doesn't defend (and the privacy hardening you can turn on), [`SECURITY.md`](SECURITY.md) to report a problem, and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rules a change has to keep.
 
 ## OpSec — keeping a scan from leading back to you
 
 Two different things, and it's worth being clear about which is which.
 
 **What the tool does for you:**
-- **Neutral fingerprint.** Outbound requests use a normal browser `User-Agent`, not a self-identifying tool name, and the CORS probe sends a neutral `Origin`. Nothing in a request labels the traffic as this tool. Set your own with `NUCLEUS_UA="..."` per engagement (e.g. to match a UA the client expects).
-- **Exposure gate.** Every target-touching run is refused while your real IP is exposed — no VPN detected — unless the target is your own lab or you tick "scan anyway". The top bar already shows EXPOSED/protected in real time; the gate turns that warning into an actual block so you don't fire a scan from your home IP by reflex.
+- **Route the app's own recon through Tor or a proxy.** Set `NUCLEUS_SOCKS=127.0.0.1:9050` (env or the Settings reference) and every request the app makes — Recon lookups, the report engine, and its DNS — goes through a stdlib SOCKS5 client over the tunnel. DNS resolves *in* the tunnel (a hostname target is handed to the proxy), so it doesn't leak around it, and a literal private/loopback IP target is still refused. `NUCLEUS_DOH` picks the DoH resolvers (Cloudflare before Google by default).
+- **Local-first exposure check.** The top bar reads your routing table to tell you EXPOSED vs. protected without sending anything anywhere; a **Verify exit IP** button is the explicit, disclosed opt-in that checks your public exit against Mullvad / the Tor Project / a geo echo. The exposure gate refuses a target-touching run while your real IP is exposed, unless it's your own lab or you tick "scan anyway".
+- **Neutral fingerprint.** Outbound requests use a normal browser `User-Agent`, not a self-identifying tool name, and the CORS probe sends a neutral `Origin`. Set your own with `NUCLEUS_UA="..."`.
+- **Keep secrets and case data off disk, or wipe them.** `NUCLEUS_KEYRING=1` stores API keys in the OS keyring instead of plaintext `var/.env` (or export them as env vars for nothing-on-disk); logging is off by default so a session leaves no trail; and `nucleus wipe` securely overwrites and removes all on-disk case data (scans, saved output, reports, scrub sessions, engagements) in one gesture.
 
-**What the tool cannot do — and you have to handle yourself:**
-- **It does not anonymize your traffic.** A local tool can change a header and refuse to run; it can't route your packets. Your source IP is whatever your machine is using.
-- **The external scanners connect on their own.** nmap, nuclei, nikto, sqlmap, hydra, gobuster and the rest open their own sockets from your real IP regardless of anything here. The command builder and Expert mode run real binaries — same story.
+**What you still handle yourself:**
+- **The external scanners connect on their own.** nmap, nuclei, nikto, sqlmap, hydra, gobuster and the rest open their own sockets from your real IP — the app's SOCKS option routes *its* traffic, not a separate binary's. Run those through `proxychains` (or your VPN) so they ride the tunnel too.
+- **A proxy is not a whole opsec plan.** `NUCLEUS_SOCKS` covers the app's requests; bring up your VPN before an engagement, use a client-agreed source IP where scope calls for one, and treat full-disk encryption as the real guarantee for anything at rest.
 
-**To actually be covered on an engagement:**
-1. Bring up your VPN (Mullvad is what the exposure check looks for) *before* you touch a target. With it up, the gate stops blocking and everything — native tools and external binaries — rides the tunnel.
-2. For the external CLI tools specifically, if you want per-tool routing or a chain, run them through `proxychains` (or a SOCKS proxy / your VPN's kill-switch) so a VPN drop can't leak a single packet mid-scan.
-3. Use a client-agreed source IP where the scope calls for one, and keep the local audit log (`var/redcell-scans.jsonl`, which stays on your box) as your record of what ran when.
+## Make it yours
+
+Everything is a preference, remembered per browser, no config file to edit:
+
+- **Theme** — dark, light, or follow the system (`prefers-color-scheme`), in **Settings → Appearance**. Light mode is a full palette, not an inversion, and its accents meet WCAG AA.
+- **Density + landing** — comfortable or compact spacing, and which console opens on launch.
+- **Keyboard shortcuts** — remap any of them in **Settings → Shortcuts**: capture a keypress, save, reset one or all. The command palette (**Ctrl-K**) and the `?` help overlay always reflect your live bindings.
+- **Settings center** — API keys, appearance, shortcuts, and a privacy reference (the `NUCLEUS_*` env toggles, what each does and how to set it) all live on the hub.
+
+## Engagements
+
+Give a case a name and an authorized **scope** (hosts, domains, CIDRs) from the hub, and it becomes the thing you actually work: every Recon scan and Redcell run tags onto its timeline, parsed findings collect on it, and one click exports a Markdown report. The scope isn't just a label — when a case is active, it's the Redcell allowlist: a target outside it is refused, so the "I'm authorized" checkbox becomes a real boundary. It's all local stdlib JSON under `var/`, created only when you make a case, and `nucleus wipe` clears it with everything else.
 
 ## Layout
 
