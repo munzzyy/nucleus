@@ -25,12 +25,23 @@
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --radius: 10px;
   --shadow: 0 6px 24px rgba(0,0,0,.35);
+  /* Surfaces that used to hardcode a colour. Tokenised so the light theme
+     (further down) can flip them without hunting through every rule. */
+  --bg-glow: #12202e;              /* inner colour of the body radial glow */
+  --logo-mid: #2b6cff;             /* middle stop of the brand mark gradient */
+  --topbar-bg: rgba(10,14,20,.82);
+  --overlay-bg: rgba(4,7,12,.72);
+  --term-bg: #060a0f;
+  --term-txt: #b8c4d4;
+  --btn-bg: color-mix(in srgb, var(--accent) 18%, transparent);
+  --btn-txt: #fff;
+  --exposed-txt: #ffd9de;
 }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
-  background: radial-gradient(1200px 600px at 80% -10%, #12202e 0%, var(--bg) 55%);
+  background: radial-gradient(1200px 600px at 80% -10%, var(--bg-glow) 0%, var(--bg) 55%);
   color: var(--txt);
   font-family: var(--sans);
   font-size: 15px;
@@ -69,7 +80,7 @@ body[data-accent="dork"]    { --accent: var(--dork); }
   background: color-mix(in srgb, var(--fg, #fff) 8%, transparent); color: inherit; }
 .opsec-verify:hover:not(:disabled) { border-color: var(--accent, #6ab0ff); }
 .opsec-verify:disabled { opacity: .6; cursor: default; }
-.opsec-bar.exposed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: #ffd9de;
+.opsec-bar.exposed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: var(--exposed-txt);
   border-bottom-color: color-mix(in srgb, var(--bad) 55%, transparent); }
 .opsec-bar.exposed .od { background: var(--bad); box-shadow: 0 0 9px var(--bad); animation: opulse 1.4s infinite; }
 .opsec-bar.exposed b { color: var(--bad); letter-spacing: .03em; }
@@ -83,14 +94,14 @@ body[data-accent="dork"]    { --accent: var(--dork); }
 .topbar {
   display: flex; align-items: center; gap: 18px;
   padding: 10px 20px;
-  background: rgba(10,14,20,.82);
+  background: var(--topbar-bg);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
 }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .02em; }
 .brand .logo {
   width: 26px; height: 26px; border-radius: 7px; flex: none;
-  background: conic-gradient(from 210deg, var(--accent), #2b6cff 40%, var(--recon) 70%, var(--accent));
+  background: conic-gradient(from 210deg, var(--accent), var(--logo-mid) 40%, var(--recon) 70%, var(--accent));
   box-shadow: 0 0 14px -2px var(--accent);
 }
 .brand small { color: var(--txt-faint); font-weight: 500; letter-spacing: .04em; text-transform: uppercase; font-size: 10px; }
@@ -163,7 +174,7 @@ textarea { font-family: var(--mono); font-size: 13px; resize: vertical; }
 button, .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   padding: 10px 16px; border-radius: 8px; border: 1px solid var(--accent);
-  background: color-mix(in srgb, var(--accent) 18%, transparent); color: #fff;
+  background: var(--btn-bg); color: var(--btn-txt);
   font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer; transition: filter .12s; white-space: nowrap;
 }
 button:hover, .btn:hover { filter: brightness(1.18); text-decoration: none; }
@@ -184,9 +195,9 @@ td.mono, .mono { font-family: var(--mono); }
 
 /* ---- terminal / output ---- */
 .term {
-  background: #060a0f; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--term-bg); border: 1px solid var(--line); border-radius: 8px;
   padding: 14px 16px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
-  color: #b8c4d4; white-space: pre-wrap; word-break: break-word;
+  color: var(--term-txt); white-space: pre-wrap; word-break: break-word;
   max-height: 460px; overflow: auto; margin: 0;
 }
 .term .ok { color: var(--ok); } .term .bad { color: var(--bad); } .term .dim { color: var(--txt-faint); }
@@ -270,7 +281,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 
 /* ---- keyboard shortcuts help overlay (? key, any console) ---- */
 .shortcuts-overlay { position: fixed; inset: 0; z-index: 200;
-  background: rgba(4,7,12,.72); display: flex; align-items: center;
+  background: var(--overlay-bg); display: flex; align-items: center;
   justify-content: center; padding: 20px; }
 .shortcuts-overlay.hidden { display: none; }
 .shortcuts-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
@@ -285,7 +296,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
    Same overlay pattern as the shortcuts help, but top-aligned so the results
    list has room to grow downward and the input sits where the eye already is. */
 .cmd-overlay { position: fixed; inset: 0; z-index: 210;
-  background: rgba(4,7,12,.72); display: flex; align-items: flex-start;
+  background: var(--overlay-bg); display: flex; align-items: flex-start;
   justify-content: center; padding: 15vh 20px 20px; }
 .cmd-overlay.hidden { display: none; }
 .cmd-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
@@ -339,7 +350,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 
 /* ---- reusable confirm modal (N.confirmModal) ---- */
 .modal-overlay { position: fixed; inset: 0; z-index: 230;
-  background: rgba(4,7,12,.72); display: flex; align-items: center;
+  background: var(--overlay-bg); display: flex; align-items: center;
   justify-content: center; padding: 20px; }
 .modal-panel { background: linear-gradient(180deg, var(--bg-1), var(--bg));
   border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: var(--shadow);
@@ -370,3 +381,153 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 .onboard-path:hover { border-color: var(--accent); text-decoration: none; background: var(--bg-2); }
 .onboard-path .op-what { font-weight: 600; }
 .onboard-path .op-where { color: var(--txt-faint); font-size: 12px; }
+
+/* ===================================================================
+   THEME SYSTEM — dark (default, above) / light / system.
+   <html data-theme="dark|light|system"> is set before paint by nucleus.js
+   from the global pref. Explicit light/dark wins; "system" follows the OS
+   via the media query below. The two light blocks MUST stay in sync — one
+   for the explicit choice, one for system-on-a-light-OS.
+   Light-mode accents are darkened from their neon dark-mode values so text
+   and white-on-accent buttons keep WCAG AA contrast on pale surfaces.
+   =================================================================== */
+html[data-theme="light"] {
+  --bg: #f4f6fa;
+  --bg-1: #ffffff;
+  --bg-2: #eef1f6;
+  --bg-3: #e3e8f0;
+  --line: #d5dbe5;
+  --line-2: #c2cad7;
+  --txt: #1a2230;
+  --txt-dim: #4a5568;
+  --txt-faint: #5b6472;
+  --accent: #0b5cad;
+  --recon: #6b34d6;
+  --redcell: #cc1f3d;
+  --bastion: #0f7a56;
+  --devkit: #8f5a06;
+  --systems: #0b7684;
+  --dork: #a01fa8;
+  --warn: #8f5a06;
+  --ok: #0f7a56;
+  --bad: #cc1f3d;
+  --shadow: 0 6px 24px rgba(20,30,50,.12);
+  --bg-glow: #dce7f5;
+  --logo-mid: #2b6cff;
+  --topbar-bg: rgba(255,255,255,.85);
+  --overlay-bg: rgba(20,28,40,.42);
+  --term-bg: #0f141c;              /* keep tool output on a dark slate — easier to read ANSI-ish spans */
+  --term-txt: #cdd6e2;
+  --btn-bg: var(--accent);          /* solid, so white button text stays high-contrast on a light page */
+  --btn-txt: #ffffff;
+  --exposed-txt: #7a1020;
+}
+@media (prefers-color-scheme: light) {
+  html[data-theme="system"] {
+    --bg: #f4f6fa;
+    --bg-1: #ffffff;
+    --bg-2: #eef1f6;
+    --bg-3: #e3e8f0;
+    --line: #d5dbe5;
+    --line-2: #c2cad7;
+    --txt: #1a2230;
+    --txt-dim: #4a5568;
+    --txt-faint: #5b6472;
+    --accent: #0b5cad;
+    --recon: #6b34d6;
+    --redcell: #cc1f3d;
+    --bastion: #0f7a56;
+    --devkit: #8f5a06;
+    --systems: #0b7684;
+    --dork: #a01fa8;
+    --warn: #8f5a06;
+    --ok: #0f7a56;
+    --bad: #cc1f3d;
+    --shadow: 0 6px 24px rgba(20,30,50,.12);
+    --bg-glow: #dce7f5;
+    --logo-mid: #2b6cff;
+    --topbar-bg: rgba(255,255,255,.85);
+    --overlay-bg: rgba(20,28,40,.42);
+    --term-bg: #0f141c;
+    --term-txt: #cdd6e2;
+    --btn-bg: var(--accent);
+    --btn-txt: #ffffff;
+    --exposed-txt: #7a1020;
+  }
+}
+
+/* ===================================================================
+   DENSITY — comfortable (default) / compact. <html data-density="compact">
+   set by nucleus.js from the global pref. Tightens the paddings and type
+   scale everywhere without touching layout structure.
+   =================================================================== */
+html[data-density="compact"] body { font-size: 13.5px; }
+html[data-density="compact"] .wrap { padding: 16px 16px 56px; }
+html[data-density="compact"] .card { padding: 12px 13px; }
+html[data-density="compact"] .card h2, html[data-density="compact"] .card h3 { margin-bottom: 8px; }
+html[data-density="compact"] .grid { gap: 10px; }
+html[data-density="compact"] .page-head { margin: 2px 0 14px; }
+html[data-density="compact"] .page-head h1 { font-size: 22px; }
+html[data-density="compact"] .section-title { margin: 18px 0 8px; }
+html[data-density="compact"] input[type=text],
+html[data-density="compact"] input[type=search],
+html[data-density="compact"] input[type=number],
+html[data-density="compact"] select,
+html[data-density="compact"] textarea { padding: 7px 10px; }
+html[data-density="compact"] button, html[data-density="compact"] .btn { padding: 7px 12px; }
+html[data-density="compact"] th, html[data-density="compact"] td { padding: 6px 9px; }
+html[data-density="compact"] .field { margin-bottom: 10px; }
+
+/* ===================================================================
+   PREFERENCES CENTER widgets (theme/density segmented pickers, the keybind
+   editor rows, the read-only privacy reference). Rendered by nucleus.js
+   helpers, dropped into the hub Settings surface.
+   =================================================================== */
+.seg { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--line-2);
+  border-radius: 10px; background: var(--bg-2); flex-wrap: wrap; }
+.seg button { padding: 6px 14px; border-radius: 7px; border: 1px solid transparent;
+  background: transparent; color: var(--txt-dim); font-weight: 600; }
+.seg button:hover { color: var(--txt); filter: none; }
+.seg button[aria-pressed="true"] { background: var(--btn-bg); color: var(--btn-txt);
+  border-color: var(--accent); }
+.pref-block { margin-bottom: 18px; }
+.pref-block > label { margin-bottom: 8px; }
+.pref-hint { color: var(--txt-faint); font-size: 12px; margin: 6px 0 0; }
+
+.keybinds { display: grid; grid-template-columns: 1fr max-content max-content; gap: 8px 12px;
+  align-items: center; margin: 0; }
+.keybind-desc { color: var(--txt); font-size: 13px; }
+.keybind-key { justify-self: start; }
+.keybind-edit, .keybind-reset { padding: 5px 11px; font-size: 12px; }
+.keybind-edit.capturing { border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.keybinds-actions { display: flex; gap: 10px; margin-top: 14px; }
+
+.privacy-ref { display: grid; gap: 12px; margin: 0; }
+.privacy-item { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--bg-1); }
+.privacy-item .pv-var { font-family: var(--mono); font-size: 12.5px; color: var(--accent); font-weight: 600; }
+.privacy-item .pv-what { display: block; margin: 5px 0 6px; color: var(--txt-dim); font-size: 13px; }
+.privacy-item .pv-how { display: block; font-family: var(--mono); font-size: 12px; color: var(--txt-faint);
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+
+/* ---- severity pills (shared: redcell findings + engagement findings) ----
+   Colour + luminance both carry severity; the label text (critical/high/…) is
+   always present so it never reads on colour alone. */
+.sev-pill { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  border: 1px solid var(--line-2); color: var(--txt-dim); background: var(--bg-2); white-space: nowrap; }
+.sev-pill.sev-critical { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 60%, transparent);
+  background: color-mix(in srgb, var(--bad) 20%, transparent); }
+.sev-pill.sev-high { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+  background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.sev-pill.sev-medium { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.sev-pill.sev-low { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.sev-pill.sev-info { color: var(--txt-dim); }
+
+/* A tighter secondary button used inside dense tables/rows. */
+.small-btn { padding: 5px 11px; font-size: 12px; }
+
+/* A quieter sub-heading under a .section-title (Settings groups, case detail). */
+.section-title.sub-section { margin: 20px 0 10px; color: var(--txt-dim); font-size: 11px; }

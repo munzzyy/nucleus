@@ -236,3 +236,13 @@ button.secondary.small, .secondary.small { padding: 5px 10px; font-size: 12px; }
 .remediation-item:last-child { border-bottom: 0; }
 .remediation-item b { font-size: 13px; }
 #stress-token-out .mono { word-break: break-all; }
+
+/* ---- run-tab raw output + findings table ---- */
+.raw-details > summary { cursor: pointer; color: var(--txt-dim); font-size: 13px; font-weight: 600;
+  padding: 6px 0; list-style: none; user-select: none; }
+.raw-details > summary::-webkit-details-marker { display: none; }
+.raw-details > summary::before { content: "▸ "; color: var(--txt-faint); }
+.raw-details[open] > summary::before { content: "▾ "; color: var(--accent); }
+.raw-details > .term { margin-top: 6px; }
+.run-findings-card .row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.run-findings-card h3 { margin: 0; }

@@ -47,3 +47,16 @@
   box-shadow: none; margin: -10px 0 22px;
 }
 .nudge a { font-weight: 650; }
+
+/* ---- engagements panel ---- */
+.eng-list { width: 100%; }
+.eng-list .eng-name { font-weight: 600; }
+.eng-active-badge { margin-left: 8px; }
+.eng-detail .row-top { align-items: flex-start; }
+.eng-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.eng-timeline { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 6px; }
+.eng-timeline li { display: flex; gap: 10px; align-items: baseline; font-size: 13px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.eng-timeline li:last-child { border-bottom: none; }
+.eng-when { flex: 0 0 auto; font-family: var(--mono); }
+.field.grow.m0 { margin-bottom: 0; }

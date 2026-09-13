@@ -21,6 +21,46 @@
   N.$ = (sel, root) => (root || document).querySelector(sel);
   N.$$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
+  // --- global (cross-console) preferences ----------------------------------
+  // N.remember (further down) is namespaced per console via data-app, so
+  // recon's "last target" can't collide with redcell's. Appearance, density,
+  // and keybind prefs are the whole app's — they live in one shared namespace
+  // every console reads, so a theme picked in the hub follows you everywhere.
+  N.pref = function (key) {
+    const full = "nuc:global:" + key;
+    return {
+      get(fallback) {
+        try { const raw = window.localStorage.getItem(full); return raw == null ? fallback : JSON.parse(raw); }
+        catch (_) { return fallback; }
+      },
+      set(value) { try { window.localStorage.setItem(full, JSON.stringify(value)); return true; } catch (_) { return false; } },
+      clear() { try { window.localStorage.removeItem(full); } catch (_) { /* nothing to clear */ } },
+    };
+  };
+
+  // --- theme + density (applied before paint) ------------------------------
+  // Sets data-theme / data-density on <html> straight away at script eval, so
+  // the attribute is in place before the body paints and a light-mode user
+  // never sees a dark flash. "system" defers to the OS via a CSS media query.
+  const THEME_MODES = ["dark", "light", "system"];
+  const DENSITY_MODES = ["comfortable", "compact"];
+  N.applyTheme = function (mode) {
+    const m = THEME_MODES.indexOf(mode) >= 0 ? mode : "dark";
+    document.documentElement.setAttribute("data-theme", m);
+    return m;
+  };
+  N.applyDensity = function (mode) {
+    const m = DENSITY_MODES.indexOf(mode) >= 0 ? mode : "comfortable";
+    // Comfortable is the default look, so no attribute — keeps the CSS lean.
+    if (m === "comfortable") document.documentElement.removeAttribute("data-density");
+    else document.documentElement.setAttribute("data-density", m);
+    return m;
+  };
+  N.themeMode = function () { return N.pref("theme").get("dark"); };
+  N.densityMode = function () { return N.pref("density").get("comfortable"); };
+  N.applyTheme(N.themeMode());
+  N.applyDensity(N.densityMode());
+
   // --- fetch wrappers ------------------------------------------------------
   // Every request gets a client-side deadline via AbortController so a backend
   // that accepts then hangs can't strand the tab on "scanning…" forever. Pass
@@ -463,15 +503,92 @@
   }
 
   // --- global keyboard shortcuts + help overlay -----------------------------
-  // g then h/r/d/b/e/s (or plain 1..6) jumps consoles; Ctrl-K opens the command
-  // palette; / focuses the page's primary input; ? toggles this help. Never
-  // fires while a field is focused, except Escape (blurs it) and Ctrl-K (the
-  // palette works from anywhere) — matching every console's own keydown
-  // handlers (Enter-to-run etc), which still work normally since we bail out
-  // before touching typed keys.
-  const SHORTCUT_PORTS = { h: 8890, r: 8900, d: 8910, b: 8920, e: 8930, s: 8940, k: 8950,
-    "1": 8890, "2": 8900, "3": 8910, "4": 8920, "5": 8930, "6": 8940, "7": 8950 };
+  // g then h/r/d/b/e/s (or the remappable single keys) jumps consoles; the
+  // palette key opens the command palette; one key focuses the page's primary
+  // input; another toggles this help. Never fires while a field is focused,
+  // except Escape (blurs it) and the palette (works from anywhere) — matching
+  // every console's own keydown handlers (Enter-to-run etc), which still work
+  // since we bail out before touching typed keys.
+  //
+  // The single-key bindings are remappable (Settings → Shortcuts). The g-chord
+  // stays fixed as a second accelerator so muscle memory survives a remap.
+  const SHORTCUT_PORTS = { h: 8890, r: 8900, d: 8910, b: 8920, e: 8930, s: 8940, k: 8950 };
+
+  // The remappable actions and their defaults. `combo` = expects a modifier
+  // combo (the palette); the rest are single keys. Order drives the help list.
+  const KEY_ACTIONS = [
+    { id: "palette", desc: "Command palette", def: "Mod-k", combo: true },
+    { id: "help", desc: "Toggle this help", def: "?" },
+    { id: "focus-input", desc: "Focus the main input", def: "/" },
+    { id: "go-hub", desc: "Go to Hub", def: "1", port: 8890 },
+    { id: "go-recon", desc: "Go to Recon", def: "2", port: 8900 },
+    { id: "go-redcell", desc: "Go to Redcell", def: "3", port: 8910 },
+    { id: "go-bastion", desc: "Go to Bastion", def: "4", port: 8920 },
+    { id: "go-devkit", desc: "Go to Devkit", def: "5", port: 8930 },
+    { id: "go-systems", desc: "Go to Systems", def: "6", port: 8940 },
+    { id: "go-dork", desc: "Go to Dork", def: "7", port: 8950 },
+  ];
+
+  // A canonical string for a key event, used identically for matching a
+  // binding and for capturing a new one. Ctrl and Meta both fold to "Mod" so a
+  // Mac Cmd-K and a Linux Ctrl-K are the same binding. Shift is only recorded
+  // for named keys; for a printable char the shift is already baked into `key`
+  // ("?" arrives as "?", not "Shift-/").
+  function eventKeyStr(e) {
+    const k = e.key;
+    if (k === "Control" || k === "Meta" || k === "Alt" || k === "Shift") return "";
+    let mod = "";
+    if (e.ctrlKey || e.metaKey) mod += "Mod-";
+    if (e.altKey) mod += "Alt-";
+    if (e.shiftKey && k.length > 1) mod += "Shift-";
+    return mod + (k.length === 1 ? k.toLowerCase() : k);
+  }
+
+  function prettyKey(ks) {
+    return String(ks == null ? "" : ks).split("-").map(p =>
+      p === "Mod" ? "Ctrl" : (p.length === 1 ? p.toUpperCase() : p)).join("-");
+  }
+  N.prettyKey = prettyKey;
+
+  // Defaults merged with the user's overrides from the global pref. A blank or
+  // non-string override falls back to the default, so a corrupt entry can't
+  // strand an action with no key.
+  function keybindMap() {
+    const over = N.pref("keybinds").get({}) || {};
+    const map = {};
+    KEY_ACTIONS.forEach(a => {
+      map[a.id] = (typeof over[a.id] === "string" && over[a.id]) ? over[a.id] : a.def;
+    });
+    return map;
+  }
+  N.keybinds = keybindMap;
+  N.keyActions = function () { return KEY_ACTIONS.map(a => ({ id: a.id, desc: a.desc, combo: !!a.combo, def: a.def })); };
+  N.setKeybind = function (id, keystr) {
+    const over = N.pref("keybinds").get({}) || {};
+    over[id] = keystr;
+    return N.pref("keybinds").set(over);
+  };
+  N.resetKeybinds = function () { N.pref("keybinds").clear(); };
+
+  // Start a one-shot capture: the next real key press resolves the callback
+  // with its canonical string (Escape resolves null = cancelled). Capture
+  // phase so it beats the global shortcut handler and any focused input.
+  N.captureKeybind = function (onDone) {
+    const handler = (e) => {
+      const k = e.key;
+      if (k === "Control" || k === "Meta" || k === "Alt" || k === "Shift") return; // wait for the real key
+      e.preventDefault();
+      e.stopPropagation();
+      cleanup();
+      onDone(k === "Escape" ? null : eventKeyStr(e));
+    };
+    function cleanup() { document.removeEventListener("keydown", handler, true); }
+    document.addEventListener("keydown", handler, true);
+    return cleanup;
+  };
+
   let helpOverlayEl = null;
+  let helpListEl = null;
   let helpCloseEl = null;
   let helpPrevFocus = null;
   let helpOpen = false;
@@ -539,26 +656,8 @@
       role: "dialog", "aria-modal": "true", "aria-label": "Keyboard shortcuts" });
     const panel = N.el("div", { class: "shortcuts-panel" });
     panel.appendChild(N.el("h2", { text: "Keyboard shortcuts" }));
-    const rows = [
-      ["Ctrl-K", "command palette"],
-      ["/", "focus the main input"],
-      ["g h", "go to Hub"],
-      ["g r", "go to Recon"],
-      ["g d", "go to Redcell"],
-      ["g b", "go to Bastion"],
-      ["g e", "go to Devkit"],
-      ["g s", "go to Systems"],
-      ["g k", "go to Dork"],
-      ["1 2 3 4 5 6 7", "same, one key"],
-      ["?", "toggle this help"],
-      ["Esc", "close this / blur a field"],
-    ];
-    const dl = N.el("dl", { class: "shortcuts-list" });
-    rows.forEach(([keys, desc]) => {
-      dl.appendChild(N.el("dt", {}, [N.el("span", { class: "kbd", text: keys })]));
-      dl.appendChild(N.el("dd", { text: desc }));
-    });
-    panel.appendChild(dl);
+    helpListEl = N.el("dl", { class: "shortcuts-list" });
+    panel.appendChild(helpListEl);
     const close = N.el("button", { class: "ghost mt", type: "button", text: "Close" });
     close.addEventListener("click", closeHelp);
     panel.appendChild(close);
@@ -571,8 +670,25 @@
     return overlay;
   }
 
+  // Rebuild the row list from the live keybind map every open, so a remap done
+  // in Settings shows up here without a reload. The g-chord + Esc are fixed, so
+  // they're listed as literal extras below the remappable bindings.
+  function fillHelpRows() {
+    if (!helpListEl) return;
+    helpListEl.replaceChildren();
+    const map = keybindMap();
+    const row = (keys, desc) => {
+      helpListEl.appendChild(N.el("dt", {}, [N.el("span", { class: "kbd", text: keys })]));
+      helpListEl.appendChild(N.el("dd", { text: desc }));
+    };
+    KEY_ACTIONS.forEach(a => row(prettyKey(map[a.id]), a.desc));
+    row("g then h/r/d/b/e/s/k", "jump to a console (fixed)");
+    row("Esc", "close this / blur a field");
+  }
+
   function openHelp() {
     buildHelpOverlay().classList.remove("hidden");
+    fillHelpRows();
     helpOpen = true;
     helpPrevFocus = document.activeElement;
     if (helpCloseEl) helpCloseEl.focus();
@@ -1003,7 +1119,7 @@
     const store = N.remember("palette-hint");
     if (store.get(false)) return null;
     const bar = N.el("div", { class: "palette-hint" });
-    bar.appendChild(N.el("span", { class: "kbd", text: "Ctrl-K" }));
+    bar.appendChild(N.el("span", { class: "kbd", text: prettyKey(keybindMap()["palette"]) }));
     bar.appendChild(document.createTextNode(" jump to any tool or console from anywhere"));
     const x = N.el("button", { type: "button", class: "palette-hint-x", "aria-label": "Dismiss hint", text: "×" });
     x.addEventListener("click", () => { store.set(true); bar.remove(); });
@@ -1016,15 +1132,157 @@
     return bar;
   };
 
+  // --- preferences center widgets ------------------------------------------
+  // Reusable, CSP-safe (N.el + textContent only) building blocks the hub drops
+  // into its Settings surface. Each persists through the global pref and takes
+  // effect live, so a change is visible without a reload.
+
+  // A little segmented radio-group. `options` = [{value,label}]. Calls onPick
+  // with the chosen value and repaints the pressed state.
+  function segmented(options, current, onPick) {
+    const seg = N.el("div", { class: "seg", role: "group" });
+    const btns = [];
+    options.forEach(o => {
+      const b = N.el("button", { type: "button", text: o.label,
+        "aria-pressed": o.value === current ? "true" : "false" });
+      b.addEventListener("click", () => {
+        btns.forEach(x => x.setAttribute("aria-pressed", x === b ? "true" : "false"));
+        onPick(o.value);
+      });
+      btns.push(b);
+      seg.appendChild(b);
+    });
+    return seg;
+  }
+
+  // Appearance: theme mode, density, and the hub's default landing console.
+  N.appearanceSettings = function () {
+    const wrap = N.el("div");
+
+    const themeBlock = N.el("div", { class: "pref-block" });
+    themeBlock.appendChild(N.el("label", { text: "Theme" }));
+    themeBlock.appendChild(segmented(
+      [{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }, { value: "system", label: "System" }],
+      N.themeMode(),
+      (v) => { N.pref("theme").set(v); N.applyTheme(v); }));
+    themeBlock.appendChild(N.el("p", { class: "pref-hint",
+      text: "System follows your OS light/dark setting. An explicit choice always wins." }));
+    wrap.appendChild(themeBlock);
+
+    const densBlock = N.el("div", { class: "pref-block" });
+    densBlock.appendChild(N.el("label", { text: "Density" }));
+    densBlock.appendChild(segmented(
+      [{ value: "comfortable", label: "Comfortable" }, { value: "compact", label: "Compact" }],
+      N.densityMode(),
+      (v) => { N.pref("density").set(v); N.applyDensity(v); }));
+    densBlock.appendChild(N.el("p", { class: "pref-hint", text: "Compact tightens spacing and type across every console." }));
+    wrap.appendChild(densBlock);
+
+    const dcBlock = N.el("div", { class: "pref-block" });
+    dcBlock.appendChild(N.el("label", { text: "Default console", for: "pref-default-console" }));
+    const sel = N.el("select", { id: "pref-default-console" });
+    sel.appendChild(N.el("option", { value: "hub", text: "Stay on the hub" }));
+    SWITCHER_BASE.forEach(c => { if (c.slug !== "hub") sel.appendChild(N.el("option", { value: c.slug, text: "Open " + c.name })); });
+    sel.value = N.pref("default-console").get("hub");
+    sel.addEventListener("change", () => N.pref("default-console").set(sel.value));
+    dcBlock.appendChild(sel);
+    dcBlock.appendChild(N.el("p", { class: "pref-hint",
+      text: "Where the hub sends you on open. Clicking Hub in the switcher still lands here." }));
+    wrap.appendChild(dcBlock);
+
+    return wrap;
+  };
+
+  // Shortcuts editor: one row per remappable action, each with a live capture
+  // button and reset, plus a reset-all. Rebuilds itself after any change.
+  N.shortcutSettings = function () {
+    const wrap = N.el("div");
+    const grid = N.el("dl", { class: "keybinds" });
+    let capturing = null;   // the cancel() of an in-flight capture
+
+    function render() {
+      grid.replaceChildren();
+      const map = keybindMap();
+      KEY_ACTIONS.forEach(a => {
+        grid.appendChild(N.el("dt", { class: "keybind-desc", text: a.desc }));
+        const keyCell = N.el("dd", { class: "keybind-key" }, [N.el("span", { class: "kbd", text: prettyKey(map[a.id]) })]);
+        grid.appendChild(keyCell);
+        const actions = N.el("dd");
+        const edit = N.el("button", { type: "button", class: "ghost keybind-edit", text: "Change" });
+        edit.addEventListener("click", () => {
+          if (capturing) { capturing(); capturing = null; }
+          edit.classList.add("capturing");
+          edit.textContent = "press a key…";
+          capturing = N.captureKeybind((ks) => {
+            capturing = null;
+            if (ks == null) { render(); return; }   // cancelled
+            if (a.combo && ks.indexOf("Mod-") < 0) { N.toast("Use a Ctrl/Cmd combo for the palette", "warn"); render(); return; }
+            if (!a.combo && /Mod-|Alt-/.test(ks)) { N.toast("Use a single key for this shortcut", "warn"); render(); return; }
+            N.setKeybind(a.id, ks);
+            render();
+          });
+        });
+        const reset = N.el("button", { type: "button", class: "ghost keybind-reset", text: "Default" });
+        reset.addEventListener("click", () => { N.setKeybind(a.id, a.def); render(); });
+        actions.appendChild(edit);
+        actions.appendChild(reset);
+        grid.appendChild(actions);
+      });
+    }
+    render();
+    wrap.appendChild(grid);
+
+    const bar = N.el("div", { class: "keybinds-actions" });
+    const resetAll = N.el("button", { type: "button", class: "ghost", text: "Reset all to defaults" });
+    resetAll.addEventListener("click", async () => {
+      const ok = await N.confirmModal({ title: "Reset shortcuts?",
+        body: ["Every keyboard shortcut goes back to its default key."],
+        confirmLabel: "Reset", cancelLabel: "Keep mine" });
+      if (ok) { N.resetKeybinds(); render(); N.toast("Shortcuts reset", "ok"); }
+    });
+    bar.appendChild(resetAll);
+    wrap.appendChild(bar);
+    wrap.appendChild(N.el("p", { class: "pref-hint",
+      text: "The g-then-letter chord (g h, g r, …) is always available as a second way to jump." }));
+    return wrap;
+  };
+
+  // Read-only reference for the environment toggles the app honors. The browser
+  // can't (and must not) set env vars — this just documents what each does and
+  // how to set it before launch.
+  const PRIVACY_ENV = [
+    { name: "NUCLEUS_SOCKS", what: "Route every outbound lookup through a SOCKS5 proxy (e.g. Tor) so scans don't leave from your real IP.",
+      how: "NUCLEUS_SOCKS=127.0.0.1:9050 nucleus up" },
+    { name: "NUCLEUS_KEYRING", what: "Read API keys from your OS keyring instead of a plaintext file on disk.",
+      how: "NUCLEUS_KEYRING=1 nucleus up" },
+    { name: "NUCLEUS_DOH", what: "Resolve DNS over HTTPS instead of your system resolver, so the local network can't see your lookups.",
+      how: "NUCLEUS_DOH=1 nucleus up" },
+    { name: "NUCLEUS_LOGGING", what: "Control whether requests and results are written to the local run log.",
+      how: "NUCLEUS_LOGGING=0 nucleus up" },
+  ];
+  N.privacyReference = function () {
+    const list = N.el("div", { class: "privacy-ref" });
+    PRIVACY_ENV.forEach(v => {
+      const item = N.el("div", { class: "privacy-item" });
+      item.appendChild(N.el("span", { class: "pv-var", text: v.name }));
+      item.appendChild(N.el("span", { class: "pv-what", text: v.what }));
+      item.appendChild(N.el("span", { class: "pv-how", text: v.how }));
+      list.appendChild(item);
+    });
+    return list;
+  };
+
   function mountShortcuts() {
     if (N._shortcutsWired) return;
     N._shortcutsWired = true;
     document.addEventListener("keydown", (e) => {
+      const map = keybindMap();
+      const ks = eventKeyStr(e);
       // Command palette wins first: it must fire even while a field is focused
       // and even though it's a modifier combo, so it goes AHEAD of the modifier
       // early-return below. (While the palette itself is open, focus is on its
       // input, whose own keydown stops propagation and handles the toggle.)
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if (ks && ks === map["palette"]) {
         e.preventDefault();
         toggleCommandPalette();
         return;
@@ -1044,8 +1302,21 @@
       if (cmdOpen || helpOpen) return;
       if (typing) return; // never hijack keys while the user is typing
 
-      if (e.key === "?") { e.preventDefault(); toggleHelp(); return; }
+      // Remappable single-key bindings.
+      if (ks) {
+        if (ks === map["help"]) { e.preventDefault(); toggleHelp(); return; }
+        if (ks === map["focus-input"]) {
+          const el = primaryInput();
+          if (el) { e.preventDefault(); el.focus(); }
+          return;
+        }
+        for (let i = 0; i < KEY_ACTIONS.length; i++) {
+          const a = KEY_ACTIONS[i];
+          if (a.port && ks === map[a.id]) { e.preventDefault(); location.href = portUrl(a.port) + "/"; return; }
+        }
+      }
 
+      // Fixed g-chord accelerator (survives a remap of the single keys).
       if (gPending) {
         gPending = false;
         clearTimeout(gPendingTimer);
@@ -1057,16 +1328,6 @@
         gPending = true;
         clearTimeout(gPendingTimer);
         gPendingTimer = setTimeout(() => { gPending = false; }, 1200);
-        return;
-      }
-      if (/^[1-7]$/.test(e.key)) {
-        e.preventDefault();
-        location.href = portUrl(SHORTCUT_PORTS[e.key]) + "/";
-        return;
-      }
-      if (e.key === "/") {
-        const el = primaryInput();
-        if (el) { e.preventDefault(); el.focus(); }
         return;
       }
     });

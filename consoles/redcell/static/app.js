@@ -659,6 +659,90 @@
     });
   }
 
+  // ---- run-tab findings (parsed table + honest rollup + CSV) --------------
+  const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+  // Trust the backend's parsed rollup; only fall back to counting the findings
+  // array if the response didn't carry one. Never guess severity from stdout.
+  function computeRollup(findings) {
+    const r = { critical: 0, high: 0, medium: 0, low: 0, info: 0, total: 0 };
+    (findings || []).forEach(f => {
+      const s = String(f.severity || "info").toLowerCase();
+      if (r[s] != null) r[s]++; else r.info++;
+      r.total++;
+    });
+    return r;
+  }
+
+  function rollupLine(roll, findings) {
+    const r = roll || {};
+    const total = r.total != null ? r.total : (findings ? findings.length : 0);
+    if (!total) return "No findings.";
+    const parts = ["critical", "high", "medium", "low", "info"]
+      .filter(k => (r[k] || 0) > 0).map(k => r[k] + " " + k);
+    return parts.length ? parts.join(", ") : total + " finding" + (total === 1 ? "" : "s");
+  }
+
+  function csvCell(v) {
+    const s = String(v == null ? "" : v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function findingsToCsv(findings) {
+    const rows = [["severity", "title", "host", "evidence", "tool"]];
+    (findings || []).forEach(f => rows.push([f.severity, f.title, f.host, f.evidence, f.tool]));
+    return rows.map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n";
+  }
+
+  // Lead the Run result with a severity-sorted findings table; the raw stdout
+  // stays available in the collapsible <details> below. No findings = empty
+  // container, and the caller opens the raw output instead.
+  function renderRunFindings(r, csvBase) {
+    const host = document.getElementById("run-findings");
+    if (!host) return false;
+    host.replaceChildren();
+    const findings = Array.isArray(r.findings) ? r.findings : [];
+    if (!findings.length) return false;
+    const roll = r.findings_rollup || computeRollup(findings);
+    const sorted = findings.slice().sort((a, b) =>
+      (SEV_RANK[String(a.severity || "info").toLowerCase()] ?? 5) -
+      (SEV_RANK[String(b.severity || "info").toLowerCase()] ?? 5));
+
+    const card = N.el("div", { class: "card mt run-findings-card" });
+    const head = N.el("div", { class: "row-top" });
+    head.appendChild(N.el("h3", { text: "Findings" }));
+    head.appendChild(N.el("span", { class: "sub", text: rollupLine(roll, findings) }));
+    card.appendChild(head);
+
+    const table = N.el("table");
+    const thead = N.el("thead");
+    const htr = N.el("tr");
+    ["Severity", "Title", "Host", "Evidence", "Tool"].forEach(h => htr.appendChild(N.el("th", { text: h })));
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tb = N.el("tbody");
+    sorted.forEach(f => {
+      const sev = String(f.severity || "info").toLowerCase();
+      const tr = N.el("tr");
+      tr.appendChild(N.el("td", {}, [N.el("span", { class: "sev-pill sev-" + sev, text: sev })]));
+      tr.appendChild(N.el("td", { text: f.title || "" }));
+      tr.appendChild(N.el("td", { class: "mono small", text: f.host || "" }));
+      tr.appendChild(N.el("td", { class: "small", text: f.evidence || "" }));
+      tr.appendChild(N.el("td", { class: "faint small", text: f.tool || "" }));
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    card.appendChild(N.el("div", { class: "table-scroll" }, [table]));
+
+    const bar = N.el("div", { class: "result-bar" });
+    bar.appendChild(N.copyButton(() => findingsToCsv(sorted), { label: "Copy CSV", title: "Copy the findings as CSV" }));
+    const dl = N.el("button", { type: "button", class: "ghost", text: "Download CSV" });
+    dl.addEventListener("click", () => N.download((csvBase || "redcell-findings") + ".csv", findingsToCsv(sorted), "text/csv"));
+    bar.appendChild(dl);
+    card.appendChild(bar);
+    host.appendChild(card);
+    return true;
+  }
+
   async function runSafeTool() {
     const spec = currentRunnerSpec();
     const target = document.getElementById("run-target").value.trim();
@@ -682,6 +766,10 @@
       body.wordlist = wl;
     }
 
+    const rawDetails = document.getElementById("run-raw-details");
+    if (rawDetails) rawDetails.classList.remove("hidden");
+    const fhost = document.getElementById("run-findings");
+    if (fhost) fhost.replaceChildren();
     out.classList.remove("hidden");
     out.textContent = "";
     document.getElementById("run-btn").disabled = true;
@@ -700,6 +788,10 @@
       if (r.error) text += "\n\n[error] " + r.error;
       if (r.out_path) text += "\n\n[saved] " + r.out_path;
       out.textContent = text || "(no output)";
+      // Lead with the parsed findings table; drop the raw output to a closed
+      // <details> when there's a table to read, keep it open when there isn't.
+      const hasFindings = renderRunFindings(r, fnBase(target, "redcell-findings"));
+      if (rawDetails) rawDetails.open = !hasFindings;
       loadHistory();
     } catch (e) {
       tickerStop(runTickerId); runTickerId = null;
@@ -712,6 +804,7 @@
         out.textContent = "REFUSED: " + (e.body && e.body.error ? e.body.error : e.message);
         N.toast("run refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
       }
+      if (rawDetails) rawDetails.open = true;   // no table on a failure — show the message
     } finally {
       runAbort = null;
       runCancel().classList.add("hidden");

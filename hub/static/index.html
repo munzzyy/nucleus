@@ -36,15 +36,31 @@
     <div class="grid cols-3 mt" id="stats"></div>
     <div id="overview-bar"></div>
 
+    <div class="section-title">Engagements</div>
+    <p class="sub mb">Group a case's scope, findings, and timeline. The active case's scope is the allowlist Redcell will scan.</p>
+    <div id="engagements"></div>
+
     <div class="section-title">Connected local apps</div>
     <div class="grid cols-3" id="apps"></div>
 
     <div class="section-title">Your shipped tools</div>
     <div class="grid cols-3" id="published"></div>
 
-    <div class="section-title">API keys — unlock more OSINT</div>
+    <div class="section-title">Settings</div>
+
+    <div class="section-title sub-section">Appearance</div>
+    <div class="card" id="pref-appearance"></div>
+
+    <div class="section-title sub-section">Shortcuts</div>
+    <div class="card" id="pref-shortcuts"></div>
+
+    <div class="section-title sub-section">API keys — unlock more OSINT</div>
     <p class="sub mb" id="settings-note">All optional — Recon works keyless. Each key you add unlocks more data. Keys stay local.</p>
     <div class="grid cols-2" id="settings"></div>
+
+    <div class="section-title sub-section">Privacy</div>
+    <p class="sub mb">Nucleus honors these environment toggles at launch. Set them before starting the app — the browser can't change them.</p>
+    <div class="card" id="pref-privacy"></div>
 
     <p class="faint mt small">
       Nucleus binds to 127.0.0.1 only. Authorized / lab / educational use.
