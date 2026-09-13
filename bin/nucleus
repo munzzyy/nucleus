@@ -279,7 +279,7 @@ def _wipe_targets():
     Directory contents are listed individually; the container dir itself stays."""
     var = REPO / "var"
     items = []
-    for d in (var / "scrub", var / "redcell-out", REPO / "engine" / "reports"):
+    for d in (var / "scrub", var / "redcell-out", var / "engagements", REPO / "engine" / "reports"):
         if d.is_dir():
             items += sorted(d.iterdir())
     for f in (var / "recon-scans.jsonl", var / "redcell-scans.jsonl"):

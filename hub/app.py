@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from shared import apikeys, common  # noqa: E402
+from shared import apikeys, common, engagement  # noqa: E402
 
 # Reading/writing var/.env is apikeys' job (shared.apikeys.get_key/set_key) —
 # it does the atomic tmp+os.replace swap and 0600 perms in one place, so the
@@ -201,10 +201,53 @@ PUBLISHED_TOOLS = [
      "url": "https://github.com/munzzyy/coacheck"},
 ]
 
+def _eng_state() -> dict:
+    act = engagement.active()
+    return {"list": engagement.list_engagements(),
+            "active": act.get("slug") if act else None,
+            "active_engagement": act}
+
+
+def _engagements_get(req) -> common.Response:
+    return common.Response.json(_eng_state())
+
+
+def _engagements_post(req) -> common.Response:
+    body = req.json()
+    action = str(body.get("action", "")).strip()
+    if action == "create":
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return common.Response.error(400, "name is required")
+        scope = body.get("scope")
+        engagement.create(name, scope if isinstance(scope, list) else [])
+    elif action == "activate":
+        engagement.set_active(str(body.get("slug", "")).strip())
+    elif action == "clear":
+        engagement.set_active("")
+    elif action == "add_scope":
+        engagement.add_scope(str(body.get("slug", "")).strip(), str(body.get("entry", "")).strip())
+    else:
+        return common.Response.error(400, "unknown action")
+    return common.Response.json({"ok": True, **_eng_state()})
+
+
+def _engagement_export(req) -> common.Response:
+    slug = req.q("slug", "").strip()
+    e = engagement.get(slug) if slug else engagement.active()
+    if not e:
+        return common.Response.error(404, "engagement not found")
+    return common.Response.text(engagement.export_markdown(e),
+                                content_type="text/markdown; charset=utf-8")
+
+
 ROUTES = {
     "GET /api/overview": _overview,
     "GET /api/settings": _settings_get,
     "POST /api/settings": _settings_post,
+    "GET /api/engagements": _engagements_get,
+    "POST /api/engagements": _engagements_post,
+    "GET /api/engagement/export": _engagement_export,
 }
 
 

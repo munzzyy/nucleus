@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from shared import common
+from shared import common, engagement
 from consoles.recon import detect, lookups, resources, takeover
 
 MAX_QUERY_LEN = 512
@@ -78,7 +78,22 @@ def _scan(req):
         "took_ms": round((time.monotonic() - t0) * 1000),
     }
     lookups.log_scan(kind, raw, result)  # best-effort case history; never fails the response
+    _tag_engagement(kind, normalized, result)
     return common.Response.json(result)
+
+
+def _tag_engagement(kind: str, target: str, result: dict) -> None:
+    """Record the scan on the active engagement's timeline (if any). Never
+    raises — tagging a case must not sink a scan response."""
+    try:
+        eng = engagement.active()
+        if not eng:
+            return
+        mods = result.get("modules") or {}
+        summary = f"{len(mods)} live module(s)" if mods else "pivots/dorks only"
+        engagement.add_event(eng["slug"], "recon:" + kind, target, summary)
+    except Exception:
+        pass
 
 
 def _arsenal(req):

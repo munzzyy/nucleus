@@ -6310,6 +6310,67 @@ class EngagementModelTests(unittest.TestCase):
         self.assertFalse(engagement.in_scope("anything", []))  # empty scope never allow-all
 
 
+class ParsedFindingsRunTests(unittest.TestCase):
+    """handle_run parses a tool's structured output into findings + a real
+    severity rollup (fixes the guessed 'N critical' line)."""
+
+    def test_nuclei_run_returns_parsed_findings_and_rollup(self):
+        jsonl = ('{"info":{"severity":"high","name":"CVE-x"},"matched-at":"http://x.test","template-id":"t1"}\n'
+                 '{"info":{"severity":"info","name":"tech"},"matched-at":"http://x.test","template-id":"t2"}')
+        rr = mock.Mock(returncode=0, stdout=jsonl, stderr="", duration=1.0, timed_out=False, error=None)
+        body = {"tool": "nuclei", "target": "http://x.test/", "authorized": True}
+        with mock.patch.object(runners.common, "host_is_public", return_value=True), \
+             mock.patch.object(runners, "opsec_gate", return_value=None), \
+             mock.patch.object(runners.engagement, "active", return_value=None), \
+             mock.patch.object(runners, "_resolve_options", return_value=({"rate": "150"}, None)), \
+             mock.patch.object(runners, "_resolve_public_ips_safe", return_value=["93.184.216.34"]), \
+             mock.patch.object(runners.common, "which", return_value="/usr/bin/nuclei"), \
+             mock.patch.object(runners.common, "run_tool", return_value=rr):
+            resp = runners.handle_run(_StressReq(body))
+        data = json.loads(resp.body)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(data["findings_rollup"]["high"], 1)
+        self.assertEqual(data["findings_rollup"]["info"], 1)
+        self.assertTrue(any(f["severity"] == "high" and f["tool"] == "nuclei" for f in data["findings"]))
+
+
+class HubEngagementEndpointTests(unittest.TestCase):
+    """The hub's engagement endpoints create/activate/scope/export cases."""
+
+    class _Req:
+        def __init__(self, body=None, query=None):
+            self._b = body or {}
+            self._q = query or {}
+
+        def json(self):
+            return self._b
+
+        def q(self, k, d=""):
+            return self._q.get(k, d)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = Path(self._tmp.name)
+        for attr, val in (("_DIR", d), ("_ACTIVE", d / "_active")):
+            p = mock.patch.object(engagement, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_create_scope_activate_export(self):
+        from hub import app as hub
+        r = hub._engagements_post(self._Req({"action": "create", "name": "Case A", "scope": ["example.com"]}))
+        d = json.loads(r.body)
+        self.assertEqual(d["active"], "case-a")
+        self.assertTrue(any(e["slug"] == "case-a" for e in d["list"]))
+        hub._engagements_post(self._Req({"action": "add_scope", "slug": "case-a", "entry": "10.0.0.0/24"}))
+        self.assertIn("10.0.0.0/24", engagement.get("case-a")["scope"])
+        exp = hub._engagement_export(self._Req(query={"slug": "case-a"}))
+        self.assertIn("Case A", exp.body.decode())
+        cleared = json.loads(hub._engagements_post(self._Req({"action": "clear"})).body)
+        self.assertIsNone(cleared["active"])
+
+
 class EngagementScopeGateTests(unittest.TestCase):
     """An active engagement's scope turns the redcell gate into a real allowlist."""
 

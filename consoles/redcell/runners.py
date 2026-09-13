@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from shared import common, apikeys, engagement
+from shared import common, apikeys, engagement, findings
 from consoles.redcell import wordlists
 
 MAX_OUTPUT = 200_000          # chars kept per stream; degrades gracefully past this
@@ -340,8 +340,10 @@ def _build_testssl(ctx: BuildCtx) -> list:
 
 
 def _build_nuclei(ctx: BuildCtx) -> list:
+    # -jsonl: one JSON object per finding on stdout, so we can parse real
+    # severities into the findings rollup instead of guessing from pretty text.
     argv = ["nuclei", "-u", ctx.target, "-rl", ctx.options["rate"],
-            "-timeout", "10", "-silent", "-etags", "dos,intrusive,fuzz"]
+            "-timeout", "10", "-silent", "-jsonl", "-etags", "dos,intrusive,fuzz"]
     tag = ctx.options.get("tags")
     if tag:
         argv += ["-tags", tag]
@@ -692,6 +694,39 @@ def opsec_gate(lab: bool, body: dict) -> Optional["common.Response"]:
     }, status=403)
 
 
+def _parse_findings(tool: str, stdout: str, target: str) -> list:
+    """Parse a runner's machine-readable stdout into normalized findings, so the
+    UI shows a real severity rollup instead of guessing from raw text. Only the
+    tools we ask for structured output; anything else returns []."""
+    try:
+        if tool == "nuclei":
+            return findings.parse_nuclei_jsonl(stdout or "", host=target)
+        if tool == "nmap":
+            return findings.parse_nmap_grepable(stdout or "")
+    except Exception:
+        return []
+    return []
+
+
+def _tag_engagement(kind: str, target: str, found: list, result) -> None:
+    """If an engagement is active, record this run on it — one timeline event
+    plus any parsed findings — so the case accumulates as you work. No-op with
+    no active engagement, and never lets a case write break a run."""
+    try:
+        eng = engagement.active()
+        if not eng:
+            return
+        slug = eng["slug"]
+        summary = (findings.summary_line(found) if found
+                   else ("timed out" if getattr(result, "timed_out", False)
+                         else f"rc={getattr(result, 'returncode', '?')}"))
+        engagement.add_event(slug, kind, target, summary)
+        for f in found:
+            engagement.add_finding(slug, f)
+    except Exception:
+        pass
+
+
 def handle_run(req) -> "common.Response":
     body = req.json()
     tool = str(body.get("tool") or "")
@@ -800,6 +835,9 @@ def handle_run(req) -> "common.Response":
     }
     _append_audit(entry)
 
+    parsed = _parse_findings(tool, result.stdout, argv_target)
+    _tag_engagement("redcell:" + tool, argv_target, parsed, result)
+
     return common.Response.json({
         "argv": safe_argv,
         "returncode": result.returncode,
@@ -809,6 +847,8 @@ def handle_run(req) -> "common.Response":
         "timed_out": result.timed_out,
         "error": result.error,
         "out_path": out_path,
+        "findings": parsed,          # normalized {severity,title,host,evidence,tool}
+        "findings_rollup": findings.roll_up(parsed),
     })
 
 
