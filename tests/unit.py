@@ -5825,6 +5825,32 @@ class RebindFailClosedTests(unittest.TestCase):
         self.assertIn("no longer resolves", json.loads(resp.body)["error"])
 
 
+class OpsecLocalFirstTests(unittest.TestCase):
+    """The always-on opsec verdict is LOCAL-only (no outbound); the exit-IP
+    oracle check is opt-in via oracles=True. This is the phone-home fix — the
+    indicator must not query third parties on a timer from the real IP."""
+
+    def test_default_is_local_and_makes_no_outbound_call(self):
+        calls = []
+
+        def rec(*a, **k):
+            calls.append(a)
+            return (200, b"{}", {})
+
+        with mock.patch.object(common, "fetch", rec):
+            o = common.opsec_status()
+        self.assertEqual(o["mode"], "local")
+        self.assertEqual(o["public_ip"], "")
+        self.assertEqual(calls, [])  # zero outbound on the default poll
+
+    def test_oracles_mode_queries_and_reports_ip(self):
+        body = b'{"ip":"203.0.113.5","organization":"X","city":"C","country":"US","mullvad_exit_ip":true}'
+        with mock.patch.object(common, "fetch", lambda url, **k: (200, body, {})):
+            o = common.opsec_status(oracles=True, force=True)
+        self.assertEqual(o["mode"], "oracles")
+        self.assertEqual(o["public_ip"], "203.0.113.5")
+
+
 class PostAndTimeoutRobustnessTests(unittest.TestCase):
     """run_tool preserves partial stderr on timeout."""
 

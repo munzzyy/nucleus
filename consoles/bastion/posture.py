@@ -360,8 +360,10 @@ def _ipv6_global() -> list[str]:
 
 def anonymity_panel() -> dict:
     """The OpSec page: is my real IP/location exposed right now, and what should
-    I have on. Read-only; the network verdict comes from shared opsec_status."""
-    o = common.opsec_status()
+    I have on. Read-only; the network verdict comes from shared opsec_status.
+    This is a dedicated page the user opened, so it opts in to the exit-IP
+    oracle check (which reveals the IP to the check services)."""
+    o = common.opsec_status(oracles=True)
     checks = []
 
     # 1) the headline: VPN / exit exposure

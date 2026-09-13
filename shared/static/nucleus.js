@@ -352,34 +352,74 @@
   };
 
   let opsecPrevExposed = null;   // null until the first poll resolves
+  let opsecVerifiedUntil = 0;    // while set, keep the verified display (don't clobber with the local poll)
+
+  // Build the bar with N.el (not innerHTML) so the Verify button can carry a
+  // click handler under the strict CSP. Handles both the local verdict and the
+  // richer oracle verdict (which has a real public_ip).
+  function renderOpsec(el, o) {
+    const local = o.mode === "local";
+    el.className = "opsec-bar " + (o.exposed ? "exposed" : "safe");
+    el.replaceChildren(N.el("span", { class: "od" }));
+    const add = (t) => el.appendChild(document.createTextNode(t));
+    const where = [o.org, o.city, o.country].filter(Boolean).join(" · ");
+    if (o.exposed) {
+      el.appendChild(N.el("b", { text: "EXPOSED" }));
+      if (!local && o.public_ip) {
+        add(" — your real IP ");
+        el.appendChild(N.el("span", { class: "mono", text: o.public_ip }));
+        add((where ? " (" + where + ")" : "") + " is what any target sees. Turn on your VPN before scanning. ");
+      } else {
+        add(" — " + (o.reason || "no VPN detected") + ". Turn on your VPN before scanning. ");
+      }
+    } else {
+      add("Protected — " + (o.reason || "VPN active") + " ");
+      if (!local && o.public_ip) {
+        add("· exit ");
+        el.appendChild(N.el("span", { class: "mono", text: o.public_ip }));
+        add(" ");
+      }
+    }
+    const btn = N.el("button", { type: "button", class: "opsec-verify",
+      text: local ? "Verify exit IP" : "Re-verify",
+      title: "Check your public exit IP against Mullvad / Tor Project / ipapi.co — this reveals your IP to those three services" });
+    btn.addEventListener("click", () => verifyExit(btn));
+    el.appendChild(btn);
+  }
+
+  async function verifyExit(btn) {
+    const el = document.getElementById("nuc-opsec");
+    btn.disabled = true;
+    btn.textContent = "checking…";
+    try {
+      const o = await N.get("/api/opsec?verify=1", { timeout: 20000 });
+      window.Nucleus._opsec = o;
+      document.dispatchEvent(new CustomEvent("nucleus:opsec", { detail: o }));
+      opsecVerifiedUntil = Date.now() + 45000;   // hold the verified view briefly
+      if (el) renderOpsec(el, o);
+    } catch (_) {
+      btn.disabled = false;
+      btn.textContent = "Verify failed — retry";
+    }
+  }
+
   async function pollOpsec() {
     const el = document.getElementById("nuc-opsec");
     if (!el) return;
+    if (opsecVerifiedUntil && Date.now() < opsecVerifiedUntil) return;  // keep the just-verified display
     let o;
+    // Local-only by default: reads the routing table, sends nothing outbound.
     try { o = await N.get("/api/opsec"); }
     catch (_) { return; }
     window.Nucleus._opsec = o;
     document.dispatchEvent(new CustomEvent("nucleus:opsec", { detail: o }));
-    // Announce only the safe→exposed transition (not every 15s poll), and do it
-    // assertively so a mid-session VPN drop interrupts whatever the AT is saying.
+    // Announce only the safe→exposed transition (not every poll), assertively so
+    // a mid-session VPN drop interrupts whatever the AT is saying.
     if (o.exposed && opsecPrevExposed === false) {
-      N.announce("EXPOSED — your real IP " + (o.public_ip || "") +
-        " is visible; turn on your VPN before scanning.");
+      N.announce("EXPOSED — " + (o.reason || "no VPN detected") + "; turn on your VPN before scanning.");
     }
     opsecPrevExposed = !!o.exposed;
-    if (o.exposed) {
-      const where = [o.org, o.city, o.country].filter(Boolean).join(" · ");
-      el.className = "opsec-bar exposed";
-      el.innerHTML =
-        '<span class="od"></span><b>EXPOSED</b> — your real IP ' +
-        '<span class="mono">' + N.esc(o.public_ip || "?") + '</span>' +
-        (where ? ' (' + N.esc(where) + ')' : '') +
-        ' is what any target sees. Turn on your VPN (Mullvad) before scanning.';
-    } else {
-      el.className = "opsec-bar safe";
-      el.innerHTML = '<span class="od"></span>Protected — ' + N.esc(o.reason || "VPN active") +
-        (o.public_ip ? ' · exit <span class="mono">' + N.esc(o.public_ip) + '</span>' : '');
-    }
+    renderOpsec(el, o);
   }
 
   function portUrl(port) { return location.protocol + "//" + location.hostname + ":" + port; }

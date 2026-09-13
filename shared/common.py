@@ -796,10 +796,13 @@ _opsec_lock = threading.Lock()
 OPSEC_TTL = 25.0
 
 
+_VPN_PREFIXES = ("wg", "tun", "mullvad", "proton", "nordlynx", "tailscale")
+
+
 def _vpn_iface_up() -> Optional[str]:
     try:
         for iface in os.listdir("/sys/class/net"):
-            if iface.startswith(("wg", "tun", "mullvad", "proton", "nordlynx", "tailscale")):
+            if iface.startswith(_VPN_PREFIXES):
                 try:
                     state = Path(f"/sys/class/net/{iface}/operstate").read_text().strip()
                 except OSError:
@@ -809,6 +812,44 @@ def _vpn_iface_up() -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def _default_route_iface() -> Optional[str]:
+    """The egress interface for the IPv4 default route, read from
+    /proc/net/route (no subprocess). None if it can't be determined."""
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            f = line.split()
+            if len(f) >= 4 and f[1] == "00000000":  # destination 0.0.0.0 = default route
+                return f[0]
+    except OSError:
+        pass
+    return None
+
+
+def _local_opsec() -> dict:
+    """Exposure verdict from LOCAL signals only — reads the routing table and
+    interface list and makes NO outbound call. This is the default for the
+    always-on indicator, so opening a console never sends your IP to a third
+    party before you ask. Call opsec_status(oracles=True) to actually confirm
+    the exit IP against the check services."""
+    route_if = _default_route_iface()
+    iface = _vpn_iface_up()
+    on_vpn = bool(route_if and route_if.startswith(_VPN_PREFIXES))
+    if on_vpn:
+        exposed, reason = False, (f"Default route is through {route_if} — traffic leaves via the tunnel "
+                                  "(local check; use Verify exit to confirm the IP)")
+    elif iface:
+        exposed, reason = True, (f"VPN interface {iface} is up but the default route is "
+                                 f"{route_if or 'unknown'} — your real IP is likely still what targets "
+                                 "see (local check)")
+    else:
+        exposed, reason = True, ("No VPN on the default route — your real IP and rough location are "
+                                 "visible to any target you scan (local check)")
+    return {"exposed": exposed, "reason": reason, "mode": "local",
+            "vpn_iface": iface, "route_iface": route_if,
+            "public_ip": "", "org": "", "city": "", "country": "",
+            "reachable": None, "mullvad": False, "tor_exit": False, "oracle_disagreement": False}
 
 
 _OPSEC_ORACLES = (
@@ -834,18 +875,24 @@ def _oracle_fetch(url: str, timeout: float = 5.0) -> Optional[dict]:
     return None
 
 
-def opsec_status(force: bool = False) -> dict:
-    """What the internet sees right now + a plain exposed/protected verdict.
+def opsec_status(force: bool = False, oracles: bool = False) -> dict:
+    """A plain exposed/protected verdict.
 
-    Cross-checks three independent, keyless, HTTPS-only oracles in parallel —
-    Mullvad's own check (authoritative for 'am I behind Mullvad'), the Tor
-    Project's check, and a plain IP-geolocation echo — instead of trusting
-    any single one. Their reported public IP must agree; if they disagree, or
-    none of them answer, that's reported as exposed rather than a false
-    'protected' (fail-safe). No oracle is ever queried over plaintext HTTP —
-    the check itself leaking the query would defeat the point of it.
-    Cached ~25s so console polling doesn't hammer the check services.
+    Default (oracles=False) uses LOCAL signals only — the routing table and
+    interface list — and makes NO outbound call, so the always-on indicator
+    never sends your IP to a third party before you ask.
+
+    oracles=True runs the full exit check: three independent, keyless,
+    HTTPS-only services in parallel (Mullvad's own check, the Tor Project's,
+    and a plain IP-geolocation echo) whose reported public IP must agree; if
+    they disagree or none answer, that's exposed, not a false 'protected'
+    (fail-safe). It's opt-in because it does reveal your IP to those three
+    services — trigger it explicitly ("Verify exit"), and it rides whatever
+    outbound proxy is configured. Cached ~25s so a verify burst doesn't hammer
+    the services.
     """
+    if not oracles:
+        return _local_opsec()
     now = time.monotonic()
     with _opsec_lock:
         cached = _opsec_cache["data"]
@@ -910,7 +957,7 @@ def opsec_status(force: bool = False) -> dict:
     data = {
         "exposed": exposed, "reason": reason, "mullvad": mullvad, "vpn_iface": iface,
         "reachable": reachable, "tor_exit": tor_exit, "oracle_disagreement": disagreement,
-        "public_ip": pub_ip, "org": org, "city": city, "country": country,
+        "public_ip": pub_ip, "org": org, "city": city, "country": country, "mode": "oracles",
     }
     with _opsec_lock:
         _opsec_cache.update(data=data, ts=now)
@@ -1018,9 +1065,11 @@ def _make_handler(app: App, port: int):
                 self._send(Response.json({"consoles": siblings_status(),
                                           "self": app.slug}))
                 return
-            # built-in: opsec / anonymity (every console can warn you)
+            # built-in: opsec / anonymity (every console can warn you). The
+            # always-on poll is local-only (no outbound); ?verify=1 opts in to
+            # the exit-IP oracle check, which does reveal the IP to 3 services.
             if path == "/api/opsec" and method == "GET":
-                self._send(Response.json(opsec_status()))
+                self._send(Response.json(opsec_status(oracles=(query.get("verify") == ["1"]))))
                 return
             # built-in: static
             if path == "/" and method in ("GET", "HEAD"):

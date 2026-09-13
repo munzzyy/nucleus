@@ -64,6 +64,11 @@ body[data-accent="dork"]    { --accent: var(--dork); }
 .opsec-bar { z-index: 25; padding: 9px 20px; font-size: 13px;
   display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }
 .opsec-bar .od { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.opsec-verify { margin-left: auto; flex: none; font: inherit; font-size: 12px; cursor: pointer;
+  padding: 2px 9px; border-radius: 5px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--fg, #fff) 8%, transparent); color: inherit; }
+.opsec-verify:hover:not(:disabled) { border-color: var(--accent, #6ab0ff); }
+.opsec-verify:disabled { opacity: .6; cursor: default; }
 .opsec-bar.exposed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: #ffd9de;
   border-bottom-color: color-mix(in srgb, var(--bad) 55%, transparent); }
 .opsec-bar.exposed .od { background: var(--bad); box-shadow: 0 0 9px var(--bad); animation: opulse 1.4s infinite; }
