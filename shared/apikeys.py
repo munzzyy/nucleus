@@ -18,6 +18,36 @@ from pathlib import Path
 
 _VAR_ENV = Path(__file__).resolve().parents[1] / "var" / ".env"
 _LOCK_PATH = _VAR_ENV.parent / ".env.lock"
+_KEYRING_SERVICE = "nucleus"
+
+
+def _keyring_on() -> bool:
+    """Use the OS keyring (libsecret via secret-tool) only when the operator
+    opts in with NUCLEUS_KEYRING=1 AND secret-tool is installed. Opt-in, never
+    automatic: a locked or empty keyring must not silently hide keys that are
+    still in var/.env, and we never want a blocking unlock prompt by surprise."""
+    from shared import common
+    return os.environ.get("NUCLEUS_KEYRING") == "1" and bool(common.which("secret-tool"))
+
+
+def _keyring_get(name: str) -> str:
+    from shared import common
+    r = common.run_tool(["secret-tool", "lookup", "service", _KEYRING_SERVICE, "key", name], timeout=4.0)
+    return _clean_value(r.stdout) if r.returncode == 0 else ""
+
+
+def _keyring_set(name: str, value: str) -> bool:
+    """Store (value truthy) or clear (value empty) one key in the OS keyring.
+    The secret is passed on stdin, never as an argv the process table could
+    show. Returns True on success."""
+    from shared import common
+    if value:
+        r = common.run_tool(["secret-tool", "store", "--label=Nucleus API key",
+                              "service", _KEYRING_SERVICE, "key", name],
+                             input_text=value, timeout=4.0)
+    else:
+        r = common.run_tool(["secret-tool", "clear", "service", _KEYRING_SERVICE, "key", name], timeout=4.0)
+    return r.returncode == 0
 
 # name(env var) -> spec. `unlocks` is a human list of what turns on.
 CATALOG = [
@@ -127,6 +157,10 @@ def get_key(name: str) -> str:
     v = os.environ.get(name)
     if v:
         return _clean_value(v)
+    if _keyring_on():
+        kv = _keyring_get(name)
+        if kv:
+            return kv
     return read_env().get(name, "")
 
 
@@ -161,6 +195,15 @@ def set_key(name: str, value: str) -> None:
     if not name or "=" in name or "\n" in name or "\r" in name:
         return
     value = _clean_value(value).replace("\n", "").replace("\r", "")
+
+    # Opt-in: keep the key in the OS keyring instead of plaintext var/.env.
+    if _keyring_on():
+        _keyring_set(name, value)
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+        return
 
     _VAR_ENV.parent.mkdir(parents=True, exist_ok=True)
     _LOCK_PATH.touch(exist_ok=True)

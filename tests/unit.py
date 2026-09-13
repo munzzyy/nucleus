@@ -5981,6 +5981,58 @@ class Socks5ProxyTests(unittest.TestCase):
         self.assertEqual(body, b"PROXIED!")
 
 
+class KeyringBackendTests(unittest.TestCase):
+    """NUCLEUS_KEYRING=1 stores keys in the OS keyring (secret-tool) instead of
+    plaintext var/.env; it's off by default, and an env var always wins."""
+
+    def setUp(self):
+        self._saved = os.environ.get("NUCLEUS_KEYRING")
+        os.environ.pop("NUCLEUS_KEYRING", None)
+        os.environ.pop("SHODAN_API_KEY", None)
+
+        def restore():
+            os.environ.pop("SHODAN_API_KEY", None)
+            if self._saved is None:
+                os.environ.pop("NUCLEUS_KEYRING", None)
+            else:
+                os.environ["NUCLEUS_KEYRING"] = self._saved
+        self.addCleanup(restore)
+
+    def test_off_by_default_uses_env_file(self):
+        with mock.patch.object(apikeys, "_keyring_get") as kg, \
+             mock.patch.object(apikeys, "read_env", return_value={"SHODAN_API_KEY": "fromfile"}):
+            self.assertEqual(apikeys.get_key("SHODAN_API_KEY"), "fromfile")
+            kg.assert_not_called()
+
+    def test_on_reads_keyring_before_file(self):
+        os.environ["NUCLEUS_KEYRING"] = "1"
+        with mock.patch.object(common, "which", return_value="/usr/bin/secret-tool"), \
+             mock.patch.object(common, "run_tool", return_value=mock.Mock(returncode=0, stdout="fromkeyring\n")), \
+             mock.patch.object(apikeys, "read_env", return_value={"SHODAN_API_KEY": "fromfile"}):
+            self.assertEqual(apikeys.get_key("SHODAN_API_KEY"), "fromkeyring")
+
+    def test_env_var_wins_over_keyring(self):
+        os.environ["NUCLEUS_KEYRING"] = "1"
+        os.environ["SHODAN_API_KEY"] = "fromenv"
+        with mock.patch.object(apikeys, "_keyring_get",
+                               side_effect=AssertionError("keyring must not be consulted when env is set")):
+            self.assertEqual(apikeys.get_key("SHODAN_API_KEY"), "fromenv")
+
+    def test_set_key_writes_to_keyring_when_on(self):
+        os.environ["NUCLEUS_KEYRING"] = "1"
+        calls = []
+
+        def fake_run(argv, **k):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(common, "which", return_value="/usr/bin/secret-tool"), \
+             mock.patch.object(common, "run_tool", fake_run):
+            apikeys.set_key("SHODAN_API_KEY", "secret123")
+        self.assertTrue(any("store" in a for a in calls))  # written to keyring, not var/.env
+        self.assertEqual(os.environ.get("SHODAN_API_KEY"), "secret123")
+
+
 class PostAndTimeoutRobustnessTests(unittest.TestCase):
     """run_tool preserves partial stderr on timeout."""
 
