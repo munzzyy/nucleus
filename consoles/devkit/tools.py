@@ -140,6 +140,8 @@ def hash_text(text, algos=None, algo=None) -> dict:
     out: dict = {}
     for name in wanted:
         key = str(name).lower()
+        if key.startswith("shake"):
+            raise ValueError(f"unsupported hash algorithm (variable-length): {name}")
         try:
             h = hashlib.new(key)
         except (ValueError, TypeError):
@@ -169,6 +171,8 @@ def hash_file_bytes(data, algos=None) -> dict:
     out: dict = {}
     for name in wanted:
         key = str(name).lower()
+        if key.startswith("shake"):
+            raise ValueError(f"unsupported hash algorithm (variable-length): {name}")
         try:
             h = hashlib.new(key)
         except (ValueError, TypeError):
@@ -182,6 +186,8 @@ def hmac_digest(text, key, algo="sha256") -> dict:
     """HMAC of `text` under `key`, as hex. `algo` is any hashlib name (default
     sha256). Local and pure — no key is ever fetched, stored, or written."""
     algo = str(algo or "sha256").lower()
+    if algo.startswith("shake"):
+        raise ValueError(f"unsupported hash algorithm (variable-length): {algo}")
     try:
         hashlib.new(algo)  # validate the name before it reaches hmac
     except (ValueError, TypeError):
@@ -576,17 +582,36 @@ def humanize_duration(seconds) -> dict:
 # --------------------------------------------------------------------------
 # cron — next fire times for a standard 5-field expression
 # --------------------------------------------------------------------------
+_DOW_ABBR = {"SUN": 0, "MON": 1, "TUE": 2, "WED": 3, "THU": 4, "FRI": 5, "SAT": 6}
+_MON_ABBR = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+             "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+
+
+def _sub_cron_names(field: str, names: dict, kind: str) -> str:
+    def repl(m):
+        w = m.group(0).upper()
+        if w not in names:
+            raise ValueError(f"bad {kind} name '{m.group(0)}'")
+        return str(names[w])
+    return re.sub(r"[A-Za-z]+", repl, field)
+
+
 def _parse_cron_field(field, lo: int, hi: int, name: str) -> set:
     """Expand one cron field into the set of integers it matches.
 
     Supports `*`, comma lists, `a-b` ranges, `*/n` and `a-b/n` steps, and a bare
-    `a/n` (start at a, step to hi). Everything is bounds-checked against
+    `a/n` (start at a, step to hi). The month and day-of-week fields also accept
+    3-letter names (JAN..DEC, SUN..SAT). Everything is bounds-checked against
     [lo, hi] so a malformed field (`60` for minutes, `9` for day-of-week) fails
     loudly here instead of silently never matching later.
     """
     field = str(field).strip()
     if field == "":
         raise ValueError(f"empty {name} field")
+    if name == "day-of-week":
+        field = _sub_cron_names(field, _DOW_ABBR, name)
+    elif name == "month":
+        field = _sub_cron_names(field, _MON_ABBR, name)
     values: set = set()
     for part in field.split(","):
         part = part.strip()
@@ -668,6 +693,14 @@ def _describe_cron(fields, minutes, hours, dows, dom_r, dow_r) -> str:
     return f"{when}, {day_str}{month_str}".strip()
 
 
+_CRON_MACROS = {
+    "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *",
+    "@monthly": "0 0 1 * *", "@weekly": "0 0 * * 0",
+    "@daily": "0 0 * * *", "@midnight": "0 0 * * *",
+    "@hourly": "0 * * * *",
+}
+
+
 def cron_next(expr, count=5, base_iso=None) -> dict:
     """Next `count` fire times of a 5-field cron expression from `base_iso`
     (default: now). Times are naive wall-clock ISO strings.
@@ -685,7 +718,17 @@ def cron_next(expr, count=5, base_iso=None) -> dict:
         raise ValueError("count must be at least 1")
     count = min(count, 20)  # cap — this is a display convenience, not a scheduler
 
-    fields = str(expr).split()
+    raw = str(expr).strip()
+    if raw.startswith("@"):
+        macro = raw.lower()
+        if macro == "@reboot":
+            raise ValueError("@reboot has no fixed schedule")
+        expanded = _CRON_MACROS.get(macro)
+        if expanded is None:
+            raise ValueError(f"unknown cron macro: {raw}")
+        raw = expanded
+
+    fields = raw.split()
     if len(fields) != 5:
         raise ValueError("cron needs exactly 5 fields: minute hour day-of-month month day-of-week")
     minutes = _parse_cron_field(fields[0], 0, 59, "minute")
@@ -742,6 +785,7 @@ def cron_next(expr, count=5, base_iso=None) -> dict:
         "description": _describe_cron(fields, minutes, hours, dows, dom_r, dow_r),
         "next": results,
         "count": len(results),
+        "horizon_reached": len(results) < count,
     }
 
 
@@ -800,6 +844,26 @@ def base_convert(value, from_base, to_base) -> dict:
 # --------------------------------------------------------------------------
 def _color_nums(s: str) -> list:
     return [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", s)]
+
+
+def _color_tokens(s: str) -> list:
+    """Raw tokens from an rgb()/hsl() body, '%' preserved. Splits on comma,
+    whitespace and '/' so the CSS Color-4 space/slash alpha form works too."""
+    if "(" in s and ")" in s:
+        s = s[s.index("(") + 1:s.rindex(")")]
+    return [t for t in re.split(r"[\s,/]+", s.strip()) if t]
+
+
+def _rgb_channel(tok: str) -> int:
+    if tok.endswith("%"):
+        return _clamp255(float(tok[:-1]) * 255 / 100)
+    return _clamp255(float(tok))
+
+
+def _alpha_token(tok: str) -> float:
+    if tok.endswith("%"):
+        return round(_clamp01(float(tok[:-1]) / 100), 3)
+    return round(_clamp01(float(tok)), 3)
 
 
 def _clamp255(v) -> int:
@@ -881,19 +945,28 @@ def color_convert(value) -> dict:
         except ValueError:
             raise ValueError(f"invalid hex color: {value}")
     elif s.startswith("rgb"):
-        nums = _color_nums(s)
-        if len(nums) < 3:
+        toks = _color_tokens(s)
+        if len(toks) < 3:
             raise ValueError(f"rgb needs 3 values: {value}")
-        r, g, b = _clamp255(nums[0]), _clamp255(nums[1]), _clamp255(nums[2])
-        if len(nums) >= 4:
-            a = round(_clamp01(nums[3]), 3)
+        try:
+            r, g, b = (_rgb_channel(t) for t in toks[:3])
+            if len(toks) >= 4:
+                a = _alpha_token(toks[3])
+        except ValueError:
+            raise ValueError(f"invalid rgb color: {value}")
     elif s.startswith("hsl"):
-        nums = _color_nums(s)
-        if len(nums) < 3:
+        toks = _color_tokens(s)
+        if len(toks) < 3:
             raise ValueError(f"hsl needs 3 values: {value}")
-        r, g, b = _hsl_to_rgb(nums[0], nums[1], nums[2])
-        if len(nums) >= 4:
-            a = round(_clamp01(nums[3]), 3)
+        try:
+            hue = toks[0][:-3] if toks[0].endswith("deg") else toks[0]
+            sat = toks[1][:-1] if toks[1].endswith("%") else toks[1]
+            lig = toks[2][:-1] if toks[2].endswith("%") else toks[2]
+            r, g, b = _hsl_to_rgb(float(hue), float(sat), float(lig))
+            if len(toks) >= 4:
+                a = _alpha_token(toks[3])
+        except ValueError:
+            raise ValueError(f"invalid hsl color: {value}")
     else:
         raise ValueError(f"unrecognized color format: {value}")
 

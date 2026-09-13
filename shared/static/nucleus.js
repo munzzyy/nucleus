@@ -22,23 +22,51 @@
   N.$$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
   // --- fetch wrappers ------------------------------------------------------
-  N.get = async function (path) {
-    const r = await fetch(path, { headers: { "Accept": "application/json" } });
-    const t = await r.text();
-    let j; try { j = t ? JSON.parse(t) : {}; } catch (_) { j = { raw: t }; }
-    if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
-    return j;
+  // Every request gets a client-side deadline via AbortController so a backend
+  // that accepts then hangs can't strand the tab on "scanning…" forever. Pass
+  // {signal} to wire your own Cancel button, {timeout} to override the default
+  // (ms; 0 disables). An aborted request rejects with an AbortError — check
+  // N.isAbort(err) to tell a cancel apart from a real failure.
+  N.FETCH_TIMEOUT = 120000;
+  N.isAbort = function (err) { return !!err && err.name === "AbortError"; };
+
+  function withDeadline(opts) {
+    opts = opts || {};
+    const ac = new AbortController();
+    const outer = opts.signal;
+    if (outer) {
+      if (outer.aborted) ac.abort();
+      else outer.addEventListener("abort", () => ac.abort(), { once: true });
+    }
+    const ms = opts.timeout != null ? opts.timeout : N.FETCH_TIMEOUT;
+    const timer = ms > 0 ? setTimeout(() => ac.abort(), ms) : null;
+    return { signal: ac.signal, done() { if (timer) clearTimeout(timer); } };
+  }
+
+  N.get = async function (path, opts) {
+    const d = withDeadline(opts);
+    try {
+      const r = await fetch(path, { headers: { "Accept": "application/json" }, signal: d.signal });
+      const t = await r.text();
+      let j; try { j = t ? JSON.parse(t) : {}; } catch (_) { j = { raw: t }; }
+      if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
+      return j;
+    } finally { d.done(); }
   };
-  N.post = async function (path, body) {
-    const r = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify(body || {}),
-    });
-    const t = await r.text();
-    let j; try { j = t ? JSON.parse(t) : {}; } catch (_) { j = { raw: t }; }
-    if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
-    return j;
+  N.post = async function (path, body, opts) {
+    const d = withDeadline(opts);
+    try {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(body || {}),
+        signal: d.signal,
+      });
+      const t = await r.text();
+      let j; try { j = t ? JSON.parse(t) : {}; } catch (_) { j = { raw: t }; }
+      if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
+      return j;
+    } finally { d.done(); }
   };
 
   // --- screen-reader announcements -----------------------------------------
@@ -307,7 +335,8 @@
     // viewport — it just sits right below however tall the topbar rendered.
     const shellWrap = N.el("div", { class: "topbar-wrap" });
     shellWrap.appendChild(bar);
-    const opsec = N.el("div", { class: "opsec-bar", id: "nuc-opsec" });
+    const opsec = N.el("div", { class: "opsec-bar", id: "nuc-opsec",
+      role: "status", "aria-live": "assertive", "aria-atomic": "true" });
     shellWrap.appendChild(opsec);
     document.body.insertBefore(shellWrap, document.body.firstChild);
 
@@ -322,6 +351,7 @@
     mountShortcuts();
   };
 
+  let opsecPrevExposed = null;   // null until the first poll resolves
   async function pollOpsec() {
     const el = document.getElementById("nuc-opsec");
     if (!el) return;
@@ -330,6 +360,13 @@
     catch (_) { return; }
     window.Nucleus._opsec = o;
     document.dispatchEvent(new CustomEvent("nucleus:opsec", { detail: o }));
+    // Announce only the safe→exposed transition (not every 15s poll), and do it
+    // assertively so a mid-session VPN drop interrupts whatever the AT is saying.
+    if (o.exposed && opsecPrevExposed === false) {
+      N.announce("EXPOSED — your real IP " + (o.public_ip || "") +
+        " is visible; turn on your VPN before scanning.");
+    }
+    opsecPrevExposed = !!o.exposed;
     if (o.exposed) {
       const where = [o.org, o.city, o.country].filter(Boolean).join(" · ");
       el.className = "opsec-bar exposed";
@@ -627,6 +664,12 @@
       li.classList.toggle("active", on);
       if (li.setAttribute) li.setAttribute("aria-selected", on ? "true" : "false");
     });
+    // Point the focused input at the highlighted row so the AT tracks the move
+    // even though DOM focus never leaves the input.
+    if (cmdInputEl) {
+      if (cmdFiltered.length) cmdInputEl.setAttribute("aria-activedescendant", "nuc-cmd-opt-" + cmdActive);
+      else cmdInputEl.removeAttribute("aria-activedescendant");
+    }
   }
 
   function renderCmdResults() {
@@ -655,11 +698,12 @@
     cmdResultsEl.innerHTML = "";
     if (!cmdFiltered.length) {
       cmdResultsEl.appendChild(N.el("li", { class: "cmd-empty", text: "No matches" }));
+      if (cmdInputEl) cmdInputEl.removeAttribute("aria-activedescendant");
       return;
     }
     cmdFiltered.forEach((c, i) => {
       const li = N.el("li", { class: "cmd-item" + (i === cmdActive ? " active" : ""),
-        role: "option", "aria-selected": i === cmdActive ? "true" : "false" });
+        id: "nuc-cmd-opt-" + i, role: "option", "aria-selected": i === cmdActive ? "true" : "false" });
       li.appendChild(N.el("span", { text: c.label }));
       const kind = recentLabels.has(c.label) ? "recent" : (c.hint || CMD_KIND_LABEL[c.kind] || "");
       li.appendChild(N.el("span", { class: "cmd-kind", text: kind }));
@@ -667,6 +711,7 @@
       li.addEventListener("click", () => runCmd(i));
       cmdResultsEl.appendChild(li);
     });
+    if (cmdInputEl) cmdInputEl.setAttribute("aria-activedescendant", "nuc-cmd-opt-" + cmdActive);
   }
 
   function moveCmd(delta) {
@@ -692,8 +737,9 @@
     const panel = N.el("div", { class: "cmd-panel" });
     cmdInputEl = N.el("input", { class: "cmd-input", id: "nuc-cmd-input", type: "text",
       autocomplete: "off", spellcheck: "false", "aria-label": "Command palette",
-      placeholder: "Jump to a console or a tool…" });
-    cmdResultsEl = N.el("ul", { class: "cmd-results", role: "listbox" });
+      role: "combobox", "aria-expanded": "true", "aria-controls": "nuc-cmd-list",
+      "aria-autocomplete": "list", placeholder: "Jump to a console or a tool…" });
+    cmdResultsEl = N.el("ul", { class: "cmd-results", role: "listbox", id: "nuc-cmd-list" });
     const hint = N.el("div", { class: "cmd-hint" },
       [N.el("span", { class: "kbd", text: "↑↓" }), " move · ",
        N.el("span", { class: "kbd", text: "↵" }), " open · ",
@@ -736,6 +782,7 @@
 
   function closeCommandPalette() {
     if (cmdOverlayEl) cmdOverlayEl.classList.add("hidden");
+    if (cmdInputEl) cmdInputEl.removeAttribute("aria-activedescendant");
     cmdOpen = false;
     if (cmdPrevFocus && cmdPrevFocus.focus) { try { cmdPrevFocus.focus(); } catch (_) { /* gone */ } }
     cmdPrevFocus = null;
@@ -768,6 +815,10 @@
         if (typing && document.activeElement.blur) document.activeElement.blur();
         return;
       }
+      // While an overlay is open, swallow every single-key shortcut so it can't
+      // navigate the window out from under the modal (help focuses its Close
+      // button, which isn't a typing target, so the typing guard misses it).
+      if (cmdOpen || helpOpen) return;
       if (typing) return; // never hijack keys while the user is typing
 
       if (e.key === "?") { e.preventDefault(); toggleHelp(); return; }

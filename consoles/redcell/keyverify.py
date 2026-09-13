@@ -98,7 +98,7 @@ _CHECKS: dict[str, tuple] = {
         "200 + the account's domains",
         "read-only; lists domains only",
     ),
-    "Cloudflare API token (contextual)": (
+    "Cloudflare API token": (
         lambda s: ["curl", "-sS", "-H", "Authorization: Bearer " + s,
                    "https://api.cloudflare.com/client/v4/user/tokens/verify"],
         'status:"active" — Cloudflare ships this endpoint specifically to verify a token',
@@ -141,7 +141,7 @@ _CHECKS: dict[str, tuple] = {
         '{"ok":true} + the bot identity',
         "read-only identity check (token rides the URL path)",
     ),
-    "Heroku API key (contextual)": (
+    "Heroku API key": (
         lambda s: ["curl", "-sS", "-H", "Authorization: Bearer " + s,
                    "-H", "Accept: application/vnd.heroku+json; version=3", "https://api.heroku.com/account"],
         "200 + the account JSON",

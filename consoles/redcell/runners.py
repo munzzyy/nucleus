@@ -584,6 +584,17 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
 # terminal, when he decides to.
 
 
+# Every safe runner must sit in exactly one rebind treatment: IP-pinned, or
+# rechecked-still-public before spawn. The gate's step-8 fallback now fails
+# closed for anything not pinned, but this catches a runner added to neither
+# set (or to both) at import time, keeping the two sets an honest map of
+# SAFE_RUNNERS instead of silently drifting.
+assert set(SAFE_RUNNERS) == _REBIND_IP_PIN | _REBIND_RECHECK, \
+    "rebind sets must cover exactly SAFE_RUNNERS"
+assert not (_REBIND_IP_PIN & _REBIND_RECHECK), \
+    "a runner cannot be both IP-pinned and rechecked"
+
+
 def _cap(s: str) -> str:
     if s and len(s) > MAX_OUTPUT:
         return s[:MAX_OUTPUT] + f"\n...[truncated, {len(s) - MAX_OUTPUT} more chars]"
@@ -746,7 +757,11 @@ def handle_run(req) -> "common.Response":
             # out of the public-only requirement (same as scope_check above).
         else:
             resolved_ip = ips[0]
-    elif tool in _REBIND_RECHECK and not lab:
+    elif not lab:
+        # Fail CLOSED for every non-IP-pinned runner, not only those we
+        # remembered to list in _REBIND_RECHECK: re-verify still-public right
+        # before spawn regardless of set membership, so adding a runner to
+        # neither set can never silently skip step 8.
         if not _resolve_public_ips_safe(scope_host):
             return common.Response.error(403,
                 "target no longer resolves to a public address (re-checked "

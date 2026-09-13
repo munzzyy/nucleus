@@ -58,10 +58,9 @@ def finding(severity: str, title: str, recommendation: str = "") -> dict:
 
 
 def _dns(name: str, rtype: str) -> list[dict]:
-    try:
-        return common.dns_query(name, rtype, timeout=_SRC_TIMEOUT)
-    except Exception:
-        return []
+    # strict=True so a DoH outage raises DNSUnavailable (caught per-check below)
+    # instead of masquerading as "no such record" and deflating a client's grade.
+    return common.dns_query(name, rtype, timeout=_SRC_TIMEOUT, strict=True)
 
 
 def _txt_values(name: str) -> list[str]:
@@ -93,9 +92,15 @@ def _fetch(url: str, timeout: float = _SRC_TIMEOUT, max_bytes: int = 400_000,
 # DNS
 # --------------------------------------------------------------------------
 def _collect_dns(domain: str) -> dict:
-    out = {}
+    # available=False if the DoH lookup itself failed (per record type), so the
+    # caller never reads "no MX" as fact when the truth is "couldn't ask".
+    out = {"A": [], "AAAA": [], "MX": [], "NS": [], "available": True}
     for rtype in ("A", "AAAA", "MX", "NS"):
-        ans = _dns(domain, rtype)
+        try:
+            ans = _dns(domain, rtype)
+        except common.DNSUnavailable:
+            out["available"] = False
+            continue
         out[rtype] = sorted({(a.get("data") or "").rstrip(".") for a in ans if a.get("data")})
     return out
 
@@ -112,34 +117,48 @@ def _apex_ip(dns_section: dict) -> str | None:
 # Email security — SPF / DMARC / DKIM hint
 # --------------------------------------------------------------------------
 def _check_spf(domain: str) -> dict:
-    spf_vals = [v for v in _txt_values(domain) if v.lower().startswith("v=spf1")]
+    try:
+        spf_vals = [v for v in _txt_values(domain) if v.lower().startswith("v=spf1")]
+    except common.DNSUnavailable:
+        return {"present": False, "record": None, "valid": False, "qualifier": None, "available": False}
     if not spf_vals:
-        return {"present": False, "record": None, "valid": False, "qualifier": None}
+        return {"present": False, "record": None, "valid": False, "qualifier": None, "available": True}
     rec = spf_vals[0]
-    m = re.search(r"([-~?+])all\s*$", rec.strip(), re.I)
-    qualifier = m.group(1) if m else None
+    # The `all` mechanism must be its own token (start-of-record or after
+    # whitespace), so an `all` substring inside another mechanism (e.g. a bare
+    # `include:example-all`) is NOT read as the policy. A bare trailing `all`
+    # with no qualifier defaults to '+' per RFC 7208 — it authorizes every
+    # sender exactly like +all, so grade it as '+', not "no qualifier".
+    m = re.search(r"(?:^|\s)([-~?+])?all\s*$", rec.strip(), re.I)
+    qualifier = (m.group(1) or "+") if m else None
     has_redirect = "redirect=" in rec.lower()
     # "valid" = the record actually asserts a policy that protects the domain.
     # -all (fail) and ~all (softfail) do; a bare redirect= delegates to another
     # policy. ?all (neutral) and +all (pass-all) do NOT — +all in particular
     # tells receivers to accept mail from ANY server as this domain.
     protective = qualifier in ("-", "~") or (has_redirect and qualifier is None)
-    return {"present": True, "record": rec, "valid": protective, "qualifier": qualifier}
+    return {"present": True, "record": rec, "valid": protective, "qualifier": qualifier, "available": True}
 
 
 def _check_dmarc(domain: str) -> dict:
-    vals = [v for v in _txt_values(f"_dmarc.{domain}") if v.lower().startswith("v=dmarc1")]
+    try:
+        vals = [v for v in _txt_values(f"_dmarc.{domain}") if v.lower().startswith("v=dmarc1")]
+    except common.DNSUnavailable:
+        return {"present": False, "record": None, "policy": None, "available": False}
     if not vals:
-        return {"present": False, "record": None, "policy": None}
+        return {"present": False, "record": None, "policy": None, "available": True}
     rec = vals[0]
     m = re.search(r"p=(\w+)", rec, re.I)
-    return {"present": True, "record": rec, "policy": (m.group(1).lower() if m else "none")}
+    return {"present": True, "record": rec, "policy": (m.group(1).lower() if m else "none"), "available": True}
 
 
 def _check_dkim_hint(domain: str) -> dict:
     for sel in _DKIM_SELECTORS:
-        if _dns(f"{sel}._domainkey.{domain}", "TXT"):
-            return {"found": True, "selector": sel}
+        try:
+            if _dns(f"{sel}._domainkey.{domain}", "TXT"):
+                return {"found": True, "selector": sel}
+        except common.DNSUnavailable:
+            return {"found": False, "selector": None, "available": False}
     return {"found": False, "selector": None}
 
 
@@ -173,15 +192,22 @@ def _check_tlsrpt(domain: str) -> dict:
     """TLS-RPT (RFC 8460): a TXT record at _smtp._tls.<domain> naming where to
     send SMTP TLS failure reports. Its presence means the operator is actually
     watching inbound-mail TLS health, which is the signal we grade."""
-    vals = [v for v in _txt_values(f"_smtp._tls.{domain}") if v.lower().startswith("v=tlsrptv1")]
+    try:
+        vals = [v for v in _txt_values(f"_smtp._tls.{domain}") if v.lower().startswith("v=tlsrptv1")]
+    except common.DNSUnavailable:
+        return {"present": False, "record": None, "available": False}
     return {"present": bool(vals), "record": vals[0] if vals else None}
 
 
 def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool,
                  mtasts: dict | None = None, tlsrpt: dict | None = None) -> tuple[int, int, list]:
     max_pts, pts, findings = 30, 0, []
+    spf_avail = spf.get("available", True)
+    dmarc_avail = dmarc.get("available", True)
 
-    if spf["present"]:
+    if not spf_avail:
+        max_pts -= 12   # SPF's full slice: excluded from the grade on a DNS outage, not scored as a failure
+    elif spf["present"]:
         q = spf.get("qualifier")
         if q == "-":
             pts += 12
@@ -214,7 +240,9 @@ def _score_email(spf: dict, dmarc: dict, dkim: dict, mx_present: bool,
                                  "Publish a TXT record on the apex starting with v=spf1 ... -all "
                                  "to stop mail systems trusting spoofed senders."))
 
-    if dmarc["present"]:
+    if not dmarc_avail:
+        max_pts -= 18   # DMARC's full slice, likewise excluded when the lookup could not run
+    elif dmarc["present"]:
         policy = dmarc.get("policy") or "none"
         if policy == "reject":
             pts += 18
@@ -556,11 +584,16 @@ def _score_tls(tls: dict) -> tuple[int, int, list]:
 # CAA record — who's allowed to issue certs for this domain
 # --------------------------------------------------------------------------
 def _check_caa(domain: str) -> dict:
-    recs = _dns(domain, "CAA")
+    try:
+        recs = _dns(domain, "CAA")
+    except common.DNSUnavailable:
+        return {"present": False, "records": [], "available": False}
     return {"present": bool(recs), "records": sorted({(r.get("data") or "").strip() for r in recs if r.get("data")})}
 
 
 def _score_caa(caa: dict) -> tuple[int, int, list]:
+    if not caa.get("available", True):
+        return 0, 0, []   # DNS outage: excluded from numerator AND denominator (see assess() info finding)
     max_pts, pts, findings = 3, 0, []
     if caa["present"]:
         pts = 3
@@ -596,12 +629,17 @@ def _score_security_txt(sec: dict) -> tuple[int, int, list]:
 # DNSSEC — best-effort presence check (DNSKEY/DS), not full chain validation
 # --------------------------------------------------------------------------
 def _check_dnssec(domain: str) -> dict:
-    dnskey = _dns(domain, "DNSKEY")
-    ds = _dns(domain, "DS")
+    try:
+        dnskey = _dns(domain, "DNSKEY")
+        ds = _dns(domain, "DS")
+    except common.DNSUnavailable:
+        return {"present": False, "available": False}
     return {"present": bool(dnskey or ds)}
 
 
 def _score_dnssec(dnssec: dict) -> tuple[int, int, list]:
+    if not dnssec.get("available", True):
+        return 0, 0, []   # DNS outage: excluded from the grade (see assess() info finding)
     max_pts, pts, findings = 5, 0, []
     if dnssec["present"]:
         pts = 5
@@ -870,6 +908,18 @@ def assess(domain: str) -> dict:
     grade, pct = _grade(total_pts, max_pts)
 
     all_findings = email_findings + web_findings + surf_findings
+    # Any DNS-derived signal whose lookup FAILED (vs genuinely absent) was left
+    # out of the grade by the scorers above; say so once, honestly, instead of
+    # emitting a deflated grade with fabricated "record missing" findings.
+    dns_down = [n for n, chk in (("SPF", spf), ("DMARC", dmarc), ("CAA", caa),
+                                 ("DNSSEC", dnssec)) if not chk.get("available", True)]
+    if not dns_section.get("available", True):
+        dns_down.insert(0, "DNS records")
+    if dns_down:
+        all_findings.append(finding("info", "Some DNS lookups did not complete",
+            f"{', '.join(dns_down)} could not be resolved (the DNS/DoH lookup did not answer). "
+            "Those checks were left out of the grade rather than counted as failing — re-run "
+            "when DNS is reachable for a complete assessment."))
     all_findings.sort(key=lambda f: _SEV_ORDER.get(f["severity"], 9))
 
     report = {
@@ -973,9 +1023,12 @@ def render_markdown(report: dict) -> str:
     if not report["findings"]:
         lines.append("No findings — every checked signal came back clean.")
     for f in report["findings"]:
-        lines.append(f"- **[{f['severity'].upper()}]** {f['title']}")
+        # Neutralize like every other external value in this file: some finding
+        # text embeds source data (Shodan CVE ids, the OpenSSL verify_error) that
+        # must not inject markup/links/newlines into a client-facing .md.
+        lines.append(f"- **[{f['severity'].upper()}]** {_md_safe(f['title'])}")
         if f["recommendation"]:
-            lines.append(f"  - {f['recommendation']}")
+            lines.append(f"  - {_md_safe(f['recommendation'])}")
     lines += [
         "",
         "## DNS",

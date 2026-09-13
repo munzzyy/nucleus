@@ -23,6 +23,16 @@
   let lastTakeoverData = null;
   let lastUsernameSites = [];
   let scanTicker = null;
+  let scanAbort = null;
+
+  // A Cancel button that only exists while a scan is in flight, sat next to the
+  // run button, so a wedged backend never strands the tab on "scanning…".
+  const cancelBtn = N.el("button", { type: "button", class: "ghost hidden", id: "scan-cancel", text: "Cancel" });
+  cancelBtn.addEventListener("click", () => { if (scanAbort) scanAbort.abort(); });
+  if (scanBtn && scanBtn.parentNode) scanBtn.parentNode.insertBefore(cancelBtn, scanBtn.nextSibling);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && scanAbort) scanAbort.abort();
+  });
   let siteFilterTimer = null;
   let pivotTrail = [];
   const MAX_TRAIL = 8;
@@ -1063,22 +1073,57 @@
     runTakeover();
   }
 
+  // Discovered values (IPs, subdomains, MX hosts, …) render as .pivot-val /
+  // .kv dd; mark the ones that aren't links as copyable so a single click grabs
+  // one value mid-pivot instead of the whole result or a hand text-selection.
+  function markCopyable(root) {
+    N.$$(".pivot-val, .kv dd", root).forEach(el => {
+      if (el.querySelector("a") || el.getAttribute("role") === "button") return;
+      if (!el.textContent.trim()) return;
+      el.setAttribute("role", "button");
+      el.setAttribute("tabindex", "0");
+      el.classList.add("copyable");
+      el.setAttribute("title", "click to copy");
+    });
+  }
+
+  function copyValue(el) {
+    if (!el || el.closest("a")) return false;
+    const cp = el.closest(".copyable");
+    if (!cp) return false;
+    N.copy(cp.textContent.trim(), "copied");
+    return true;
+  }
+
   results.addEventListener("click", (e) => {
     if (e.target.closest(".sub-takeover-btn")) { launchSubsTakeover(); return; }
     const chip = e.target.closest(".pivot-chip");
-    if (!chip) return;
-    const value = chip.dataset.pivotValue;
-    const type = chip.dataset.pivotType;
-    if (!value) return;
-    launchPivot(value, type);
+    if (chip) {
+      const value = chip.dataset.pivotValue;
+      const type = chip.dataset.pivotType;
+      if (!value) return;
+      launchPivot(value, type);
+      return;
+    }
+    copyValue(e.target);
+  });
+
+  results.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const cp = e.target.closest(".copyable");
+    if (!cp) return;
+    e.preventDefault();
+    copyValue(e.target);
   });
 
   async function runScan(q, type) {
     scanBtn.disabled = true;
+    scanAbort = new AbortController();
+    cancelBtn.classList.remove("hidden");
     results.innerHTML = "";
     startTicker("scanning");
     try {
-      const data = await N.post("/api/scan", { type, q });
+      const data = await N.post("/api/scan", { type, q }, { signal: scanAbort.signal });
       stopTicker();
       lastScanData = data;
       lastScanQuery = q;
@@ -1097,11 +1142,18 @@
       loadReconHistory();
     } catch (e) {
       stopTicker();
-      settleStatus("");
-      N.toast(e.message || "scan failed", "bad");
-      results.innerHTML = `<div class="card"><p class="bad">${esc(e.message || "scan failed")}</p></div>`;
+      if (N.isAbort(e)) {
+        settleStatus("scan canceled");
+        N.toast("scan canceled", "");
+      } else {
+        settleStatus("");
+        N.toast(e.message || "scan failed", "bad");
+        results.innerHTML = `<div class="card"><p class="bad">${esc(e.message || "scan failed")}</p></div>`;
+      }
     } finally {
       scanBtn.disabled = false;
+      scanAbort = null;
+      cancelBtn.classList.add("hidden");
     }
   }
 
@@ -1119,6 +1171,7 @@
     html += renderPivots(data.pivots);
     html += renderDorks(data.dorks);
     results.innerHTML = html;
+    markCopyable(results);
     // The username site grid has interactive controls (filter / found-only)
     // that must be wired after the innerHTML swap.
     if (data.detected_type === "username") wireUsernameControls();

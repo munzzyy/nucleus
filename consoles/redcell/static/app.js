@@ -10,6 +10,21 @@
   let WL_SEARCH_SEQ = 0;   // monotonic id — drops a stale wordlist response if a newer query already started
   let runTickerId = null;
   let expertTickerId = null;
+  let runAbort = null;
+
+  // Cancel button for a live run, created once and parked next to run-btn. A
+  // long scan (nmap "full" runs to a 600s server deadline) otherwise leaves the
+  // tab on "running…" with a disabled button and no escape short of a reload.
+  let runCancelBtn = null;
+  function runCancel() {
+    if (!runCancelBtn) {
+      const runBtn = document.getElementById("run-btn");
+      runCancelBtn = N.el("button", { type: "button", class: "ghost hidden", id: "run-cancel", text: "Cancel" });
+      runCancelBtn.addEventListener("click", () => { if (runAbort) runAbort.abort(); });
+      if (runBtn && runBtn.parentNode) runBtn.parentNode.insertBefore(runCancelBtn, runBtn.nextSibling);
+    }
+    return runCancelBtn;
+  }
 
   // -- last-used target, remembered across tabs/reloads --------------------
   const LAST_TARGET_KEY = "nucleus.redcell.lastTarget";
@@ -670,9 +685,13 @@
     out.classList.remove("hidden");
     out.textContent = "";
     document.getElementById("run-btn").disabled = true;
+    runAbort = new AbortController();
+    runCancel().classList.remove("hidden");
     runTickerId = tickerStart("run-status", "running " + spec.key);
     try {
-      const r = await N.post("/api/run", body);
+      // No client deadline: the server hard-bounds each run (nmap 600s, others
+      // 300s); Cancel is how the client stops waiting, not a premature timeout.
+      const r = await N.post("/api/run", body, { signal: runAbort.signal, timeout: 0 });
       tickerStop(runTickerId); runTickerId = null;
       status.textContent = `exit ${r.returncode} · ${r.duration}s` + (r.timed_out ? " · TIMED OUT" : "");
       let text = "$ " + r.argv.map(a => (/\s/.test(a) ? `'${a}'` : a)).join(" ") + "\n\n";
@@ -684,10 +703,18 @@
       loadHistory();
     } catch (e) {
       tickerStop(runTickerId); runTickerId = null;
-      status.textContent = "refused";
-      out.textContent = "REFUSED: " + (e.body && e.body.error ? e.body.error : e.message);
-      N.toast("run refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+      if (N.isAbort(e)) {
+        status.textContent = "canceled";
+        out.textContent = "canceled — the tool may still be finishing server-side until its own deadline.";
+        N.toast("run canceled", "");
+      } else {
+        status.textContent = "refused";
+        out.textContent = "REFUSED: " + (e.body && e.body.error ? e.body.error : e.message);
+        N.toast("run refused: " + (e.body && e.body.error ? e.body.error : e.message), "bad");
+      }
     } finally {
+      runAbort = null;
+      runCancel().classList.add("hidden");
       document.getElementById("run-btn").disabled = !authorized;
       fillSlot("run-actions", () => out.textContent, fnBase(spec.key, "redcell-run"), "text/plain");
     }
@@ -1149,14 +1176,16 @@
     if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
     const btn = document.getElementById("web-analyze-btn");
     btn.disabled = true;
-    status.textContent = "analyzing…";
+    const tick = tickerStart("web-analyze-status", "analyzing");
     resultWrap.classList.remove("hidden");
     resultWrap.innerHTML = "";
     try {
       const r = await N.post("/api/web-analyze", { url: target, authorized: gateChecked(), lab: labChecked(), proceed_exposed: opsecOverride() });
+      tickerStop(tick);
       status.textContent = "";
       resultWrap.appendChild(buildAnalyzeCard(r));
     } catch (e) {
+      tickerStop(tick);
       status.textContent = "refused";
       resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
         document.createTextNode("refused: " + (e.body && e.body.error ? e.body.error : e.message))]));
@@ -1174,15 +1203,17 @@
     if (!gateChecked()) { N.toast("check the authorization box first", "bad"); return; }
     const btn = document.getElementById("secret-scan-btn");
     btn.disabled = true;
-    status.textContent = "scanning page + same-site JS…";
+    const tick = tickerStart("secret-scan-status", "scanning page + same-site JS");
     resultWrap.classList.remove("hidden");
     resultWrap.innerHTML = "";
     try {
       const deep = !!document.getElementById("secret-scan-deep") && document.getElementById("secret-scan-deep").checked;
       const r = await N.post("/api/secret-scan", { url: target, authorized: gateChecked(), lab: labChecked(), deep, proceed_exposed: opsecOverride() });
+      tickerStop(tick);
       status.textContent = "";
       resultWrap.appendChild(buildSecretScanCard(r));
     } catch (e) {
+      tickerStop(tick);
       status.textContent = "refused";
       resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
         document.createTextNode("refused: " + (e.body && e.body.error ? e.body.error : e.message))]));

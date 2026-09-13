@@ -195,7 +195,38 @@ def _origin_ok(origin: str, port: int) -> bool:
             and oport == port)
 
 
+_SIXTOFOUR = ipaddress.ip_network("2002::/16")     # 6to4 tunnel: IPv4 in bits 16-48
+_NAT64_WK = ipaddress.ip_network("64:ff9b::/96")   # NAT64 well-known: IPv4 in the low 32
+
+
+def _embedded_ipv4(ip):
+    """Pull the IPv4 destination out of an IPv6 form that actually routes to
+    IPv4 — 6to4 (2002::/16) and NAT64 well-known (64:ff9b::/96) — so the SSRF
+    check judges where the packet really goes. Returns an IPv4Address or None.
+    (ipaddress.ipv4_mapped already covers ::ffff:0:0/96; these two are the ones
+    the stdlib has classified inconsistently across interpreter versions.)"""
+    if ip.version != 6:
+        return None
+    packed = ip.packed
+    if ip in _SIXTOFOUR:
+        return ipaddress.IPv4Address(packed[2:6])
+    if ip in _NAT64_WK:
+        return ipaddress.IPv4Address(packed[12:16])
+    return None
+
+
 def _ip_is_public(ip) -> bool:
+    # Judge an embedded/tunneled IPv4 by its real target first, so the verdict
+    # never depends on the interpreter's version-shifting classification of
+    # these forms (pre-3.13 CPython read some 6to4 addresses as public — this
+    # made the SSRF guard's floor the same on every supported Python).
+    if ip.version == 6:
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            return _ip_is_public(mapped)
+        emb = _embedded_ipv4(ip)
+        if emb is not None:
+            return _ip_is_public(emb)
     if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
             or ip.is_reserved or ip.is_unspecified):
         return False
@@ -579,13 +610,27 @@ _DOH_ENDPOINTS = (
 )
 
 
-def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT) -> list[dict]:
+class DNSUnavailable(Exception):
+    """Every DoH endpoint failed to answer (transport / non-200 / parse error) —
+    as opposed to a successful lookup that simply returned no records. Only
+    raised by dns_query(strict=True); the default path still returns [] on
+    failure so existing callers are unchanged. A grader that scores on record
+    presence needs this to tell 'no such record' apart from 'the lookup did not
+    run' and avoid reporting an outage as a real finding."""
+
+
+def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT,
+              strict: bool = False) -> list[dict]:
     """Encrypted DNS-over-HTTPS lookup (keyless, zero-dep).
 
     Returns the raw Answer list. Using DoH JSON here means no dnspython — and so
     no repeat of the shared-Resolver thread-safety bug that bit the old
     osint-console — while still keeping every lookup encrypted in transit.
     Google is primary, Cloudflare the fallback.
+
+    A valid 200 response (even with an empty Answer) is a definitive result and
+    returns []. Only when NO endpoint produced one does strict=True raise
+    DNSUnavailable; without strict it returns [] as before.
     """
     name = (name or "").strip().rstrip(".")
     if not name:
@@ -601,6 +646,8 @@ def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT) -> 
             return ans
         except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
             continue
+    if strict:
+        raise DNSUnavailable(f"no DoH endpoint answered for {name} {rtype}")
     return []
 
 
@@ -651,8 +698,10 @@ def run_tool(argv: list[str], *, timeout: float = 120.0,
         return RunResult(argv, proc.returncode, proc.stdout or "", proc.stderr or "",
                          round(time.monotonic() - start, 3))
     except subprocess.TimeoutExpired as e:
-        return RunResult(argv, -1, (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
-                         "", round(time.monotonic() - start, 3), timed_out=True,
+        def _dec(b):
+            return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        return RunResult(argv, -1, _dec(e.stdout), _dec(e.stderr),
+                         round(time.monotonic() - start, 3), timed_out=True,
                          error=f"timed out after {timeout}s")
     except (OSError, ValueError) as e:
         return RunResult(argv, -1, "", "", round(time.monotonic() - start, 3),
@@ -1007,12 +1056,25 @@ def _make_handler(app: App, port: int):
 
             body = b""
             if method == "POST":
+                if self.headers.get("Transfer-Encoding"):
+                    # The body is sized by Content-Length; a chunked body would
+                    # read as empty and silently drop the request. Refuse it and
+                    # close, rather than mis-handling it. (No browser fetch(str)
+                    # path sends chunked, so this only trips a raw/hostile client.)
+                    self.close_connection = True
+                    self._send(Response.error(HTTPStatus.BAD_REQUEST, "chunked request bodies are not supported"))
+                    return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     length = 0
+                if length < 0:
+                    length = 0  # a negative Content-Length is malformed; treat as no body
                 limit = app.body_limits.get(key, MAX_BODY)  # per-route override (uploads)
                 if length > limit:
+                    # Close instead of leaving the oversized body on a keep-alive
+                    # socket for the next request to trip over.
+                    self.close_connection = True
                     self._send(Response.error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body too large"))
                     return
                 body = self.rfile.read(length) if length > 0 else b""

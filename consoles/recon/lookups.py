@@ -36,6 +36,8 @@ USERNAME_SITE_TIMEOUT = 6.0
 USERNAME_CONCURRENCY = 32  # WMN adds hundreds of candidate sites -- needs real
                             # throughput to cover a useful sample inside the budget
 USERNAME_BUDGET = 30.0  # overall wall-clock cap for the whole username scan
+SCAN_CONCURRENCY = 12   # in-flight network lookups per domain/ip scan
+SCAN_BUDGET = 25.0      # overall wall-clock cap so one hung source can't hang the scan
 
 VAR_DIR = Path(__file__).resolve().parents[2] / "var"
 HISTORY_FILE = VAR_DIR / "recon-scans.jsonl"
@@ -118,10 +120,11 @@ def _keyed_note(status, err) -> str:
 
 
 def _geo_lookup(ip: str) -> dict | None:
-    # HTTPS source first — this is an opsec tool, and the IP being looked up is
-    # exactly the thing you don't want leaking over cleartext to a passive
-    # observer. ip-api.com's free tier is HTTP-only, so it's the last-resort
-    # fallback, not the default path.
+    # HTTPS only — this is an opsec tool and the IP being looked up is exactly
+    # the thing you don't want leaking over cleartext to a passive observer
+    # (the same reason PTR uses DoH, not socket.gethostbyaddr). ip-api.com's
+    # free tier is HTTP-only, so it's dropped entirely rather than reintroducing
+    # the leak on a fallback path; ipwho.is over TLS is the sole source.
     status, body, _, _ = _safe_fetch(f"https://ipwho.is/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
     if status == 200:
         data = _json_or_none(body) or {}
@@ -132,16 +135,6 @@ def _geo_lookup(ip: str) -> dict | None:
                 "city": data.get("city"), "lat": data.get("latitude"), "lon": data.get("longitude"),
                 "isp": conn.get("isp"), "org": conn.get("org"), "asn": conn.get("asn"),
                 "source": "ipwho.is",
-            }
-    status, body, _, _ = _safe_fetch(f"http://ip-api.com/json/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        if data.get("status") == "success":
-            return {
-                "country": data.get("country"), "region": data.get("regionName"),
-                "city": data.get("city"), "lat": data.get("lat"), "lon": data.get("lon"),
-                "isp": data.get("isp"), "org": data.get("org"), "asn": data.get("as"),
-                "source": "ip-api.com (cleartext fallback)",
             }
     return None
 
@@ -583,21 +576,6 @@ def email_scan(email: str) -> dict:
     _grav_future = _enrich_ex.submit(sources.gravatar_profile, email)
     _hr_future = _enrich_ex.submit(sources.hudsonrock_email, email)
 
-    # XposedOrNot -- simple breach list
-    status, body, _, err = _safe_fetch(
-        f"https://api.xposedornot.com/v1/check-email/{quote(email, safe='')}", timeout=FETCH_TIMEOUT)
-    breaches_simple: list[str] = []
-    if status in (200, 404):
-        data = _json_or_none(body) or {}
-        for group in data.get("breaches") or []:
-            if isinstance(group, list):
-                breaches_simple.extend(group)
-        result["breach_check"] = {"ok": True, "breached": bool(breaches_simple),
-                                   "breaches": breaches_simple, "error": None}
-    else:
-        result["breach_check"] = {"ok": False, "breached": False, "breaches": [],
-                                   "error": err or f"HTTP {status}"}
-
     # XposedOrNot -- rich breach analytics
     status, body, _, err = _safe_fetch(
         f"https://api.xposedornot.com/v1/breach-analytics?email={quote(email, safe='')}", timeout=FETCH_TIMEOUT)
@@ -628,6 +606,17 @@ def email_scan(email: str) -> dict:
         result["breach_analytics"] = {"ok": False, "risk_label": None, "risk_score": None,
                                        "breach_count": 0, "breaches": [], "paste_count": 0,
                                        "error": err or f"HTTP {status}"}
+
+    # Derive the simple breach list from analytics instead of a second, redundant
+    # XposedOrNot round trip (/v1/check-email returns nothing analytics doesn't).
+    ba = result["breach_analytics"]
+    if ba["ok"]:
+        names = [b["name"] for b in ba["breaches"] if b.get("name")]
+        result["breach_check"] = {"ok": True, "breached": ba["breach_count"] > 0,
+                                   "breaches": names, "error": None}
+    else:
+        result["breach_check"] = {"ok": False, "breached": False, "breaches": [],
+                                   "error": ba["error"]}
 
     # LeakCheck -- keyless, second breach oracle (HIBP's email breach lookup
     # is paid-only as of 2026; keep this top-level like the XposedOrNot
@@ -787,119 +776,201 @@ def domain_scan(domain: str) -> dict:
     _rapiddns_future = _dom_ex.submit(sources.rapiddns_subdomains, d)
     _wayback_future = _dom_ex.submit(sources.wayback_urls, d)
     _hr_domain_future = _dom_ex.submit(sources.hudsonrock_domain, d)
+    # The independent network lookups below share no state, so they run
+    # concurrently on a bounded pool instead of stacking ~20 serial round trips
+    # (a single slow DoH or an overloaded crt.sh used to add its full timeout to
+    # the wall clock). Each is collected with result(timeout) against an overall
+    # SCAN_BUDGET deadline, so one hung source can never hang the whole request.
+    # The assembled output is byte-identical to the old serial version.
+    urlscan_key = apikeys.get_key("URLSCAN_API_KEY")
+    securitytrails_key = apikeys.get_key("SECURITYTRAILS_API_KEY")
 
-    # DNS
+    _net_ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY)
+    _deadline = time.time() + SCAN_BUDGET
+
+    def _grab(fut, fallback):
+        try:
+            return fut.result(timeout=max(0.1, _deadline - time.time()))
+        except Exception:
+            return fallback
+
+    def _fetch_rdap():
+        # RDAP whois (rdap.org redirects to the right RIR/registry; urllib follows it)
+        status, body, _, err = _safe_fetch(f"https://rdap.org/domain/{quote(d, safe='')}", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            registrar_name = None
+            for ent in data.get("entities") or []:
+                if "registrar" in (ent.get("roles") or []):
+                    vcard = ent.get("vcardArray")
+                    if isinstance(vcard, list) and len(vcard) > 1 and isinstance(vcard[1], list):
+                        for field in vcard[1]:
+                            # A jCard property is [name, params, type, value]. A
+                            # registry that returns a short or non-list entry used
+                            # to raise IndexError/TypeError here.
+                            if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
+                                registrar_name = field[3]
+            return {
+                "ok": True, "handle": data.get("handle"), "status": data.get("status"),
+                "registrar": registrar_name,
+                "events": [{"action": e.get("eventAction"), "date": e.get("eventDate")}
+                           for e in data.get("events") or []],
+                "error": None,
+            }
+        return {"ok": False, "error": err or f"HTTP {status}"}
+
+    def _fetch_crtsh():
+        # crt.sh certificate-transparency subdomains (notoriously flaky/rate-limited).
+        # Busy domains return a multi-MB body; a whole-document json.loads that
+        # lands mid-array on a truncated body fails silently. Fall back to parsing
+        # row-by-row (NDJSON-style) -- mirrors engine/osint_report.py's crt.sh parser.
+        status, body, _, err = _safe_fetch(
+            f"https://crt.sh/?q=%25.{quote(d, safe='')}&output=json", timeout=10.0, max_bytes=3_000_000)
+        crt_names: set[str] = set()
+        if status == 200:
+            rows = _json_or_none(body)
+            if not isinstance(rows, list):
+                rows = []
+                for line in body.decode("utf-8", "replace").splitlines():
+                    line = line.strip().strip(",")
+                    if not line:
+                        continue
+                    row = _json_or_none(line.encode("utf-8"))
+                    if isinstance(row, dict):
+                        rows.append(row)
+            for row in rows:
+                for n in (row.get("name_value") or "").split("\n"):
+                    n = n.strip().lstrip("*.").lower()
+                    # Scope on a label boundary, not a bare suffix.
+                    if n and (n == d or n.endswith("." + d)):
+                        crt_names.add(n)
+            return crt_names, None
+        return crt_names, err or f"HTTP {status} (crt.sh is often overloaded -- retry later)"
+
+    def _fetch_hackertarget():
+        # hackertarget hostsearch -- CSV `host,ip`. Free tier rate-limits with a
+        # plain-text error body on a 200, so detect that instead of trusting status.
+        status, body, _, err = _safe_fetch(
+            f"https://api.hackertarget.com/hostsearch/?q={quote(d, safe='')}",
+            timeout=FETCH_TIMEOUT, max_bytes=100_000)
+        ht_hosts: list[dict] = []
+        if status == 200:
+            text = body.decode("utf-8", "replace").strip()
+            if not text or "error" in text.lower() or "exceeded" in text.lower():
+                return ht_hosts, text[:200] or "empty response"
+            for line in text.splitlines():
+                host, _, ip = line.partition(",")
+                host = host.strip().lower()
+                if host and (host == d or host.endswith("." + d)):   # label boundary
+                    ht_hosts.append({"host": host, "ip": ip.strip()})
+            return ht_hosts, None
+        return ht_hosts, err or f"HTTP {status}"
+
+    def _fetch_urlscan():
+        # urlscan.io recent public scans -- a key only raises submit/search limits.
+        status, body, _, err = _safe_fetch(
+            f"https://urlscan.io/api/v1/search/?q=domain:{quote(d, safe='')}&size=5",
+            timeout=FETCH_TIMEOUT, max_bytes=300_000,
+            headers={"API-Key": urlscan_key} if urlscan_key else None)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            scans = []
+            for r in (data.get("results") or [])[:5]:
+                page = r.get("page") or {}
+                task = r.get("task") or {}
+                scans.append({
+                    "url": page.get("url"), "ip": page.get("ip"),
+                    "time": task.get("time"), "screenshot": r.get("screenshot"),
+                })
+            return {"ok": True, "count": len(scans), "scans": scans, "error": None}
+        return {"ok": False, "count": 0, "scans": [], "error": err or f"HTTP {status}"}
+
+    def _fetch_otx():
+        # AlienVault OTX reputation (community threat-intel pulses mentioning this domain)
+        status, body, _, err = _safe_fetch(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{quote(d, safe='')}/general",
+            timeout=FETCH_TIMEOUT, max_bytes=300_000)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            pulse_info = data.get("pulse_info") or {}
+            pulses = pulse_info.get("pulses") or []
+            return {"ok": True, "pulse_count": pulse_info.get("count", 0),
+                    "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
+                    "error": None}
+        return {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
+
+    def _fetch_wayback():
+        status, body, _, err = _safe_fetch(
+            f"https://archive.org/wayback/available?url={quote(d, safe='')}", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            snap = (data.get("archived_snapshots") or {}).get("closest") or {}
+            return {"ok": True, "archived": bool(snap), "url": snap.get("url"),
+                    "timestamp": snap.get("timestamp"), "error": None}
+        return {"ok": False, "archived": False, "error": err or f"HTTP {status}"}
+
+    def _fetch_hosting(ip):
+        # Hosting chain: apex IP -> InternetDB (ports/CVEs) + geo.
+        hosting = {"ip": ip, "ports": [], "cves": [], "hostnames": [], "tags": [], "geo": None, "error": None}
+        status, body, _, err = _safe_fetch(f"https://internetdb.shodan.io/{ip}", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            idb = _json_or_none(body) or {}
+            hosting["ports"] = idb.get("ports", [])
+            hosting["cves"] = idb.get("vulns", [])
+            hosting["hostnames"] = idb.get("hostnames", [])
+            hosting["tags"] = idb.get("tags", [])
+        elif status is not None:
+            hosting["error"] = f"internetdb HTTP {status}"
+        hosting["geo"] = _geo_lookup(ip)
+        return hosting
+
+    # Wave 1: everything that depends only on the domain name.
+    _rtypes = ("A", "AAAA", "MX", "TXT", "NS", "CNAME", "CAA", "SOA", "SRV", "DNSKEY")
+    _dns_futs = {rt: _net_ex.submit(_dns_query_ex, d, rt, DNS_TIMEOUT) for rt in _rtypes}
+    _dmarc_fut = _net_ex.submit(_dns_query_ex, f"_dmarc.{d}", "TXT", DNS_TIMEOUT)
+    _dnssec_fut = _net_ex.submit(sources.dnssec_status, d)
+    _rdap_fut = _net_ex.submit(_fetch_rdap)
+    _crtsh_fut = _net_ex.submit(_fetch_crtsh)
+    _ht_fut = _net_ex.submit(_fetch_hackertarget)
+    _urlscan_fut = _net_ex.submit(_fetch_urlscan)
+    _otx_fut = _net_ex.submit(_fetch_otx)
+    _wayback_avail_fut = _net_ex.submit(_fetch_wayback)
+    _st_fut = _net_ex.submit(_securitytrails_subdomains, d, securitytrails_key) if securitytrails_key else None
+
+    # DNS -- collected in fixed record-type order so dns_unreachable is stable.
     dns: dict = {}
     dns_unreachable: list[str] = []
-    for rtype in ("A", "AAAA", "MX", "TXT", "NS", "CNAME", "CAA", "SOA", "SRV", "DNSKEY"):
-        try:
-            ans, unreachable = _dns_query_ex(d, rtype, timeout=DNS_TIMEOUT)
-        except Exception:
-            ans, unreachable = [], True
+    for rtype in _rtypes:
+        ans, unreachable = _grab(_dns_futs[rtype], ([], True))
         dns[rtype] = sorted({a.get("data") for a in ans if a.get("data")})
         if unreachable:
             dns_unreachable.append(rtype)
     result["dns"] = dns
     # Record types where BOTH DoH resolvers were unreachable (vs. a genuine
-    # empty/NXDOMAIN answer) -- the UI should render these as "lookup failed",
-    # not silently as "none".
+    # empty/NXDOMAIN answer) -- the UI should render these as "lookup failed".
     result["dns_unreachable"] = dns_unreachable
 
-    # DNSSEC: DNSKEY (already fetched above) + a DS record at the parent means
-    # a real signed chain of trust, not just self-published keys.
-    result["dnssec"] = sources.dnssec_status(d, dns.get("DNSKEY"))
+    # Wave 2: the hosting chain needs the resolved apex IP, so it starts once DNS
+    # is in but still overlaps the wave-1 HTTP sources still in flight.
+    a_records = dns.get("A") or dns.get("AAAA") or []
+    _hosting_fut = _net_ex.submit(_fetch_hosting, a_records[0]) if a_records else None
 
-    # RDAP whois (rdap.org redirects to the right RIR/registry; urllib follows it)
-    status, body, _, err = _safe_fetch(f"https://rdap.org/domain/{quote(d, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        registrar_name = None
-        for ent in data.get("entities") or []:
-            if "registrar" in (ent.get("roles") or []):
-                vcard = ent.get("vcardArray")
-                if isinstance(vcard, list) and len(vcard) > 1 and isinstance(vcard[1], list):
-                    for field in vcard[1]:
-                        # A jCard property is [name, params, type, value]. A
-                        # registry that returns a short or non-list entry used
-                        # to raise IndexError/TypeError here, and this runs
-                        # outside _safe_fetch's guard, so it took the WHOLE
-                        # domain scan down with it.
-                        if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
-                            registrar_name = field[3]
-        result["whois"] = {
-            "ok": True, "handle": data.get("handle"), "status": data.get("status"),
-            "registrar": registrar_name,
-            "events": [{"action": e.get("eventAction"), "date": e.get("eventDate")}
-                       for e in data.get("events") or []],
-            "error": None,
-        }
-    else:
-        result["whois"] = {"ok": False, "error": err or f"HTTP {status}"}
+    # DNSSEC: DNSKEY + a DS record at the parent means a real signed chain of trust.
+    result["dnssec"] = _grab(_dnssec_fut, {
+        "signed": False, "dnskey_present": False, "dnskey_count": 0, "ds_present": False,
+        "ds_count": 0, "unreachable": True, "note": "DNSSEC lookup did not complete"})
 
-    # crt.sh certificate-transparency subdomains (notoriously flaky/rate-limited).
-    # Busy domains return a multi-MB body; a whole-document json.loads that
-    # lands mid-array on a truncated body fails silently and we'd report
-    # "unavailable" for a domain that actually has plenty of data. Raise the
-    # cap and fall back to parsing row-by-row (NDJSON-style) when the whole
-    # body doesn't parse as one JSON list -- mirrors engine/osint_report.py's
-    # crt.sh parser so both stay in sync.
-    status, body, _, err = _safe_fetch(
-        f"https://crt.sh/?q=%25.{quote(d, safe='')}&output=json", timeout=10.0, max_bytes=3_000_000)
-    crt_names: set[str] = set()
-    if status == 200:
-        rows = _json_or_none(body)
-        if not isinstance(rows, list):
-            rows = []
-            for line in body.decode("utf-8", "replace").splitlines():
-                line = line.strip().strip(",")
-                if not line:
-                    continue
-                row = _json_or_none(line.encode("utf-8"))
-                if isinstance(row, dict):
-                    rows.append(row)
-        for row in rows:
-            for n in (row.get("name_value") or "").split("\n"):
-                n = n.strip().lstrip("*.").lower()
-                # Scope on a label boundary, not a bare suffix: "notexample.com"
-                # ends with "example.com" but is a different registration, and
-                # a name that lands here also gets DNS-probed by the takeover
-                # checker, so an out-of-scope host is a scope violation, not
-                # just a wrong count.
-                if n and (n == d or n.endswith("." + d)):
-                    crt_names.add(n)
-        crt_error = None
-    else:
-        crt_error = err or f"HTTP {status} (crt.sh is often overloaded -- retry later)"
+    result["whois"] = _grab(_rdap_fut, {"ok": False, "error": "lookup did not complete"})
 
-    # hackertarget hostsearch -- CSV `host,ip`. Free tier rate-limits with a
-    # plain-text error body on a 200, so detect that instead of trusting status.
-    status, body, _, err = _safe_fetch(
-        f"https://api.hackertarget.com/hostsearch/?q={quote(d, safe='')}",
-        timeout=FETCH_TIMEOUT, max_bytes=100_000)
-    ht_hosts: list[dict] = []
-    if status == 200:
-        text = body.decode("utf-8", "replace").strip()
-        if not text or "error" in text.lower() or "exceeded" in text.lower():
-            ht_error = text[:200] or "empty response"
-        else:
-            ht_error = None
-            for line in text.splitlines():
-                host, _, ip = line.partition(",")
-                host = host.strip().lower()
-                if host and (host == d or host.endswith("." + d)):   # label boundary, see crt.sh above
-                    ht_hosts.append({"host": host, "ip": ip.strip()})
-    else:
-        ht_error = err or f"HTTP {status}"
+    crt_names, crt_error = _grab(_crtsh_fut, (set(), "lookup did not complete"))
+    ht_hosts, ht_error = _grab(_ht_fut, ([], "lookup did not complete"))
 
-    # SecurityTrails full subdomain list (keyed) -- merges into the same set.
-    securitytrails_key = apikeys.get_key("SECURITYTRAILS_API_KEY")
     st_names: set[str] = set()
     st_error: str | None = None
-    if securitytrails_key:
-        st_names, st_error = _securitytrails_subdomains(d, securitytrails_key)
+    if _st_fut is not None:
+        st_names, st_error = _grab(_st_fut, (set(), "lookup did not complete"))
 
-    # CertSpotter (clean CT JSON, unlike crt.sh's flaky dumps) + RapidDNS
-    # (passive DNS). Collected from the futures started at the top.
+    # CertSpotter + RapidDNS, from the futures started at the top of the scan.
     try:
         cs_names, cs_error = _certspotter_future.result(timeout=sources.SLOW_TIMEOUT + 2)
     except Exception as e:
@@ -924,58 +995,13 @@ def domain_scan(domain: str) -> dict:
                             "error": st_error if securitytrails_key else None},
     }
 
-    # urlscan.io recent public scans -- a key (if set) only raises submit/search
-    # limits, the keyless search already works, so this stays best-effort.
-    urlscan_key = apikeys.get_key("URLSCAN_API_KEY")
-    status, body, _, err = _safe_fetch(
-        f"https://urlscan.io/api/v1/search/?q=domain:{quote(d, safe='')}&size=5",
-        timeout=FETCH_TIMEOUT, max_bytes=300_000,
-        headers={"API-Key": urlscan_key} if urlscan_key else None)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        scans = []
-        for r in (data.get("results") or [])[:5]:
-            page = r.get("page") or {}
-            task = r.get("task") or {}
-            scans.append({
-                "url": page.get("url"), "ip": page.get("ip"),
-                "time": task.get("time"), "screenshot": r.get("screenshot"),
-            })
-        result["urlscan"] = {"ok": True, "count": len(scans), "scans": scans, "error": None}
-    else:
-        result["urlscan"] = {"ok": False, "count": 0, "scans": [], "error": err or f"HTTP {status}"}
+    result["urlscan"] = _grab(_urlscan_fut, {"ok": False, "count": 0, "scans": [], "error": "lookup did not complete"})
+    result["otx"] = _grab(_otx_fut, {"ok": False, "pulse_count": 0, "pulse_names": [], "error": "lookup did not complete"})
+    result["wayback"] = _grab(_wayback_avail_fut, {"ok": False, "archived": False, "error": "lookup did not complete"})
 
-    # AlienVault OTX reputation (community threat-intel pulses mentioning this domain)
-    status, body, _, err = _safe_fetch(
-        f"https://otx.alienvault.com/api/v1/indicators/domain/{quote(d, safe='')}/general",
-        timeout=FETCH_TIMEOUT, max_bytes=300_000)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        pulse_info = data.get("pulse_info") or {}
-        pulses = pulse_info.get("pulses") or []
-        result["otx"] = {"ok": True, "pulse_count": pulse_info.get("count", 0),
-                          "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
-                          "error": None}
-    else:
-        result["otx"] = {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
-
-    # Wayback availability
-    status, body, _, err = _safe_fetch(
-        f"https://archive.org/wayback/available?url={quote(d, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        snap = (data.get("archived_snapshots") or {}).get("closest") or {}
-        result["wayback"] = {"ok": True, "archived": bool(snap), "url": snap.get("url"),
-                              "timestamp": snap.get("timestamp"), "error": None}
-    else:
-        result["wayback"] = {"ok": False, "archived": False, "error": err or f"HTTP {status}"}
-
-    # SPF / DMARC posture
+    # SPF / DMARC posture (SPF is read off the already-fetched TXT set).
     spf_txt = [t for t in dns.get("TXT", []) if "v=spf1" in (t or "").lower()]
-    try:
-        dmarc_ans, dmarc_unreachable = _dns_query_ex(f"_dmarc.{d}", "TXT", timeout=DNS_TIMEOUT)
-    except Exception:
-        dmarc_ans, dmarc_unreachable = [], True
+    dmarc_ans, dmarc_unreachable = _grab(_dmarc_fut, ([], True))
     dmarc_txt = [a.get("data") for a in dmarc_ans
                  if a.get("data") and "v=dmarc1" in a.get("data", "").lower()]
     result["email_posture"] = {
@@ -984,7 +1010,8 @@ def domain_scan(domain: str) -> dict:
         "dmarc_unreachable": dmarc_unreachable,
     }
 
-    # Live HTTP fetch: status, server/tech headers, security-header score
+    # Live HTTP fetch: status, server/tech headers, security-header score. Kept
+    # serial (https then http) -- it's a deliberate fallback, not independent work.
     http_info = {"ok": False, "error": "no response on http or https"}
     for scheme in ("https", "http"):
         status, body, hdrs, err = _safe_fetch(f"{scheme}://{d}/", timeout=FETCH_TIMEOUT, max_bytes=100_000)
@@ -1002,26 +1029,15 @@ def domain_scan(domain: str) -> dict:
         http_info = {"ok": False, "error": err}
     result["http"] = http_info
 
-    # Hosting chain: apex A (falling back to AAAA for an IPv6-only apex) -> IP
-    # -> InternetDB (ports/CVEs) + geo
-    hosting = {"ip": None, "ports": [], "cves": [], "hostnames": [], "tags": [], "geo": None, "error": None}
-    a_records = dns.get("A") or dns.get("AAAA") or []
-    if a_records:
-        ip = a_records[0]
-        hosting["ip"] = ip
-        status, body, _, err = _safe_fetch(f"https://internetdb.shodan.io/{ip}", timeout=FETCH_TIMEOUT)
-        if status == 200:
-            idb = _json_or_none(body) or {}
-            hosting["ports"] = idb.get("ports", [])
-            hosting["cves"] = idb.get("vulns", [])
-            hosting["hostnames"] = idb.get("hostnames", [])
-            hosting["tags"] = idb.get("tags", [])
-        elif status is not None:
-            hosting["error"] = f"internetdb HTTP {status}"
-        hosting["geo"] = _geo_lookup(ip)
+    if _hosting_fut is not None:
+        result["hosting"] = _grab(_hosting_fut, {
+            "ip": a_records[0], "ports": [], "cves": [], "hostnames": [], "tags": [],
+            "geo": None, "error": "hosting lookup did not complete"})
     else:
-        hosting["error"] = "no A or AAAA record to resolve"
-    result["hosting"] = hosting
+        result["hosting"] = {"ip": None, "ports": [], "cves": [], "hostnames": [], "tags": [],
+                             "geo": None, "error": "no A or AAAA record to resolve"}
+
+    _net_ex.shutdown(wait=False, cancel_futures=True)
 
     keyed: dict = {}
     unlock: list[str] = []
@@ -1205,82 +1221,102 @@ def ip_scan(ip: str) -> dict:
 
     result: dict = {"input": ip, "version": ipobj.version}
 
-    status, body, _, err = _safe_fetch(f"https://internetdb.shodan.io/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        result["internetdb"] = {"ok": True, "ports": data.get("ports", []), "cves": data.get("vulns", []),
-                                 "hostnames": data.get("hostnames", []), "tags": data.get("tags", []),
-                                 "cpes": data.get("cpes", []), "error": None}
-    elif status == 404:
-        result["internetdb"] = {"ok": True, "ports": [], "cves": [], "hostnames": [], "tags": [],
-                                 "cpes": [], "error": None, "note": "no data on file for this IP"}
-    else:
-        result["internetdb"] = {"ok": False, "error": err or f"HTTP {status}"}
+    # These six lookups are mutually independent, so they run concurrently on a
+    # bounded pool against an overall SCAN_BUDGET deadline instead of stacking
+    # six serial round trips (a hung source can't hang the whole scan). Output
+    # is byte-identical to the old serial version.
+    def _grab(fut, fallback):
+        try:
+            return fut.result(timeout=max(0.1, _deadline - time.time()))
+        except Exception:
+            return fallback
 
-    result["geo"] = _geo_lookup(ip)
+    def _fetch_internetdb():
+        status, body, _, err = _safe_fetch(f"https://internetdb.shodan.io/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            return {"ok": True, "ports": data.get("ports", []), "cves": data.get("vulns", []),
+                    "hostnames": data.get("hostnames", []), "tags": data.get("tags", []),
+                    "cpes": data.get("cpes", []), "error": None}
+        elif status == 404:
+            return {"ok": True, "ports": [], "cves": [], "hostnames": [], "tags": [],
+                    "cpes": [], "error": None, "note": "no data on file for this IP"}
+        return {"ok": False, "error": err or f"HTTP {status}"}
 
-    # Reverse DNS (PTR) over DoH -- NOT socket.gethostbyaddr(), which hits the
-    # system resolver: that leaks the queried IP straight to the ISP/system
-    # DNS (defeating the whole encrypted-DoH passive design) and has no
-    # timeout of its own, so it can block a worker for the resolver's full
-    # timeout. This stays on the same encrypted, timeout-bounded path as
-    # every other lookup in this file.
-    try:
-        ptr_ans, ptr_unreachable = _dns_query_ex(_reverse_dns_name(ipobj), "PTR", timeout=DNS_TIMEOUT)
-    except Exception:
-        ptr_ans, ptr_unreachable = [], True
-    hostnames = [h for h in ((a.get("data") or "").rstrip(".") for a in ptr_ans) if h]
-    if ptr_unreachable:
-        result["reverse_dns"] = {
-            "ok": False, "hostname": None, "hostnames": [], "unreachable": True,
-            "error": "PTR lookup failed -- both DoH resolvers unreachable",
-        }
-    else:
-        result["reverse_dns"] = {
-            "ok": True, "hostname": hostnames[0] if hostnames else None,
-            "hostnames": hostnames, "unreachable": False, "error": None,
-        }
+    def _fetch_ptr():
+        # Reverse DNS (PTR) over DoH -- NOT socket.gethostbyaddr(), which hits the
+        # system resolver: that leaks the queried IP straight to the ISP/system
+        # DNS (defeating the whole encrypted-DoH passive design) and has no
+        # timeout of its own. This stays on the same encrypted, bounded path.
+        try:
+            ptr_ans, ptr_unreachable = _dns_query_ex(_reverse_dns_name(ipobj), "PTR", timeout=DNS_TIMEOUT)
+        except Exception:
+            ptr_ans, ptr_unreachable = [], True
+        hostnames = [h for h in ((a.get("data") or "").rstrip(".") for a in ptr_ans) if h]
+        if ptr_unreachable:
+            return {"ok": False, "hostname": None, "hostnames": [], "unreachable": True,
+                    "error": "PTR lookup failed -- both DoH resolvers unreachable"}
+        out = {"ok": True, "hostname": hostnames[0] if hostnames else None,
+               "hostnames": hostnames, "unreachable": False, "error": None}
         if not hostnames:
-            result["reverse_dns"]["note"] = "no PTR record on file"
+            out["note"] = "no PTR record on file"
+        return out
 
-    status, body, _, err = _safe_fetch(f"https://rdap.org/ip/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        result["rdap"] = {"ok": True, "start": data.get("startAddress"), "end": data.get("endAddress"),
-                           "name": data.get("name"), "type": data.get("type"),
-                           "country": data.get("country"), "error": None}
-    else:
-        result["rdap"] = {"ok": False, "error": err or f"HTTP {status}"}
+    def _fetch_rdap():
+        status, body, _, err = _safe_fetch(f"https://rdap.org/ip/{quote(ip, safe='')}", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            return {"ok": True, "start": data.get("startAddress"), "end": data.get("endAddress"),
+                    "name": data.get("name"), "type": data.get("type"),
+                    "country": data.get("country"), "error": None}
+        return {"ok": False, "error": err or f"HTTP {status}"}
 
-    status, body, _, err = _safe_fetch(
-        f"https://onionoo.torproject.org/details?search={quote(ip, safe='')}"
-        "&fields=nickname,flags,exit_addresses,running", timeout=FETCH_TIMEOUT)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        relays = data.get("relays") or []  # empty list is a valid "not a relay" answer, not a 404
-        is_exit = any("Exit" in (r.get("flags") or []) or r.get("exit_addresses") for r in relays)
-        result["tor"] = {
-            "ok": True, "is_relay": bool(relays), "is_exit": is_exit,
-            "relays": [{"nickname": r.get("nickname"), "flags": r.get("flags"), "running": r.get("running")}
-                       for r in relays[:10]],
-            "error": None,
-        }
-    else:
-        result["tor"] = {"ok": False, "error": err or f"HTTP {status}"}
+    def _fetch_tor():
+        status, body, _, err = _safe_fetch(
+            f"https://onionoo.torproject.org/details?search={quote(ip, safe='')}"
+            "&fields=nickname,flags,exit_addresses,running", timeout=FETCH_TIMEOUT)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            relays = data.get("relays") or []  # empty list is a valid "not a relay" answer, not a 404
+            is_exit = any("Exit" in (r.get("flags") or []) or r.get("exit_addresses") for r in relays)
+            return {"ok": True, "is_relay": bool(relays), "is_exit": is_exit,
+                    "relays": [{"nickname": r.get("nickname"), "flags": r.get("flags"), "running": r.get("running")}
+                               for r in relays[:10]], "error": None}
+        return {"ok": False, "error": err or f"HTTP {status}"}
 
-    otx_type = "IPv4" if ipobj.version == 4 else "IPv6"
-    status, body, _, err = _safe_fetch(
-        f"https://otx.alienvault.com/api/v1/indicators/{otx_type}/{quote(ip, safe='')}/general",
-        timeout=FETCH_TIMEOUT, max_bytes=300_000)
-    if status == 200:
-        data = _json_or_none(body) or {}
-        pulse_info = data.get("pulse_info") or {}
-        pulses = pulse_info.get("pulses") or []
-        result["otx"] = {"ok": True, "pulse_count": pulse_info.get("count", 0),
-                          "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
-                          "error": None}
-    else:
-        result["otx"] = {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
+    def _fetch_otx():
+        otx_type = "IPv4" if ipobj.version == 4 else "IPv6"
+        status, body, _, err = _safe_fetch(
+            f"https://otx.alienvault.com/api/v1/indicators/{otx_type}/{quote(ip, safe='')}/general",
+            timeout=FETCH_TIMEOUT, max_bytes=300_000)
+        if status == 200:
+            data = _json_or_none(body) or {}
+            pulse_info = data.get("pulse_info") or {}
+            pulses = pulse_info.get("pulses") or []
+            return {"ok": True, "pulse_count": pulse_info.get("count", 0),
+                    "pulse_names": [p.get("name") for p in pulses[:5] if p.get("name")],
+                    "error": None}
+        return {"ok": False, "pulse_count": 0, "pulse_names": [], "error": err or f"HTTP {status}"}
+
+    _net_ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY)
+    _deadline = time.time() + SCAN_BUDGET
+    _idb_fut = _net_ex.submit(_fetch_internetdb)
+    _geo_fut = _net_ex.submit(_geo_lookup, ip)
+    _ptr_fut = _net_ex.submit(_fetch_ptr)
+    _rdap_fut = _net_ex.submit(_fetch_rdap)
+    _tor_fut = _net_ex.submit(_fetch_tor)
+    _otx_fut = _net_ex.submit(_fetch_otx)
+
+    result["internetdb"] = _grab(_idb_fut, {"ok": False, "error": "lookup did not complete"})
+    result["geo"] = _grab(_geo_fut, None)
+    result["reverse_dns"] = _grab(_ptr_fut, {
+        "ok": False, "hostname": None, "hostnames": [], "unreachable": True,
+        "error": "PTR lookup failed -- both DoH resolvers unreachable"})
+    result["rdap"] = _grab(_rdap_fut, {"ok": False, "error": "lookup did not complete"})
+    result["tor"] = _grab(_tor_fut, {"ok": False, "error": "lookup did not complete"})
+    result["otx"] = _grab(_otx_fut, {"ok": False, "pulse_count": 0, "pulse_names": [],
+                                     "error": "lookup did not complete"})
+    _net_ex.shutdown(wait=False, cancel_futures=True)
 
     # Keyed sources -- each only runs when its free API key is present in
     # Settings; otherwise it's skipped and surfaced as an "unlock" hint so
@@ -1975,12 +2011,41 @@ def _read_history() -> list[dict]:
         return []
 
 
+def _tail_history(limit: int) -> list[dict]:
+    """The newest `limit` history rows, newest-first, parsing only those lines.
+    The sidebar (fired after every scan and on load) needs ~50 rows, not the
+    whole capped file json-parsed and thrown away."""
+    try:
+        if not HISTORY_FILE.is_file():
+            return []
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        row = _json_or_none(line.encode("utf-8"))
+        if isinstance(row, dict):
+            out.append(row)
+            if len(out) >= limit:
+                break
+    return out
+
+
+# Trim to HISTORY_MAX only once the file drifts this far past the cap, so the
+# whole-file rewrite happens once every _HISTORY_TRIM_SLACK appends, not on
+# every single scan.
+_HISTORY_TRIM_SLACK = 100
+
+
 def _trim_history_locked() -> None:
-    """Keep only the newest HISTORY_MAX lines on disk. Caller must already
-    hold _history_lock (runs right after an append)."""
+    """Keep the on-disk file near HISTORY_MAX lines. Caller must already hold
+    _history_lock (runs right after an append)."""
     try:
         lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
-        if len(lines) > HISTORY_MAX:
+        if len(lines) > HISTORY_MAX + _HISTORY_TRIM_SLACK:
             HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n", encoding="utf-8")
     except OSError:
         pass
@@ -2015,10 +2080,9 @@ def log_scan(kind: str, query: str, scan: dict) -> None:
 def history_list(limit: int = 50) -> list[dict]:
     """Newest-first summaries for the history sidebar."""
     limit = max(1, min(limit, HISTORY_MAX))
-    rows = _read_history()
-    rows.reverse()  # file is append order (oldest-first) -- flip for display
+    rows = _tail_history(limit)  # already newest-first, only `limit` parsed
     return [{"id": r.get("id"), "ts": r.get("ts"), "type": r.get("type"),
-             "q": r.get("q"), "summary": r.get("summary")} for r in rows[:limit]]
+             "q": r.get("q"), "summary": r.get("summary")} for r in rows]
 
 
 def history_get(scan_id: str):
@@ -2026,9 +2090,18 @@ def history_get(scan_id: str):
     or None if the id doesn't exist (already trimmed, or never existed)."""
     if not scan_id:
         return None
-    for r in _read_history():
-        if r.get("id") == scan_id:
-            return r.get("scan")
+    try:
+        if not HISTORY_FILE.is_file():
+            return None
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if scan_id not in line:  # cheap skip before json-parsing the row
+            continue
+        row = _json_or_none(line.strip().encode("utf-8"))
+        if isinstance(row, dict) and row.get("id") == scan_id:
+            return row.get("scan")
     return None
 
 

@@ -179,9 +179,9 @@ RULES: list[Rule] = [
     Rule("Mailgun API key", r"\b(key-[0-9a-f]{32})\b", "high", confidence="medium", group=1, keywords=("key-",),
          note="Mailgun keys are hex; a key- prefix on non-hex is something else."),
     Rule("Mailchimp API key", r"\b([0-9a-f]{32}-us[0-9]{1,2})\b", "high", confidence="medium", group=1, keywords=("-us",)),
-    Rule("Twilio API Key SID", r"\b(SK[0-9a-fA-F]{32})\b", "high", confidence="medium", group=1, keywords=("sk",),
+    Rule("Twilio API Key SID", r"\b(SK[0-9a-fA-F]{32})\b", "high", confidence="medium", group=1, keywords=None,
          note="SK+32hex is the Twilio API Key SID shape — confirm it's Twilio (it needs the paired auth token to use)."),
-    Rule("Twilio Account SID", r"\b(AC[0-9a-f]{32})\b", "low", confidence="medium", public_ok=True, keywords=("ac",),
+    Rule("Twilio Account SID", r"\b(AC[0-9a-f]{32})\b", "low", confidence="medium", public_ok=True, keywords=None,
          note="An Account SID is an identifier, not a secret on its own — a finding only paired with the auth token."),
     # ---- infra / observability ----
     Rule("DigitalOcean access token", r"\b(doo_v1_[a-f0-9]{64})\b", "critical", group=1, keywords=("doo_v1_",)),
@@ -207,7 +207,7 @@ RULES: list[Rule] = [
          "critical", group=1, keywords=("secret_",)),
     Rule("Postman API key", r"\b(PMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34})\b", "high", group=1, keywords=("pmak-",)),
     Rule("Airtable personal access token", r"\b(pat[A-Za-z0-9]{14}\.[a-f0-9]{64})\b",
-         "critical", group=1, keywords=("pat",)),
+         "critical", group=1, keywords=None),
     Rule("Algolia Admin API key",
          r"(?i)algolia(?:[ \t\w.-]{0,20})['\"]?\s*[:=]\s*['\"]?([a-f0-9]{32})\b",
          "high", confidence="medium", group=1, keywords=("algolia",)),
@@ -234,6 +234,12 @@ RULES: list[Rule] = [
          r"(?i)authorization['\"]?\s*[:=]\s*['\"]?bearer\s+([A-Za-z0-9_\-\.=]{20,})",
          "high", confidence="medium", group=1, keywords=("bearer",), placeholder_check=True),
 ]
+
+# Every keyverify check must key off a real rule name, or its verify command is
+# dead code (a " (contextual)" suffix once orphaned Cloudflare/Heroku). Fail at
+# import if any check name drifts away from the rule it enriches.
+_orphan_checks = (set(keyverify._CHECKS) | set(keyverify.NO_SAFE_CHECK)) - {r.name for r in RULES}
+assert not _orphan_checks, f"keyverify checks with no matching rule: {sorted(_orphan_checks)}"
 
 # Keys that gate the entropy-checked generic assignment rule — if none of these
 # literals appear, the generic pattern (the most expensive one) is skipped.

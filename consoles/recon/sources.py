@@ -198,14 +198,14 @@ def _answers_of_type(name: str, rtype: str, type_num: int) -> tuple[int, bool]:
     return sum(1 for a in ans if a.get("type") == type_num), False
 
 
-def dnssec_status(d: str, dnskey_records: list | None = None) -> dict:
+def dnssec_status(d: str) -> dict:
     """Is the zone DNSSEC-signed?
 
     A real chain of trust needs BOTH a DNSKEY in the zone and a DS record at
     the parent. Both are queried here with a record-type filter rather than
-    trusting the caller's pre-extracted list, because that list is flattened to
-    bare strings by domain_scan and loses the type -- and an unfiltered answer
-    for a CNAME'd host reports "signed" for a zone that is not signed at all.
+    trusting a caller's pre-extracted list, because domain_scan flattens that
+    list to bare strings and loses the type -- and an unfiltered answer for a
+    CNAME'd host reports "signed" for a zone that is not signed at all.
     """
     dnskey_count, dnskey_unreachable = _answers_of_type(d, "DNSKEY", _DNS_TYPE_DNSKEY)
     ds_count, ds_unreachable = _answers_of_type(d, "DS", _DNS_TYPE_DS)

@@ -48,6 +48,10 @@ class HashType:
     # matched by length/charset and other types share that shape.
     exact: bool = False
     note: str = ""
+    # Optional post-match refiner: given the matched string, returns the real
+    # HashType to report, or None to reject the match and fall through. Lets a
+    # loose structural regex (e.g. the JWT triple) be confirmed by decoding.
+    check: Optional[Callable[[str], "Optional[HashType]"]] = None
 
 
 # --------------------------------------------------------------------------
@@ -154,7 +158,7 @@ _STRUCTURED: list[tuple[re.Pattern, HashType]] = [
     (re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"),
      HashType("JWT (JSON Web Token, HMAC signature)", 16500, "HMAC-SHA256",
               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", exact=True,
-              note="Only HS256/384/512 JWTs are crackable (shared secret). RS/ES use a private key — not brute-forceable here.")),
+              check=lambda s: _jwt_check(s))),
     (re.compile(rf"^grub\.pbkdf2\.sha512\."),
      HashType("GRUB2 PBKDF2-SHA512", 7200, None,
               "grub.pbkdf2.sha512.10000.salt.hash", exact=True)),
@@ -237,6 +241,27 @@ def _clean(raw: str) -> str:
     return (raw or "").strip()
 
 
+def _jwt_check(s: str) -> Optional[HashType]:
+    """Decode a candidate JWT and only claim it's crackable when the alg is
+    actually HMAC. Rejects arbitrary dotted base64url triples that aren't JWTs,
+    and reports asymmetric (RS/ES/PS) tokens as not brute-forceable."""
+    from consoles.redcell import keyverify
+    dec = keyverify.decode_jwt(s)
+    if dec is None:
+        return None
+    alg = str(dec["header"].get("alg", "")).upper()
+    if alg in ("HS256", "HS384", "HS512"):
+        return HashType("JWT (JSON Web Token, HMAC signature)", 16500, "HMAC-SHA256",
+                        s, exact=True,
+                        note=f"{alg}: HMAC-signed, crackable against the shared secret.")
+    if alg.startswith(("RS", "ES", "PS")):
+        return HashType(f"JWT (JSON Web Token, {alg} asymmetric) — not brute-forceable",
+                        None, None, s, exact=True,
+                        note=f"{alg} signatures need the issuer's private key; there is "
+                             "no shared secret to crack.")
+    return None  # 'none' alg or unknown — not a crackable JWT
+
+
 def identify(raw: str) -> list[dict]:
     """Return ranked candidate hash types for `raw`, best guess first.
 
@@ -253,6 +278,11 @@ def identify(raw: str) -> list[dict]:
     # 1) Structured — first specific match wins, returned alone and exact.
     for pat, ht in _STRUCTURED:
         if pat.match(s):
+            if ht.check is not None:
+                refined = ht.check(s)
+                if refined is None:
+                    continue  # loose regex matched but the value isn't really this type
+                ht = refined
             return [_as_dict(ht, ambiguous=not ht.exact)]
 
     # 2) Raw hex — length lookup, all candidates, ambiguous.

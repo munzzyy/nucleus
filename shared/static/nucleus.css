@@ -10,7 +10,7 @@
   --line-2: #2e3a4b;
   --txt: #d6dee8;
   --txt-dim: #8a97a8;
-  --txt-faint: #5b6675;
+  --txt-faint: #808d9e;
   --accent: #4db8ff;      /* nucleus blue */
   --recon: #7c5cff;       /* osint violet */
   --redcell: #ff5c72;     /* offensive red */
@@ -221,6 +221,11 @@ hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
    a clipped textarea can't reliably be selected, and selection is the whole
    mechanism of that fallback. */
 .copy-fallback { position: fixed; top: -1000px; left: 0; width: 1px; height: 1px; opacity: 0; }
+
+/* Click-to-copy discovered values. Kept subtle so it reads as text, not a button. */
+.copyable { cursor: copy; border-radius: 4px; }
+.copyable:hover { background: var(--bg-3); }
+.copyable:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Wrap any table that can outgrow its card in <div class="table-scroll"> so the
    table scrolls sideways inside the card instead of stretching the page. */

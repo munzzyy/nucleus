@@ -105,6 +105,7 @@
   }
 
   // ---- opsec / anonymity ---------------------------------------------
+  let anonPrevExposed = null;   // null until the first poll resolves
   async function loadAnonymity() {
     try {
       const j = await N.get("/api/anonymity");
@@ -125,6 +126,13 @@
            <div class="line">${N.esc(v.reason || "VPN active")} — exit <span class="mono">${N.esc(v.public_ip || "?")}</span>${where ? " (" + N.esc(where) + ")" : ""}.</div>
            <div class="line faint">Your real IP is not what targets see.</div>`;
       }
+      // Announce only on the false->true flip (not every poll, not first load)
+      // so a screen-reader user hears the moment their real IP becomes exposed.
+      if (v.exposed && anonPrevExposed === false) {
+        N.announce("EXPOSED — your real IP " + (v.public_ip || "") +
+          " is what any target you scan will see. Turn on your VPN before scanning.");
+      }
+      anonPrevExposed = !!v.exposed;
       document.getElementById("anon-grid").innerHTML = (j.checks || []).map(checkCard).join("");
       const recs = document.getElementById("anon-recs");
       recs.innerHTML = `<h2>What to have on</h2><ul class="rec-list">` +
@@ -374,6 +382,20 @@
     }
   }
 
+  // Cancel button for a live assessment, parked next to Assess and shown only
+  // while a report is running (mirrors the Run tab's cancel in redcell).
+  let reportAbort = null;
+  let reportCancelBtn = null;
+  function reportCancel() {
+    if (!reportCancelBtn) {
+      const btn = document.getElementById("report-run");
+      reportCancelBtn = N.el("button", { type: "button", class: "ghost hidden", id: "report-cancel", text: "Cancel" });
+      reportCancelBtn.addEventListener("click", () => { if (reportAbort) reportAbort.abort(); });
+      if (btn && btn.parentNode) btn.parentNode.insertBefore(reportCancelBtn, btn.nextSibling);
+    }
+    return reportCancelBtn;
+  }
+
   async function runReport() {
     const input = document.getElementById("report-domain");
     const domain = (input.value || "").trim();
@@ -381,16 +403,33 @@
     const btn = document.getElementById("report-run");
     const el = document.getElementById("report-result");
     btn.disabled = true;
-    el.replaceChildren(N.stateCard("loading", "assessing " + domain + "…"));
+    reportAbort = new AbortController();
+    reportCancel().classList.remove("hidden");
+    const card = N.stateCard("loading", "assessing " + domain + "…");
+    const msg = card.querySelector(".state-msg");
+    const started = Date.now();
+    el.replaceChildren(card);
+    const tick = setInterval(() => {
+      if (msg) msg.textContent = "assessing " + domain + "… " + ((Date.now() - started) / 1000).toFixed(0) + "s";
+    }, 500);
     try {
-      const j = await N.post("/api/report", { domain });
+      // No client deadline: the engine time-boxes each source itself, so Cancel
+      // is how the operator stops waiting rather than a premature timeout.
+      const j = await N.post("/api/report", { domain }, { signal: reportAbort.signal, timeout: 0 });
       renderReport(j);
       lastDomainStore.set(domain);
       writeHashDomain(domain);
     } catch (e) {
-      el.replaceChildren(N.stateCard("error", "assessment failed: " + e.message));
-      N.toast("assessment failed", "bad");
+      if (N.isAbort(e)) {
+        el.replaceChildren(N.stateCard("empty", "assessment canceled"));
+      } else {
+        el.replaceChildren(N.stateCard("error", "assessment failed: " + e.message));
+        N.toast("assessment failed", "bad");
+      }
     } finally {
+      clearInterval(tick);
+      reportCancel().classList.add("hidden");
+      reportAbort = null;
       btn.disabled = false;
     }
   }

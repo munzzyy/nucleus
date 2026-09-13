@@ -1068,6 +1068,26 @@ class BodyLimitTests(unittest.TestCase):
         app = common.App(slug="unit-test-app", static_dir=Path("."), routes={})
         self.assertEqual(app.body_limits, {})
 
+    def test_negative_content_length_is_treated_as_empty(self):
+        # A negative Content-Length is malformed; the server clamps to 0 and
+        # handles it gracefully instead of desyncing the socket.
+        self.assertEqual(self._post_declared("/api/small", -5), 200)
+
+    def test_chunked_body_is_refused(self):
+        # Bodies are sized by Content-Length; a chunked request would read as
+        # empty, so it's refused with 400 and the connection closed.
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            req = (f"POST /api/small HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                   f"Origin: http://127.0.0.1:{self.port}\r\n"
+                   "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n"
+                   "3\r\nabc\r\n0\r\n\r\n")
+            c.sendall(req.encode())
+            status_line = c.recv(4096).decode("latin1").split("\r\n", 1)[0]
+        finally:
+            c.close()
+        self.assertIn("400", status_line)
+
 
 class TlsCertRebindTests(unittest.TestCase):
     """_tls_cert must connect to a resolved-and-validated IP, never re-resolve
@@ -5326,6 +5346,495 @@ class ScrubRiskClassifyTests(unittest.TestCase):
         s = scrub.risk_summary(residual)
         self.assertEqual(s["sensitive_count"], 0,
                          f"a cleaned video must read as privacy-clean; flagged: {s['sensitive_keys']}")
+
+
+from consoles.devkit import tools as devkit_tools  # noqa: E402
+from consoles.redcell import hashtools as _hashtools  # noqa: E402
+from consoles.redcell import keyverify as _keyverify  # noqa: E402
+from consoles.redcell import secretscan as _secretscan  # noqa: E402
+
+
+class ColorPercentTests(unittest.TestCase):
+    def test_rgb_percentage_channels(self):
+        r = devkit_tools.color_convert("rgb(100%,50%,0%)")
+        self.assertEqual(r["hex"], "#ff8000")
+
+    def test_rgb_percentage_alpha(self):
+        self.assertEqual(devkit_tools.color_convert("rgba(255,0,0,50%)")["alpha"], 0.5)
+
+    def test_color4_space_slash_alpha(self):
+        r = devkit_tools.color_convert("rgb(255 0 0 / 50%)")
+        self.assertEqual((r["r"], r["g"], r["b"]), (255, 0, 0))
+        self.assertEqual(r["alpha"], 0.5)
+
+    def test_hsl_percentage_alpha(self):
+        self.assertEqual(devkit_tools.color_convert("hsla(120,50%,50%,50%)")["alpha"], 0.5)
+
+
+class CronNamesAndMacrosTests(unittest.TestCase):
+    def test_named_days_of_week(self):
+        r = devkit_tools.cron_next("0 9 * * MON-FRI", count=3)
+        self.assertEqual(len(r["next"]), 3)
+
+    def test_named_month(self):
+        r = devkit_tools.cron_next("0 0 1 JAN *", count=2)
+        self.assertEqual(len(r["next"]), 2)
+
+    def test_macro_daily(self):
+        r = devkit_tools.cron_next("@daily", count=3)
+        self.assertEqual(len(r["next"]), 3)
+
+    def test_reboot_macro_rejected_cleanly(self):
+        with self.assertRaises(ValueError):
+            devkit_tools.cron_next("@reboot")
+
+    def test_horizon_reached_flag(self):
+        r = devkit_tools.cron_next("0 0 29 2 *", count=5)
+        self.assertTrue(r["horizon_reached"])
+        self.assertLess(r["count"], 5)
+
+
+class HashShakeTests(unittest.TestCase):
+    def test_hash_text_rejects_shake(self):
+        with self.assertRaises(ValueError) as cm:
+            devkit_tools.hash_text("x", algo="shake_128")
+        self.assertIn("unsupported", str(cm.exception).lower())
+
+    def test_hmac_rejects_shake(self):
+        with self.assertRaises(ValueError) as cm:
+            devkit_tools.hmac_digest("x", "k", algo="shake_256")
+        self.assertIn("unsupported", str(cm.exception).lower())
+
+
+# A real HS256 and RS256 token (unsigned/dummy sigs — decode only reads header).
+_HS256_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+_RS256_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij"
+
+
+class HashJwtRefineTests(unittest.TestCase):
+    def test_garbage_triple_is_not_a_jwt(self):
+        for junk in ("foo.bar.baz", "abc.def.ghijklmnop"):
+            names = [c["name"] for c in _hashtools.identify(junk)]
+            self.assertFalse(any("JWT" in n for n in names), junk)
+
+    def test_hs256_is_crackable(self):
+        c = _hashtools.identify(_HS256_JWT)[0]
+        self.assertEqual(c["hashcat"], 16500)
+        self.assertIn("HMAC", c["name"])
+
+    def test_rs256_not_bruteforceable(self):
+        c = _hashtools.identify(_RS256_JWT)[0]
+        self.assertIsNone(c["hashcat"])
+        self.assertIn("not brute-forceable", c["name"])
+
+
+class KeyverifyRuleNameTests(unittest.TestCase):
+    def test_cloudflare_and_heroku_reachable(self):
+        for rule in ("Cloudflare API token", "Heroku API key"):
+            cmd = _keyverify.build_command(rule, "x" * 40)
+            self.assertIsNotNone(cmd, rule)
+
+    def test_no_orphan_checks(self):
+        rule_names = {r.name for r in _secretscan.RULES}
+        orphans = (set(_keyverify._CHECKS) | set(_keyverify.NO_SAFE_CHECK)) - rule_names
+        self.assertEqual(orphans, set())
+
+
+class SecretscanKeywordTests(unittest.TestCase):
+    def test_nondistinctive_keywords_disabled(self):
+        by_name = {r.name: r for r in _secretscan.RULES}
+        for name in ("Twilio API Key SID", "Twilio Account SID", "Airtable personal access token"):
+            self.assertIsNone(by_name[name].keywords, name)
+
+
+class GeoNoCleartextTests(unittest.TestCase):
+    def test_no_http_fallback(self):
+        calls = []
+
+        def fake_fetch(url, **kw):
+            calls.append(url)
+            return 429, b"", {}, "rate limited"  # ipwho.is fails -> old code hit http://
+
+        with mock.patch.object(lookups, "_safe_fetch", fake_fetch):
+            out = lookups._geo_lookup("8.8.8.8")
+        self.assertIsNone(out)
+        self.assertTrue(all(u.startswith("https://") for u in calls), calls)
+        self.assertFalse(any("ip-api.com" in u for u in calls), calls)
+
+
+class DnssecStatusSignatureTests(unittest.TestCase):
+    def test_second_arg_rejected(self):
+        with self.assertRaises(TypeError):
+            recon_sources.dnssec_status("example.com", ["dnskey"])
+
+
+class EmailScanXposedTests(unittest.TestCase):
+    def test_no_redundant_check_email_call(self):
+        analytics = {
+            "BreachMetrics": {"risk": [{"risk_label": "High", "risk_score": 5}]},
+            "ExposedBreaches": {"breaches_details": [
+                {"breach": "Acme", "domain": "acme.com", "xposed_date": "2020",
+                 "xposed_records": 100, "password_risk": "plaintext",
+                 "xposed_data": "Email;Passwords", "verified": True}]},
+            "ExposedPastes": [],
+        }
+        calls = []
+
+        def fake_fetch(url, **kw):
+            calls.append(url)
+            if "breach-analytics" in url:
+                return 200, json.dumps(analytics).encode(), {}, None
+            return None, b"", {}, "should not be called"
+
+        with mock.patch.object(lookups, "_safe_fetch", fake_fetch), \
+             mock.patch.object(lookups, "_dns_query_ex", lambda *a, **k: ([], False)), \
+             mock.patch.object(lookups, "_leakcheck_lookup", lambda e: {"ok": True}), \
+             mock.patch.object(lookups.apikeys, "get_key", lambda k: None), \
+             mock.patch.object(lookups.sources, "gravatar_profile", lambda e: {"exists": False}), \
+             mock.patch.object(lookups.sources, "hudsonrock_email", lambda e: {"ok": True}):
+            r = lookups.email_scan("a@acme.com")
+        self.assertFalse(any("check-email" in u for u in calls), calls)
+        self.assertTrue(r["breach_check"]["breached"])
+        self.assertEqual(r["breach_check"]["breaches"], ["Acme"])
+
+
+class HistoryTrimSlackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+        self.tmp.close()
+        self.path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.path.unlink(missing_ok=True)
+
+    def test_trim_only_past_slack(self):
+        with mock.patch.object(lookups, "HISTORY_FILE", self.path), \
+             mock.patch.object(lookups, "HISTORY_MAX", 3), \
+             mock.patch.object(lookups, "_HISTORY_TRIM_SLACK", 2), \
+             mock.patch.object(lookups.common, "LOGGING_ENABLED", True):
+            for i in range(5):  # 5 <= MAX(3)+SLACK(2), so no trim yet
+                lookups.log_scan("username", f"u{i}", {"ok": True})
+            self.assertEqual(len(self.path.read_text().splitlines()), 5)
+            lookups.log_scan("username", "u5", {"ok": True})  # 6 > 5 -> trim to MAX
+            self.assertEqual(len(self.path.read_text().splitlines()), 3)
+
+    def test_history_list_newest_first(self):
+        with mock.patch.object(lookups, "HISTORY_FILE", self.path), \
+             mock.patch.object(lookups.common, "LOGGING_ENABLED", True):
+            for i in range(4):
+                lookups.log_scan("username", f"u{i}", {"ok": True})
+            rows = lookups.history_list(limit=2)
+        self.assertEqual([r["q"] for r in rows], ["u3", "u2"])
+
+
+def _canned_dns(mapping):
+    def fn(name, rtype, timeout=None):
+        return mapping.get((name, rtype), ([], False))
+    return fn
+
+
+class DomainScanParallelTests(unittest.TestCase):
+    def _run(self):
+        dns_map = {
+            ("acme.com", "A"): ([{"data": "1.2.3.4"}], False),
+            ("acme.com", "TXT"): ([{"data": "v=spf1 -all"}], False),
+            ("_dmarc.acme.com", "TXT"): ([{"data": "v=DMARC1; p=reject"}], False),
+            ("acme.com", "MX"): ([], True),  # unreachable -> stays in dns_unreachable
+        }
+
+        def fake_fetch(url, **kw):
+            if "rdap.org/domain" in url:
+                return 200, json.dumps({"handle": "H1", "status": ["active"], "entities": [
+                    {"roles": ["registrar"], "vcardArray": ["vcard", [["fn", {}, "text", "RegCo"]]]}],
+                    "events": []}).encode(), {}, None
+            if "crt.sh" in url:
+                return 200, json.dumps([{"name_value": "a.acme.com\nacme.com"}]).encode(), {}, None
+            if "hackertarget" in url:
+                return 200, b"b.acme.com,5.6.7.8", {}, None
+            if "urlscan.io" in url:
+                return 200, json.dumps({"results": [{"page": {"url": "http://acme.com", "ip": "1.2.3.4"},
+                                                     "task": {"time": "t"}, "screenshot": "s"}]}).encode(), {}, None
+            if "otx.alienvault.com" in url:
+                return 200, json.dumps({"pulse_info": {"count": 2, "pulses": [{"name": "P1"}]}}).encode(), {}, None
+            if "archive.org/wayback" in url:
+                return 200, json.dumps({"archived_snapshots": {"closest": {"url": "u", "timestamp": "20200101"}}}).encode(), {}, None
+            if "internetdb.shodan.io" in url:
+                return 200, json.dumps({"ports": [80], "vulns": [], "hostnames": [], "tags": []}).encode(), {}, None
+            if url.startswith("https://acme.com") or url.startswith("http://acme.com"):
+                return 200, b"<html></html>", {"Server": "nginx"}, None
+            return None, b"", {}, "unrouted"
+
+        with mock.patch.object(lookups, "_safe_fetch", fake_fetch), \
+             mock.patch.object(lookups, "_dns_query_ex", _canned_dns(dns_map)), \
+             mock.patch.object(lookups, "_geo_lookup", lambda ip: {"country": "US", "source": "ipwho.is"}), \
+             mock.patch.object(lookups.apikeys, "get_key", lambda k: None), \
+             mock.patch.object(lookups.sources, "certspotter_subdomains", lambda d: ({"c.acme.com"}, None)), \
+             mock.patch.object(lookups.sources, "rapiddns_subdomains", lambda d: (set(), None)), \
+             mock.patch.object(lookups.sources, "wayback_urls", lambda d: {"ok": True, "count": 0, "urls": [], "subdomains": []}), \
+             mock.patch.object(lookups.sources, "hudsonrock_domain", lambda d: {"ok": True}), \
+             mock.patch.object(lookups.sources, "dnssec_status", lambda d: {"signed": True, "dnskey_present": True,
+                    "dnskey_count": 1, "ds_present": True, "ds_count": 1, "unreachable": False, "note": None}):
+            return lookups.domain_scan("acme.com")
+
+    def test_output_shape_and_content(self):
+        r = self._run()
+        self.assertEqual(r["dns"]["A"], ["1.2.3.4"])
+        self.assertIn("MX", r["dns_unreachable"])
+        self.assertTrue(r["dnssec"]["signed"])
+        self.assertEqual(r["whois"]["registrar"], "RegCo")
+        # merged from crt.sh (a.acme.com, acme.com), hackertarget (b), certspotter (c)
+        self.assertEqual(set(r["subdomains"]["names"]),
+                         {"a.acme.com", "acme.com", "b.acme.com", "c.acme.com"})
+        self.assertEqual(r["urlscan"]["count"], 1)
+        self.assertEqual(r["otx"]["pulse_count"], 2)
+        self.assertTrue(r["wayback"]["archived"])
+        self.assertTrue(r["email_posture"]["spf_present"])
+        self.assertTrue(r["email_posture"]["dmarc_present"])
+        self.assertEqual(r["http"]["server"], "nginx")
+        self.assertEqual(r["hosting"]["ip"], "1.2.3.4")
+        self.assertEqual(r["hosting"]["ports"], [80])
+        self.assertEqual(r["hosting"]["geo"]["country"], "US")
+        # HudsonRock domain infostealer must be submitted AND collected — the
+        # parallelization refactor dropped the submit and this went silently to
+        # an error dict (regression guard).
+        self.assertTrue(r["infostealer"]["ok"])
+
+    def test_runs_concurrently(self):
+        # Each mocked lookup sleeps; serial would stack to >2s, parallel must not.
+        def slow_fetch(url, **kw):
+            time.sleep(0.12)
+            return None, b"", {}, "x"
+
+        def slow_dns(name, rtype, timeout=None):
+            time.sleep(0.12)
+            return [], False
+
+        with mock.patch.object(lookups, "_safe_fetch", slow_fetch), \
+             mock.patch.object(lookups, "_dns_query_ex", slow_dns), \
+             mock.patch.object(lookups, "_geo_lookup", lambda ip: None), \
+             mock.patch.object(lookups.apikeys, "get_key", lambda k: None), \
+             mock.patch.object(lookups.sources, "certspotter_subdomains", lambda d: (set(), None)), \
+             mock.patch.object(lookups.sources, "rapiddns_subdomains", lambda d: (set(), None)), \
+             mock.patch.object(lookups.sources, "wayback_urls", lambda d: {"ok": True, "subdomains": []}), \
+             mock.patch.object(lookups.sources, "hudsonrock_domain", lambda d: {"ok": True}), \
+             mock.patch.object(lookups.sources, "dnssec_status", lambda d: {"signed": False}):
+            t0 = time.time()
+            lookups.domain_scan("acme.com")
+            elapsed = time.time() - t0
+        # ~10 DNS + ~7 HTTP serial would be >2.0s; the live HTTP probe is 2 serial
+        # sleeps (~0.24s) plus one parallel wave. Generous ceiling to avoid flake.
+        self.assertLess(elapsed, 1.5, f"scan not parallel: {elapsed:.2f}s")
+
+
+class IpScanParallelTests(unittest.TestCase):
+    def test_output_and_concurrency(self):
+        def fake_fetch(url, **kw):
+            if "internetdb.shodan.io" in url:
+                return 200, json.dumps({"ports": [22], "vulns": ["CVE-1"], "hostnames": [], "tags": [], "cpes": []}).encode(), {}, None
+            if "rdap.org/ip" in url:
+                return 200, json.dumps({"startAddress": "8.8.8.0", "name": "GOOGLE"}).encode(), {}, None
+            if "onionoo" in url:
+                return 200, json.dumps({"relays": []}).encode(), {}, None
+            if "otx.alienvault.com" in url:
+                return 200, json.dumps({"pulse_info": {"count": 0, "pulses": []}}).encode(), {}, None
+            return None, b"", {}, "unrouted"
+
+        with mock.patch.object(lookups, "_safe_fetch", fake_fetch), \
+             mock.patch.object(lookups, "_dns_query_ex", lambda *a, **k: ([{"data": "dns.google."}], False)), \
+             mock.patch.object(lookups, "_geo_lookup", lambda ip: {"country": "US", "source": "ipwho.is"}), \
+             mock.patch.object(lookups.apikeys, "get_key", lambda k: None):
+            r = lookups.ip_scan("8.8.8.8")
+        self.assertEqual(r["internetdb"]["ports"], [22])
+        self.assertEqual(r["rdap"]["name"], "GOOGLE")
+        self.assertFalse(r["tor"]["is_relay"])
+        self.assertEqual(r["geo"]["country"], "US")
+        self.assertEqual(r["reverse_dns"]["hostname"], "dns.google")
+
+    def test_ip_scan_parallel_timing(self):
+        def slow_fetch(url, **kw):
+            time.sleep(0.15)
+            return None, b"", {}, "x"
+
+        with mock.patch.object(lookups, "_safe_fetch", slow_fetch), \
+             mock.patch.object(lookups, "_dns_query_ex", lambda *a, **k: (time.sleep(0.15), ([], True))[1]), \
+             mock.patch.object(lookups, "_geo_lookup", lambda ip: (time.sleep(0.15), None)[1]), \
+             mock.patch.object(lookups.apikeys, "get_key", lambda k: None), \
+             mock.patch.object(lookups.sources, "ripestat_ip", lambda ip: {"ok": True}), \
+             mock.patch.object(lookups.sources, "isc_ip", lambda ip: {"ok": True}):
+            t0 = time.time()
+            lookups.ip_scan("8.8.8.8")
+            elapsed = time.time() - t0
+        # 6 lookups serial would be ~0.9s; parallel must be well under.
+        self.assertLess(elapsed, 0.6, f"ip_scan not parallel: {elapsed:.2f}s")
+
+
+# ==========================================================================
+# Phase-B core fixes — regression tests
+# ==========================================================================
+class SsrfEmbeddedIpv4Tests(unittest.TestCase):
+    """_ip_is_public judges 6to4 / NAT64 / IPv4-mapped IPv6 by their embedded
+    IPv4 target, so the SSRF floor is the same on every interpreter version
+    (pre-3.13 CPython classified some of these as public)."""
+
+    def _pub(self, s):
+        import ipaddress
+        return common._ip_is_public(ipaddress.ip_address(s))
+
+    def test_tunneled_private_targets_refused(self):
+        for s in ("2002:7f00:0001::", "2002:a9fe:a9fe::", "2002:0a00:0001::",
+                  "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "::ffff:127.0.0.1",
+                  "::ffff:169.254.169.254", "::ffff:10.0.0.1"):
+            with self.subTest(addr=s):
+                self.assertFalse(self._pub(s))
+
+    def test_tunneled_public_target_allowed(self):
+        self.assertTrue(self._pub("2002:0808:0808::"))  # 6to4 wrapping 8.8.8.8
+
+    def test_plain_addresses_unchanged(self):
+        self.assertTrue(self._pub("8.8.8.8"))
+        self.assertTrue(self._pub("2606:4700:4700::1111"))
+        self.assertFalse(self._pub("127.0.0.1"))
+        self.assertFalse(self._pub("169.254.169.254"))
+
+
+class DnsQueryStrictTests(unittest.TestCase):
+    """dns_query(strict=True) tells a transport failure apart from an empty
+    answer: DNSUnavailable only when no endpoint answered; a valid 200 with no
+    records is a definitive empty result, not a failure."""
+
+    def test_all_endpoints_fail_raises_only_in_strict(self):
+        with mock.patch.object(common, "fetch", return_value=(503, b"", {})):
+            self.assertEqual(common.dns_query("x.test", "A"), [])
+            with self.assertRaises(common.DNSUnavailable):
+                common.dns_query("x.test", "A", strict=True)
+
+    def test_valid_empty_answer_is_not_a_failure(self):
+        with mock.patch.object(common, "fetch", return_value=(200, b'{"Status":0}', {})):
+            self.assertEqual(common.dns_query("x.test", "A", strict=True), [])
+
+    def test_answer_returned(self):
+        body = b'{"Status":0,"Answer":[{"data":"1.2.3.4"}]}'
+        with mock.patch.object(common, "fetch", return_value=(200, body, {})):
+            self.assertEqual(common.dns_query("x.test", "A", strict=True), [{"data": "1.2.3.4"}])
+
+
+class ReportDnsOutageTests(unittest.TestCase):
+    """A DNS/DoH outage must EXCLUDE the affected signal from both score and
+    max (like the attack-surface source-outage rule), not deflate the grade
+    and emit fabricated 'record missing' findings."""
+
+    def test_checks_flag_unavailable_on_outage(self):
+        with mock.patch.object(report, "_dns", side_effect=common.DNSUnavailable("down")):
+            self.assertFalse(report._check_spf("x.test")["available"])
+            self.assertFalse(report._check_dmarc("x.test")["available"])
+            self.assertFalse(report._check_caa("x.test")["available"])
+            self.assertFalse(report._check_dnssec("x.test")["available"])
+
+    def test_scorers_exclude_unavailable_from_max(self):
+        spf = {"present": False, "record": None, "valid": False, "qualifier": None, "available": False}
+        dmarc = {"present": False, "record": None, "policy": None, "available": False}
+        pts, mx, findings = report._score_email(spf, dmarc, {"found": False}, mx_present=False)
+        self.assertEqual((pts, mx), (0, 0))  # excluded, not 0/30
+        self.assertFalse(any(f["title"].startswith("No SPF") or f["title"].startswith("No DMARC")
+                             for f in findings))
+        self.assertEqual(report._score_caa({"present": False, "records": [], "available": False})[:2], (0, 0))
+        self.assertEqual(report._score_dnssec({"present": False, "available": False})[:2], (0, 0))
+
+    def test_available_signals_still_scored(self):
+        spf = {"present": False, "record": None, "valid": False, "qualifier": None, "available": True}
+        dmarc = {"present": False, "record": None, "policy": None, "available": True}
+        _pts, mx, _f = report._score_email(spf, dmarc, {"found": False}, mx_present=True)
+        self.assertEqual(mx, 30)  # reachable-but-absent still costs its slice
+
+
+class SpfBareAllTests(unittest.TestCase):
+    """A record ending in a bare `all` defaults to +all per RFC 7208 and must
+    grade HIGH, not as a benign 'no qualifier'."""
+
+    def test_bare_all_is_plus_and_high(self):
+        with mock.patch.object(report, "_txt_values", return_value=["v=spf1 ip4:1.2.3.4 all"]):
+            spf = report._check_spf("x.test")
+        self.assertEqual(spf["qualifier"], "+")
+        self.assertFalse(spf["valid"])
+        dmarc = {"present": True, "policy": "reject", "available": True}
+        _pts, _mx, findings = report._score_email(spf, dmarc, {"found": False}, mx_present=True)
+        self.assertTrue(any(f["severity"] == "high" and "+all" in f["title"] for f in findings))
+
+    def test_no_all_stays_none(self):
+        with mock.patch.object(report, "_txt_values", return_value=["v=spf1 ip4:1.2.3.4"]):
+            self.assertIsNone(report._check_spf("x.test")["qualifier"])
+
+    def test_all_inside_mechanism_not_matched(self):
+        # `-all` inside `include:example-all` must NOT read as a hard-fail all
+        # mechanism (the naive [-~?+]all$ regex captured the `-` and scored it).
+        with mock.patch.object(report, "_txt_values", return_value=["v=spf1 include:example-all"]):
+            self.assertIsNone(report._check_spf("x.test")["qualifier"])
+
+    def test_explicit_qualifier_unchanged(self):
+        with mock.patch.object(report, "_txt_values", return_value=["v=spf1 -all"]):
+            self.assertEqual(report._check_spf("x.test")["qualifier"], "-")
+
+
+class MarkdownFindingInjectionTests(unittest.TestCase):
+    """Finding title/recommendation are neutralized in the Markdown render, so
+    source data in a finding can't inject headings or links into a client .md."""
+
+    def _report(self, rec):
+        return {"domain": "x.test", "generated_at": "t", "grade": "A", "score_pct": 90,
+                "findings": [{"severity": "high", "title": "t", "recommendation": rec}],
+                "dns": {"A": [], "AAAA": [], "MX": [], "NS": []},
+                "email_security": {"spf": {"present": False}, "dmarc": {"present": False},
+                                   "dkim_hint": {"found": False}, "mx_present": False,
+                                   "mtasts": None, "tlsrpt": None},
+                "web": {"https": {"ok": True, "status": 200}, "http": {},
+                        "redirects_to_https": True, "banner": {}, "tls": {"ok": False, "error": "x"},
+                        "caa": {"present": False}, "security_txt": {"present": False}},
+                "attack_surface": {"apex_ip": None, "subdomains": {}, "shodan_internetdb": {},
+                                   "dnssec": {"present": False}}}
+
+    def test_injection_is_neutralized(self):
+        md = report.render_markdown(self._report("CVE-1\n\n## INJECTED\n[x](javascript:alert(1))"))
+        self.assertNotIn("\n## INJECTED", md)   # newlines flattened -> no injected heading line
+        self.assertNotIn("[x](", md)            # bracket link broken
+        self.assertNotIn("](javascript:", md)   # no working js link anywhere
+
+
+class RebindFailClosedTests(unittest.TestCase):
+    """Step 8 fails CLOSED for any non-IP-pinned runner: a runner in neither
+    rebind set still re-verifies still-public before spawn."""
+
+    def test_sets_cover_exactly_safe_runners(self):
+        self.assertEqual(set(runners.SAFE_RUNNERS),
+                         runners._REBIND_IP_PIN | runners._REBIND_RECHECK)
+        self.assertFalse(runners._REBIND_IP_PIN & runners._REBIND_RECHECK)
+
+    def test_fallback_rechecks_even_when_not_in_recheck_set(self):
+        # Empty _REBIND_RECHECK puts a normally-rechecked runner in NEITHER set.
+        # Old code (elif tool in _REBIND_RECHECK) skipped step 8 -> fail OPEN;
+        # the fix (elif not lab) must still refuse a now-private target.
+        body = {"tool": "whois", "target": "example.com", "authorized": True}
+        with mock.patch.object(runners, "_REBIND_RECHECK", set()), \
+             mock.patch.object(runners.common, "host_is_public", return_value=True), \
+             mock.patch.object(runners, "opsec_gate", return_value=None), \
+             mock.patch.object(runners, "_resolve_options", return_value=({}, None)), \
+             mock.patch.object(runners.common, "which", return_value="/usr/bin/whois"), \
+             mock.patch.object(runners.common, "run_tool", return_value=None), \
+             mock.patch.object(runners, "_resolve_public_ips_safe", return_value=[]):
+            resp = runners.handle_run(_StressReq(body))
+        self.assertEqual(resp.status, 403)
+        self.assertIn("no longer resolves", json.loads(resp.body)["error"])
+
+
+class PostAndTimeoutRobustnessTests(unittest.TestCase):
+    """run_tool preserves partial stderr on timeout."""
+
+    def test_timeout_keeps_stderr(self):
+        r = common.run_tool(
+            ["python3", "-c",
+             "import sys,time;sys.stderr.write('partial');sys.stderr.flush();time.sleep(5)"],
+            timeout=0.6)
+        self.assertTrue(r.timed_out)
+        self.assertIn("partial", r.stderr)
 
 
 if __name__ == "__main__":
