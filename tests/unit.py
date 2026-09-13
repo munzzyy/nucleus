@@ -49,6 +49,8 @@ from consoles.recon import phonedata as recon_phonedata
 from consoles.recon import lookups
 from shared import common
 from shared import apikeys
+from shared import findings
+from shared import engagement
 from engine import osint_report as report
 from consoles.redcell import runners
 from consoles.redcell import builder as redcell_builder
@@ -6249,6 +6251,87 @@ class NucleusCliTests(unittest.TestCase):
                 rc = self.cli.cmd_wipe(mock.Mock(yes=False))
         self.assertEqual(rc, 1)
         self.assertTrue((repo / "var" / "redcell-out" / "out.txt").exists())  # untouched
+
+
+class FindingsModuleTests(unittest.TestCase):
+    """shared/findings.py — normalize, roll up, export, and parse tool output."""
+
+    def test_rollup_and_summary(self):
+        fs = [findings.finding("high", "a"), findings.finding("weird", "b"), findings.finding("info", "c")]
+        r = findings.roll_up(fs)
+        self.assertEqual((r["high"], r["info"], r["total"]), (1, 2, 3))  # 'weird' -> info
+        self.assertEqual(findings.summary_line(fs), "1 high, 2 info")
+
+    def test_csv_and_markdown(self):
+        fs = [findings.finding("high", "SQLi", "x.test", "param id", "sqlmap")]
+        self.assertEqual(findings.to_csv(fs).splitlines()[0], "severity,title,host,evidence,tool")
+        self.assertIn("SQLi", findings.to_markdown(fs))
+
+    def test_parse_nuclei_and_nmap(self):
+        n = findings.parse_nuclei_jsonl('{"info":{"severity":"high","name":"CVE"},"matched-at":"h:443","template-id":"t"}')
+        self.assertEqual((n[0]["severity"], n[0]["host"], n[0]["tool"]), ("high", "h:443", "nuclei"))
+        ports = findings.parse_nmap_grepable("22/tcp open ssh\n443/tcp closed\n80/tcp open http")
+        self.assertEqual(len(ports), 2)  # only the open ports
+        self.assertTrue(findings.parse_nuclei_jsonl("not json\n") == [])  # malformed skipped, no raise
+
+
+class EngagementModelTests(unittest.TestCase):
+    """shared/engagement.py — case model + scope matching (the gate allowlist)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = Path(self._tmp.name)
+        for attr, val in (("_DIR", d), ("_ACTIVE", d / "_active")):
+            p = mock.patch.object(engagement, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_create_activate_scope_roundtrip(self):
+        e = engagement.create("Acme Q4", ["example.com"])
+        self.assertEqual(e["slug"], "acme-q4")
+        self.assertEqual(engagement.active()["slug"], "acme-q4")
+        engagement.add_scope("acme-q4", "10.0.0.0/24")
+        self.assertIn("10.0.0.0/24", engagement.get("acme-q4")["scope"])
+        engagement.add_finding("acme-q4", findings.finding("high", "SQLi", "x.example.com"))
+        engagement.add_event("acme-q4", "recon", "x.example.com", "scanned")
+        e2 = engagement.get("acme-q4")
+        self.assertEqual(len(e2["findings"]), 1)
+        self.assertEqual(len(e2["events"]), 1)
+        md = engagement.export_markdown(e2)
+        self.assertIn("Acme Q4", md)
+        self.assertIn("example.com", md)
+
+    def test_scope_matching_is_fail_safe(self):
+        self.assertTrue(engagement.in_scope("app.example.com", ["example.com"]))
+        self.assertFalse(engagement.in_scope("notexample.com", ["example.com"]))
+        self.assertTrue(engagement.in_scope("10.0.0.5", ["10.0.0.0/24"]))
+        self.assertFalse(engagement.in_scope("10.0.1.5", ["10.0.0.0/24"]))
+        self.assertFalse(engagement.in_scope("anything", []))  # empty scope never allow-all
+
+
+class EngagementScopeGateTests(unittest.TestCase):
+    """An active engagement's scope turns the redcell gate into a real allowlist."""
+
+    def test_public_target_out_of_scope_refused(self):
+        eng = {"slug": "acme", "name": "Acme", "scope": ["example.com"]}
+        with mock.patch.object(runners.common, "host_is_public", return_value=True), \
+             mock.patch.object(runners.engagement, "active", return_value=eng):
+            ok, reason = runners.scope_check("evil.com", lab=False)
+            self.assertFalse(ok)
+            self.assertIn("scope", reason)
+            self.assertTrue(runners.scope_check("app.example.com", lab=False)[0])
+
+    def test_no_active_engagement_leaves_gate_unchanged(self):
+        with mock.patch.object(runners.common, "host_is_public", return_value=True), \
+             mock.patch.object(runners.engagement, "active", return_value=None):
+            self.assertTrue(runners.scope_check("anything.com", lab=False)[0])
+
+    def test_active_without_scope_allows(self):
+        with mock.patch.object(runners.common, "host_is_public", return_value=True), \
+             mock.patch.object(runners.engagement, "active",
+                               return_value={"slug": "x", "name": "x", "scope": []}):
+            self.assertTrue(runners.scope_check("anything.com", lab=False)[0])
 
 
 if __name__ == "__main__":

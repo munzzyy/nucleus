@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from shared import common, apikeys
+from shared import common, apikeys, engagement
 from consoles.redcell import wordlists
 
 MAX_OUTPUT = 200_000          # chars kept per stream; degrades gracefully past this
@@ -171,6 +171,15 @@ def scope_check(host: str, lab: bool) -> tuple[bool, str]:
     window as much as a Python-level check can.
     """
     if common.host_is_public(host):
+        # If an engagement with a scope is active, it becomes a real allowlist:
+        # a public target outside the scope is refused. No active scope -> the
+        # public check alone decides (unchanged). Fail-safe: a target that isn't
+        # clearly in scope is refused, not allowed.
+        eng = engagement.active()
+        if eng and eng.get("scope") and not engagement.in_scope(host, eng["scope"]):
+            return False, (f"'{host}' is outside the active engagement scope "
+                           f"({eng.get('name') or eng.get('slug')}). Add it to the engagement's "
+                           "scope, or clear the active engagement, to run against it.")
         return True, ""
     if lab:
         return True, "lab-scope override"
