@@ -620,7 +620,8 @@
         const li = N.el("li");
         const when = ev.at || ev.time || ev.ts || "";
         if (when) li.appendChild(N.el("span", { class: "faint small eng-when", text: String(when) }));
-        li.appendChild(N.el("span", { text: (ev.kind || ev.type || "event") + (ev.detail ? " — " + ev.detail : (ev.message ? " — " + ev.message : "")) }));
+        const detail = [ev.target, ev.summary].filter(Boolean).join(" — ");
+        li.appendChild(N.el("span", { text: (ev.kind || ev.type || "event") + (detail ? " — " + detail : "") }));
         ul.appendChild(li);
       });
       card.appendChild(ul);

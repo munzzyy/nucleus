@@ -151,7 +151,14 @@ def _entry_matches(target: str, entry: str) -> bool:
             return False  # entry is a network, target is a hostname -> no match
     except ValueError:
         pass
-    # Hostname/domain entry: exact, or target is a subdomain of it.
+    # Hostname/domain entry. An IP target must NEVER be matched against a domain
+    # string — a malformed entry like '168.1.1' would otherwise suffix-match
+    # 192.168.1.1 and widen the allowlist to an out-of-scope address.
+    try:
+        ipaddress.ip_address(target)
+        return False
+    except ValueError:
+        pass
     return target == entry or target.endswith("." + entry)
 
 

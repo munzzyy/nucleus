@@ -170,16 +170,16 @@ def scope_check(host: str, lab: bool) -> tuple[bool, str]:
     before spawn (pin or re-verify, depending on the runner) to shrink that
     window as much as a Python-level check can.
     """
+    # An active engagement's scope is a real allowlist and governs EVERY target,
+    # public or lab: a target outside it is refused before anything else, so lab
+    # mode can't sidestep the scope. No active scope -> the public/lab check
+    # alone decides (unchanged). Fail-safe: not clearly in scope means refused.
+    eng = engagement.active()
+    if eng and eng.get("scope") and not engagement.in_scope(host, eng["scope"]):
+        return False, (f"'{host}' is outside the active engagement scope "
+                       f"({eng.get('name') or eng.get('slug')}). Add it to the engagement's "
+                       "scope, or clear the active engagement, to run against it.")
     if common.host_is_public(host):
-        # If an engagement with a scope is active, it becomes a real allowlist:
-        # a public target outside the scope is refused. No active scope -> the
-        # public check alone decides (unchanged). Fail-safe: a target that isn't
-        # clearly in scope is refused, not allowed.
-        eng = engagement.active()
-        if eng and eng.get("scope") and not engagement.in_scope(host, eng["scope"]):
-            return False, (f"'{host}' is outside the active engagement scope "
-                           f"({eng.get('name') or eng.get('slug')}). Add it to the engagement's "
-                           "scope, or clear the active engagement, to run against it.")
         return True, ""
     if lab:
         return True, "lab-scope override"

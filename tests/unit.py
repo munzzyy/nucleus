@@ -6308,6 +6308,9 @@ class EngagementModelTests(unittest.TestCase):
         self.assertTrue(engagement.in_scope("10.0.0.5", ["10.0.0.0/24"]))
         self.assertFalse(engagement.in_scope("10.0.1.5", ["10.0.0.0/24"]))
         self.assertFalse(engagement.in_scope("anything", []))  # empty scope never allow-all
+        # an IP target must never suffix-match a malformed domain-ish entry
+        self.assertFalse(engagement.in_scope("192.168.1.1", ["168.1.1"]))
+        self.assertTrue(engagement.in_scope("192.168.1.1", ["192.168.1.0/24"]))
 
 
 class ParsedFindingsRunTests(unittest.TestCase):
@@ -6393,6 +6396,20 @@ class EngagementScopeGateTests(unittest.TestCase):
              mock.patch.object(runners.engagement, "active",
                                return_value={"slug": "x", "name": "x", "scope": []}):
             self.assertTrue(runners.scope_check("anything.com", lab=False)[0])
+
+    def test_lab_target_still_governed_by_active_scope(self):
+        # lab mode must not sidestep the engagement scope: a private target out
+        # of scope is refused even with lab=True; in scope (by CIDR) it passes.
+        with mock.patch.object(runners.common, "host_is_public", return_value=False), \
+             mock.patch.object(runners.engagement, "active",
+                               return_value={"slug": "a", "name": "A", "scope": ["example.com"]}):
+            ok, reason = runners.scope_check("10.0.0.5", lab=True)
+            self.assertFalse(ok)
+            self.assertIn("scope", reason)
+        with mock.patch.object(runners.common, "host_is_public", return_value=False), \
+             mock.patch.object(runners.engagement, "active",
+                               return_value={"slug": "a", "name": "A", "scope": ["10.0.0.0/24"]}):
+            self.assertTrue(runners.scope_check("10.0.0.5", lab=True)[0])
 
 
 if __name__ == "__main__":
