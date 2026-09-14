@@ -826,15 +826,16 @@ _live_runs_lock = threading.Lock()
 
 def _kill_proc(proc) -> None:
     """Terminate a spawned tool AND its whole process group — nmap/nuclei/etc.
-    fork children, and killing only the leader would orphan them. SIGTERM, then
-    SIGKILL if it lingers. Best-effort; a gone process is a no-op."""
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = None
+    fork children, and killing only the leader would orphan them. Only signals
+    while the child is still alive (poll() is None), so a reaped-then-reused PID
+    is never signalled by mistake; start_new_session made the child its own
+    group leader, so the group id equals its pid. SIGTERM, then SIGKILL if it
+    lingers. Best-effort."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return  # already exited/reaped — never signal a pid we no longer own
         try:
-            os.killpg(pgid, sig) if pgid is not None else proc.send_signal(sig)
+            os.killpg(proc.pid, sig)
         except OSError:
             return
         try:
@@ -846,9 +847,10 @@ def _kill_proc(proc) -> None:
 
 def cancel_run(run_id: str) -> bool:
     """Kill an in-flight run by its client-supplied id (and its process group)
-    before its own timeout. Returns True if a live run was found and signalled."""
+    before its own timeout. Pops the entry so a double-cancel can't race a
+    second kill onto a reaped pid. Returns True if a live run was found."""
     with _live_runs_lock:
-        proc = _live_runs.get(run_id)
+        proc = _live_runs.pop(run_id, None)
     if proc is None:
         return False
     _kill_proc(proc)
@@ -905,6 +907,10 @@ def run_tool(argv: list[str], *, timeout: float = 120.0, cwd: Optional[str] = No
         if run_id:
             with _live_runs_lock:
                 _live_runs.pop(run_id, None)
+        # Any unexpected exit path (an exception other than the timeout we
+        # handle) must never leave the tool running as an orphan.
+        if proc.poll() is None:
+            _kill_proc(proc)
 
 
 # --------------------------------------------------------------------------

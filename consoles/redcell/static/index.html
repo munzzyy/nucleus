@@ -230,6 +230,25 @@
     </div>
 
     <div class="card mb">
+      <h2>Exploit-DB search <span class="tag">offline</span></h2>
+      <p class="sub">Searches the local exploitdb database with <code>searchsploit</code> — by product,
+        version, or CVE. No target and no network: it queries the copy on this box, so there's no
+        authorization gate. Results render in the same findings table the runners use.</p>
+      <div class="row mt">
+        <div class="field grow-2">
+          <label for="searchsploit-term">Search terms</label>
+          <input type="text" id="searchsploit-term" placeholder="e.g. apache 2.4.49 — or wordpress plugin">
+        </div>
+        <div class="field fit">
+          <label>&nbsp;</label>
+          <button type="button" id="searchsploit-btn">Search</button>
+        </div>
+      </div>
+      <span id="searchsploit-status" class="sub"></span>
+      <div id="searchsploit-result" class="mt hidden"></div>
+    </div>
+
+    <div class="card mb">
       <h2>Website assessment <span class="tag">playbooks</span></h2>
       <p class="sub">One click runs the right tools in order and rolls the findings up. Every step runs
         through the same gated endpoint the Run tab uses by hand — a playbook can't do anything a manual

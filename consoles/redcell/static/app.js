@@ -11,6 +11,19 @@
   let runTickerId = null;
   let expertTickerId = null;
   let runAbort = null;
+  let runRunId = null;     // cancel handle for the live /api/run — lets Cancel kill the server process group, not just the client fetch
+
+  // A URL-safe random id per run so Cancel can name the exact server process
+  // group to kill. crypto.getRandomValues works in a non-secure (loopback)
+  // context; only crypto.subtle would need HTTPS.
+  function newRunId() {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const cs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += cs[bytes[i] % cs.length];
+    return s;
+  }
 
   // Cancel button for a live run, created once and parked next to run-btn. A
   // long scan (nmap "full" runs to a 600s server deadline) otherwise leaves the
@@ -20,7 +33,13 @@
     if (!runCancelBtn) {
       const runBtn = document.getElementById("run-btn");
       runCancelBtn = N.el("button", { type: "button", class: "ghost hidden", id: "run-cancel", text: "Cancel" });
-      runCancelBtn.addEventListener("click", () => { if (runAbort) runAbort.abort(); });
+      runCancelBtn.addEventListener("click", () => {
+        // Kill the server process group first (fire-and-forget, same origin),
+        // then stop the client waiting. Aborting the fetch alone left the tool
+        // running server-side until its own deadline.
+        if (runRunId) N.post("/api/cancel", { run_id: runRunId }).catch(() => { /* best-effort */ });
+        if (runAbort) runAbort.abort();
+      });
       if (runBtn && runBtn.parentNode) runBtn.parentNode.insertBefore(runCancelBtn, runBtn.nextSibling);
     }
     return runCancelBtn;
@@ -703,6 +722,14 @@
     const findings = Array.isArray(r.findings) ? r.findings : [];
     if (!findings.length) return false;
     const roll = r.findings_rollup || computeRollup(findings);
+    host.appendChild(buildFindingsCard(findings, roll, csvBase));
+    return true;
+  }
+
+  // The findings table + rollup + CSV bar as a standalone card, so anything
+  // that returns the same {severity,title,host,evidence,tool} shape (the Run
+  // tab, searchsploit) renders it identically.
+  function buildFindingsCard(findings, roll, csvBase) {
     const sorted = findings.slice().sort((a, b) =>
       (SEV_RANK[String(a.severity || "info").toLowerCase()] ?? 5) -
       (SEV_RANK[String(b.severity || "info").toLowerCase()] ?? 5));
@@ -739,8 +766,7 @@
     dl.addEventListener("click", () => N.download((csvBase || "redcell-findings") + ".csv", findingsToCsv(sorted), "text/csv"));
     bar.appendChild(dl);
     card.appendChild(bar);
-    host.appendChild(card);
-    return true;
+    return card;
   }
 
   async function runSafeTool() {
@@ -754,7 +780,8 @@
     if (!target) { N.toast("enter a target first", "bad"); return; }
     if (!authorized) { N.toast("check the authorization box first", "bad"); return; }
 
-    const body = { tool: spec.key, target, authorized, lab, proceed_exposed: opsecOverride() };
+    runRunId = newRunId();
+    const body = { tool: spec.key, target, authorized, lab, proceed_exposed: opsecOverride(), run_id: runRunId };
     const optSelects = document.querySelectorAll("#run-options-row [data-option]");
     if (optSelects.length) {
       body.options = {};
@@ -807,6 +834,7 @@
       if (rawDetails) rawDetails.open = true;   // no table on a failure — show the message
     } finally {
       runAbort = null;
+      runRunId = null;
       runCancel().classList.add("hidden");
       document.getElementById("run-btn").disabled = !authorized;
       fillSlot("run-actions", () => out.textContent, fnBase(spec.key, "redcell-run"), "text/plain");
@@ -960,6 +988,11 @@
     jwtBtn.addEventListener("click", runJwtAudit);
     document.getElementById("jwt-input").addEventListener("keydown", e => {
       if (e.key === "Enter") runJwtAudit();
+    });
+    const ssBtn = document.getElementById("searchsploit-btn");  // offline local DB, never gated
+    ssBtn.addEventListener("click", runSearchsploit);
+    document.getElementById("searchsploit-term").addEventListener("keydown", e => {
+      if (e.key === "Enter") runSearchsploit();
     });
   }
 
@@ -1130,14 +1163,12 @@
     const report = { playbook: pb.key, name: pb.name, target: target,
                      started: new Date().toISOString(), summary: agg, steps: [] };
 
-    for (const se of stepEls) {
-      if (!se.checkbox.checked) {
-        se.statusPill.textContent = "skipped";
-        se.statusPill.className = "pill pb-status";
-        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
-                            tool: se.step.tool, status: "skipped" });
-        continue;
-      }
+    // One step's work, isolated so a bounded pool can run several at once. It
+    // never throws (its own try/catch), so one failure can't abort the others,
+    // and it writes its result into report.steps[idx] to keep report order
+    // stable regardless of which step finishes first. Each step still goes
+    // through the same gated endpoint a manual run uses — nothing is weakened.
+    async function runOneStep(se, idx) {
       se.statusPill.className = "pill pb-status warn";
       const started = Date.now();
       se.statusPill.textContent = "running — 0.0s";
@@ -1172,8 +1203,8 @@
           const hasOutput = !!(r.stdout && r.stdout.trim());
           agg.ran.push(`${se.step.tool}: ${hasOutput ? "returned output" : "no output"}`);
         }
-        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
-                            tool: se.step.tool, status: "done", result: stepResult });
+        report.steps[idx] = { label: se.step.label, kind: se.step.kind || "runner",
+                              tool: se.step.tool, status: "done", result: stepResult };
         clearInterval(se.ticker); se.ticker = null;
         se.statusPill.textContent = "done";
         se.statusPill.className = "pill pb-status ok";
@@ -1197,11 +1228,37 @@
           "error: " + ((e.body && e.body.error) ? e.body.error : e.message) }));
         se.resultBox.classList.remove("hidden");
         agg.ran.push(`${stepKindLabel(se.step)}: failed`);
-        report.steps.push({ label: se.step.label, kind: se.step.kind || "runner",
-                            tool: se.step.tool, status: "failed",
-                            error: (e.body && e.body.error) ? e.body.error : e.message });
+        report.steps[idx] = { label: se.step.label, kind: se.step.kind || "runner",
+                              tool: se.step.tool, status: "failed",
+                              error: (e.body && e.body.error) ? e.body.error : e.message };
       }
     }
+
+    // Mark skips up front (keeping their report slot), queue the rest.
+    const queued = [];
+    stepEls.forEach((se, idx) => {
+      if (!se.checkbox.checked) {
+        se.statusPill.textContent = "skipped";
+        se.statusPill.className = "pill pb-status";
+        report.steps[idx] = { label: se.step.label, kind: se.step.kind || "runner",
+                              tool: se.step.tool, status: "skipped" };
+        return;
+      }
+      queued.push({ se, idx });
+    });
+
+    // Bounded concurrent pool — independent steps run in parallel (cap 5 in
+    // flight) instead of strictly one at a time. Workers pull from a shared
+    // cursor; DOM rows and report slots are keyed by index so order holds.
+    const POOL = 5;
+    let cursor = 0;
+    async function worker() {
+      while (cursor < queued.length) {
+        const t = queued[cursor++];
+        await runOneStep(t.se, t.idx);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(POOL, queued.length) }, () => worker()));
 
     renderPlaybookSummary(agg);
     appendPlaybookExport(report);
@@ -1484,6 +1541,40 @@
       status.textContent = "error";
       resultWrap.appendChild(N.el("span", { class: "pill bad" }, [N.el("span", { class: "dot" }),
         document.createTextNode("error: " + (e.body && e.body.error ? e.body.error : e.message))]));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // Offline exploit-DB lookup — no target, no gate. Reuses the runner findings
+  // table so the exploit rows read like any other findings set.
+  async function runSearchsploit() {
+    const term = document.getElementById("searchsploit-term").value.trim();
+    const status = document.getElementById("searchsploit-status");
+    const resultWrap = document.getElementById("searchsploit-result");
+    if (!term) { N.toast("enter a search term first", "bad"); return; }
+    const btn = document.getElementById("searchsploit-btn");
+    btn.disabled = true;
+    status.textContent = "searching exploit-db…";
+    resultWrap.classList.remove("hidden");
+    resultWrap.replaceChildren();
+    try {
+      const r = await N.post("/api/searchsploit", { term });
+      status.textContent = "";
+      const findings = Array.isArray(r.findings) ? r.findings : [];
+      resultWrap.appendChild(N.el("p", { class: "sub", text:
+        `${r.count} result${r.count === 1 ? "" : "s"} for "${r.term}"` }));
+      if (findings.length) {
+        const roll = r.findings_rollup || computeRollup(findings);
+        resultWrap.appendChild(buildFindingsCard(findings, roll, fnBase(r.term, "redcell-searchsploit")));
+      } else {
+        resultWrap.appendChild(N.stateCard("empty", "No matching exploits in the local database."));
+      }
+    } catch (e) {
+      // 409 not installed, 400 bad term — both arrive with the message on e.body.error.
+      status.textContent = "";
+      resultWrap.replaceChildren(N.stateCard("error", (e.body && e.body.error) ? e.body.error : e.message));
+      N.toast("searchsploit failed: " + ((e.body && e.body.error) ? e.body.error : e.message), "bad");
     } finally {
       btn.disabled = false;
     }
