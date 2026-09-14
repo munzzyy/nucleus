@@ -6036,6 +6036,56 @@ class KeyringBackendTests(unittest.TestCase):
         self.assertEqual(os.environ.get("SHODAN_API_KEY"), "secret123")
 
 
+class RunCancelAndToolsTests(unittest.TestCase):
+    """Server-side run cancel, the searchsploit native endpoint, and the gau runner."""
+
+    def test_valid_run_id(self):
+        self.assertIsNone(runners._valid_run_id("has space"))
+        self.assertIsNone(runners._valid_run_id("x" * 65))
+        self.assertEqual(runners._valid_run_id("ok_id-123"), "ok_id-123")
+
+    def test_cancel_endpoint(self):
+        self.assertEqual(runners.handle_cancel(_StressReq({"run_id": "bad id"})).status, 400)
+        with mock.patch.object(runners.common, "cancel_run", return_value=True) as cr:
+            resp = runners.handle_cancel(_StressReq({"run_id": "abc"}))
+        self.assertTrue(json.loads(resp.body)["cancelled"])
+        cr.assert_called_once_with("abc")
+
+    def test_run_tool_cancel_kills_live_run(self):
+        res = {}
+
+        def go():
+            res["r"] = common.run_tool(["python3", "-c", "import time;time.sleep(20)"],
+                                       timeout=30, run_id="uT-cancel")
+        t = threading.Thread(target=go)
+        t.start()
+        time.sleep(0.5)
+        self.assertTrue(common.cancel_run("uT-cancel"))
+        t.join(timeout=5)
+        self.assertLess(res["r"].duration, 4)              # killed promptly, not 20s
+        self.assertFalse(common.cancel_run("uT-cancel"))   # gone from the registry now
+
+    def test_searchsploit_parses_json_to_findings(self):
+        js = '{"RESULTS_EXPLOIT":[{"Title":"Apache 2.4 RCE","EDB-ID":"12345","Path":"/x.py"}]}'
+        with mock.patch.object(runners.common, "which", return_value="/usr/bin/searchsploit"), \
+             mock.patch.object(runners.common, "run_tool", return_value=mock.Mock(returncode=0, stdout=js, stderr="")):
+            resp = runners.handle_searchsploit(_StressReq({"term": "apache 2.4"}))
+        d = json.loads(resp.body)
+        self.assertEqual(d["count"], 1)
+        self.assertIn("Apache", d["findings"][0]["title"])
+
+    def test_searchsploit_rejects_bad_term(self):
+        with mock.patch.object(runners.common, "which", return_value="/usr/bin/searchsploit"):
+            self.assertEqual(runners.handle_searchsploit(_StressReq({"term": "-x"})).status, 400)
+            self.assertEqual(runners.handle_searchsploit(_StressReq({"term": ""})).status, 400)
+
+    def test_gau_is_a_passive_registered_runner(self):
+        self.assertIn("gau", runners.SAFE_RUNNERS)
+        self.assertIn("gau", runners._REBIND_RECHECK)  # covered by the import-time set guard
+        ctx = runners.BuildCtx(target="example.com")
+        self.assertEqual(runners.SAFE_RUNNERS["gau"].build(ctx), ["gau", "--subs", "example.com"])
+
+
 class PostAndTimeoutRobustnessTests(unittest.TestCase):
     """run_tool preserves partial stderr on timeout."""
 

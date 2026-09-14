@@ -11,6 +11,8 @@ ROUTES = {
     "GET /api/inventory": inventory.handle_inventory,
     "POST /api/inventory/refresh": inventory.handle_inventory_refresh,
     "POST /api/run": runners.handle_run,
+    "POST /api/cancel": runners.handle_cancel,
+    "POST /api/searchsploit": runners.handle_searchsploit,
     "GET /api/history": runners.handle_history,
     "GET /api/wordlists": runners.handle_wordlists,
     "GET /api/wordlist-preview": runners.handle_wordlist_preview,

@@ -24,6 +24,7 @@ import io
 import ipaddress
 import json
 import os
+import signal
 import socket
 import ssl
 import subprocess
@@ -819,32 +820,91 @@ class RunResult:
     error: str = ""
 
 
-def run_tool(argv: list[str], *, timeout: float = 120.0,
-             cwd: Optional[str] = None, input_text: Optional[str] = None) -> RunResult:
+_live_runs: dict = {}
+_live_runs_lock = threading.Lock()
+
+
+def _kill_proc(proc) -> None:
+    """Terminate a spawned tool AND its whole process group — nmap/nuclei/etc.
+    fork children, and killing only the leader would orphan them. SIGTERM, then
+    SIGKILL if it lingers. Best-effort; a gone process is a no-op."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig) if pgid is not None else proc.send_signal(sig)
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def cancel_run(run_id: str) -> bool:
+    """Kill an in-flight run by its client-supplied id (and its process group)
+    before its own timeout. Returns True if a live run was found and signalled."""
+    with _live_runs_lock:
+        proc = _live_runs.get(run_id)
+    if proc is None:
+        return False
+    _kill_proc(proc)
+    return True
+
+
+def run_tool(argv: list[str], *, timeout: float = 120.0, cwd: Optional[str] = None,
+             input_text: Optional[str] = None, run_id: Optional[str] = None) -> RunResult:
     """Run a command with NO shell — argv is a list, never a string.
 
     Callers are responsible for validating argv[0] against an allowlist and
     validating every argument before calling this. This function only
     guarantees the shell is never involved and the process is time-bounded.
+
+    If run_id is given, the process is registered so cancel_run(run_id) can
+    terminate it (and its children) before the timeout. Runs in its own process
+    group (start_new_session) so a timeout or cancel reaps the whole tree.
     """
     import time
     start = time.monotonic()
+
+    def _dec(b):
+        return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=cwd, input=input_text, check=False, shell=False,
+        proc = subprocess.Popen(
+            argv, stdin=(subprocess.PIPE if input_text is not None else subprocess.DEVNULL),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=cwd, shell=False, start_new_session=True,
         )
-        return RunResult(argv, proc.returncode, proc.stdout or "", proc.stderr or "",
-                         round(time.monotonic() - start, 3))
-    except subprocess.TimeoutExpired as e:
-        def _dec(b):
-            return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
-        return RunResult(argv, -1, _dec(e.stdout), _dec(e.stderr),
-                         round(time.monotonic() - start, 3), timed_out=True,
-                         error=f"timed out after {timeout}s")
     except (OSError, ValueError) as e:
-        return RunResult(argv, -1, "", "", round(time.monotonic() - start, 3),
-                         error=str(e))
+        return RunResult(argv, -1, "", "", round(time.monotonic() - start, 3), error=str(e))
+
+    if run_id:
+        with _live_runs_lock:
+            _live_runs[run_id] = proc
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+            # A cancel/kill lands here too: communicate returns with a negative
+            # returncode once the group is signalled, not as a timeout.
+            return RunResult(argv, proc.returncode, stdout or "", stderr or "",
+                             round(time.monotonic() - start, 3))
+        except subprocess.TimeoutExpired:
+            _kill_proc(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                stdout, stderr = "", ""
+            return RunResult(argv, -1, _dec(stdout), _dec(stderr),
+                             round(time.monotonic() - start, 3), timed_out=True,
+                             error=f"timed out after {timeout}s")
+    finally:
+        if run_id:
+            with _live_runs_lock:
+                _live_runs.pop(run_id, None)
 
 
 # --------------------------------------------------------------------------

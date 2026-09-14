@@ -216,7 +216,7 @@ _REBIND_RECHECK = {
     "nuclei", "gobuster-dns", "gobuster-dir", "wpscan", "nikto", "sqlmap",
     "subfinder", "theharvester", "dnsenum", "dnsrecon", "sublist3r", "ffuf",
     "feroxbuster", "wfuzz", "whatweb", "httpx", "wafw00f",
-    "dig", "host", "whois",
+    "dig", "host", "whois", "gau",
 }
 
 
@@ -404,6 +404,14 @@ SAFE_RUNNERS: dict[str, RunnerSpec] = {
         install="yay -S whatweb",
         desc="Web technology fingerprinting at the lowest aggression level.",
         build=lambda ctx: ["whatweb", "--no-errors", "-a", "1", ctx.target],
+    ),
+    "gau": RunnerSpec(
+        bin="gau", kind="host", timeout=90,
+        install="yay -S gau",
+        desc="Passive URL discovery — pulls known URLs for a domain from web archives "
+             "(Wayback / CommonCrawl / OTX / URLScan). Read-only; it queries the archives, "
+             "not the target, so nothing touches the host itself.",
+        build=lambda ctx: ["gau", "--subs", ctx.target],
     ),
     "dnsenum": RunnerSpec(
         bin="dnsenum", kind="host", timeout=180,
@@ -694,6 +702,53 @@ def opsec_gate(lab: bool, body: dict) -> Optional["common.Response"]:
     }, status=403)
 
 
+def _valid_run_id(v) -> "Optional[str]":
+    """A client-supplied run id, used only as a cancel handle. Safe charset and
+    bounded, so it can key the live-run registry without surprises."""
+    v = v if isinstance(v, str) else ""
+    return v if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v) else None
+
+
+def handle_cancel(req) -> "common.Response":
+    """Terminate an in-flight run (and its process group) by the run_id the
+    client passed to /api/run. Returns whether a live run was found."""
+    run_id = _valid_run_id(req.json().get("run_id"))
+    if not run_id:
+        return common.Response.error(400, "missing or invalid run_id")
+    return common.Response.json({"cancelled": common.cancel_run(run_id)})
+
+
+def handle_searchsploit(req) -> "common.Response":
+    """Offline exploit-DB search — `searchsploit --json <terms>`. Local database,
+    no target and no network, so no scope/authorization gate is needed; POST-only
+    so the query never lands in a URL or log. Each term is one argv element (no
+    shell), a leading dash or metachar is refused, and the JSON rows come back as
+    findings so the same table renders them."""
+    if not common.which("searchsploit"):
+        return common.Response.error(409, "searchsploit is not installed — install exploitdb "
+                                           "(e.g. sudo pacman -S exploitdb)")
+    raw = str(req.json().get("term") or "").strip()
+    if not raw:
+        return common.Response.error(400, "missing search term")
+    if len(raw) > 200:
+        return common.Response.error(400, "term too long")
+    terms = raw.split()
+    for t in terms:
+        if t.startswith("-") or any(c in t for c in ";|&`$<>\\\n\r"):
+            return common.Response.error(400, "term contains a disallowed character")
+    result = common.run_tool(["searchsploit", "--json"] + terms, timeout=30)
+    exploits = []
+    try:
+        exploits = (json.loads(result.stdout or "{}") or {}).get("RESULTS_EXPLOIT") or []
+    except (ValueError, TypeError):
+        exploits = []
+    fs = [findings.finding("info", e.get("Title") or "exploit", "",
+                           f"EDB-{e.get('EDB-ID', '')} · {e.get('Path', '')}", "searchsploit")
+          for e in exploits if isinstance(e, dict)]
+    return common.Response.json({"term": raw, "count": len(fs), "findings": fs,
+                                 "findings_rollup": findings.roll_up(fs)})
+
+
 def _parse_findings(tool: str, stdout: str, target: str) -> list:
     """Parse a runner's machine-readable stdout into normalized findings, so the
     UI shows a real severity rollup instead of guessing from raw text. Only the
@@ -733,6 +788,7 @@ def handle_run(req) -> "common.Response":
     target_raw = body.get("target")
     authorized = body.get("authorized") is True
     lab = body.get("lab") is True
+    run_id = _valid_run_id(body.get("run_id"))   # optional cancel handle
 
     spec = SAFE_RUNNERS.get(tool)
     if spec is None:
@@ -821,7 +877,7 @@ def handle_run(req) -> "common.Response":
                    wordlist=wordlist_path, out_path=out_path, apikey=apikey,
                    resolved_ip=resolved_ip)
     argv = spec.build(ctx)
-    result = common.run_tool(argv, timeout=spec.timeout)
+    result = common.run_tool(argv, timeout=spec.timeout, run_id=run_id)
 
     safe_argv = _redact_argv(argv, apikey)
 
@@ -847,6 +903,7 @@ def handle_run(req) -> "common.Response":
         "timed_out": result.timed_out,
         "error": result.error,
         "out_path": out_path,
+        "run_id": run_id,
         "findings": parsed,          # normalized {severity,title,host,evidence,tool}
         "findings_rollup": findings.roll_up(parsed),
     })
