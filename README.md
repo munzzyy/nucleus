@@ -6,6 +6,10 @@ One local command center for your machine: recon, offense, defense, a developer 
 
 Everything binds to `127.0.0.1` only. Pure stdlib Python, zero dependencies, and nothing phones home.
 
+<p align="center">
+  <img src="docs/screenshots/hub.png" alt="Nucleus hub: the command center, with the console switcher across the top, the opsec exposure banner, and each console's live status" width="900">
+</p>
+
 ```
 ┌─ Nucleus hub  :8890 ─ the command center. links + live status of everything.
 ├─ Recon        :8900 ─ OSINT. paste a username / email / domain / IP / ASN / phone / hash / crypto address / Discord ID, get live passive recon (incl. infostealer + sanctions checks).
