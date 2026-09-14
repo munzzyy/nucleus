@@ -1,4 +1,4 @@
-# local state + secrets — never commit
+# local state and secrets, never commit
 var/.env
 var/.env.lock
 var/*.json
@@ -13,3 +13,12 @@ __pycache__/
 .DS_Store
 var/*.md
 var/*.txt
+
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

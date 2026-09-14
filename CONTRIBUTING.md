@@ -9,15 +9,15 @@ negotiable, because they're the whole reason the app is safe to run.
    `pip install`, it doesn't go in. The payoff is that there's nothing to audit but this repo, and
    the app runs on a fresh Python with no setup. (The optional native window uses system PySide6 if
    it's already installed; the app runs fine without it.)
-2. **Loopback only.** Every server binds `127.0.0.1`. Don't add a bind address, a `0.0.0.0`, or a
+2. Every server binds `127.0.0.1`, loopback only. Don't add a bind address, a `0.0.0.0`, or a
    "just for the LAN" option. That's not a limitation to fix; it's the security model.
-3. **Nothing phones home.** No telemetry, no analytics, no update check, no remote assets. The only
+3. Nothing phones home: no telemetry, no analytics, no update check, no remote assets. The only
    outbound traffic is a lookup the user explicitly triggered, going to the source it names.
 4. **One door out.** All outbound HTTP goes through `common.fetch` (the SSRF guard). Never call
    `urllib` directly. All DNS goes through `common.dns_query`.
-5. **No shell.** Anything that runs a binary goes through `common.run_tool` with an argv list. No
+5. No shell. Anything that runs a binary goes through `common.run_tool` with an argv list. No
    `shell=True`, no string interpolation into a command, no exceptions.
-6. **Strict CSP stays strict.** No inline script or style, no `innerHTML` of any value that came
+6. Strict CSP stays strict: no inline script or style, no `innerHTML` of any value that came
    from the network or the user. Build DOM with `N.el` and `textContent` so echoed values are inert.
 
 If a change can't live inside those rules, it's out of scope, however good the idea.
@@ -43,14 +43,16 @@ No build step, no virtualenv needed. Python 3.11 or newer.
 
 ## Where things go
 
-- **A new Recon lookup:** add it to `consoles/recon/lookups.py` (or `sources.py`) and route it in
-  `detect.py`. Use `common.fetch` / `common.dns_query`. Degrade to a populated dict with an
-  `error`/`note` field on failure; one dead source must never sink a scan.
-- **A new safe runner:** add a template + validator to the Redcell allowlist. If it isn't obviously
-  read-only and non-destructive, make it a command-*builder* entry instead of a runner.
-- **A new console:** add a row to `CONSOLES` in `shared/common.py`, create
-  `consoles/<slug>/app.py` with a `build_app()`, and it appears in the switcher, hub, and launcher
-  automatically. See `docs/ARCHITECTURE.md`.
+For a new Recon lookup, add it to `consoles/recon/lookups.py` (or `sources.py`) and route it in
+`detect.py`. Use `common.fetch` / `common.dns_query`, and degrade to a populated dict with an
+`error`/`note` field on failure; one dead source must never sink a scan.
+
+A new safe runner gets a template plus a validator added to the Redcell allowlist. If it isn't
+obviously read-only and non-destructive, make it a command-*builder* entry instead of a runner.
+
+For a new console, add a row to `CONSOLES` in `shared/common.py` and create
+`consoles/<slug>/app.py` with a `build_app()`. It appears in the switcher, hub, and launcher
+automatically. See `docs/ARCHITECTURE.md`.
 
 ## Writing
 

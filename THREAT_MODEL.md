@@ -12,22 +12,20 @@ Content-Security-Policy. There is no third-party runtime dependency, no build st
 
 ## Assets worth protecting
 
-1. **What you investigate.** Recon runs on real people and organizations. The targets, the results,
-   and the pivot trail are sensitive by nature.
-2. **Your own operational security.** The fact that *you* looked something up, and from where.
-3. **Credentials.** Optional API keys you add to unlock deeper data.
-4. **The machine.** Nucleus can run local security tooling, so it must never become a way to run
-   arbitrary code or reach places it shouldn't.
+What you investigate comes first: recon runs on real people and organizations, and the targets,
+results, and pivot trail are sensitive by nature. Second is your own operational security, meaning
+the fact that *you* looked something up, and from where. Third, any optional API keys you add to
+get deeper data. And the machine itself: Nucleus can run local security tooling, so it must never
+become a way to run arbitrary code or reach places it shouldn't.
 
 ## Adversaries considered
 
-- **The network you're on.** Other hosts on your LAN, and anyone on-path to the internet.
-- **A hostile web page or a malicious link** trying to reach the local servers through your browser
-  (DNS rebinding, CSRF, cross-origin reads).
-- **A hostile lookup target** trying to turn a passive scan into a server-side request forgery, or
-  to inject content into results, a saved report, or the audit log.
-- **A malicious tool target** trying to escape the run sandbox into shell execution or a
-  private/internal address.
+Four kinds of attacker matter here. The network you're on: other hosts on your LAN, and anyone
+on-path to the internet. A hostile web page or a malicious link trying to reach the local servers
+through your browser (DNS rebinding, CSRF, cross-origin reads). A hostile lookup target trying to
+turn a passive scan into a server-side request forgery, or to inject content into results, a saved
+report, or the audit log. And a malicious tool target trying to escape the run sandbox into shell
+execution or a private/internal address.
 
 Explicitly **out of scope** (see "What this does not defend" below): a machine already running
 malware as your user, and other accounts on a shared multi-user box.
@@ -49,36 +47,39 @@ malware as your user, and other accounts on a shared multi-user box.
 
 This matters most for anyone whose threat model includes their own device being seized or searched.
 
-- **Audit and case logs are OFF by default.** With logging disabled (the default), Nucleus writes
-  nothing to `var/` during use: not the offensive-tool audit trail (`var/redcell-scans.jsonl`), not
-  the recon case history (`var/recon-scans.jsonl`), not saved tool output (`var/redcell-out/`).
-  Results render live in the browser for the session and are gone when you close it. You turn
-  persistence on deliberately with `NUCLEUS_LOGGING=1`.
-- **API keys** you add are stored in `var/.env` in plaintext, readable only by your user. Treat that
-  file as a secret. It is git-ignored.
-- **Reports** you generate with the report engine are written where you tell the CLI to write them.
-- **Browser-side state** (remembered inputs, recent scans, deep-link state) lives in your browser's
-  `localStorage`, scoped to the loopback origin, never sent anywhere.
+Audit and case logs are OFF by default. With logging disabled, Nucleus writes nothing to `var/`
+during use: not the offensive-tool audit trail (`var/redcell-scans.jsonl`), not the recon case
+history (`var/recon-scans.jsonl`), not saved tool output (`var/redcell-out/`). Results render live
+in the browser for the session and are gone when you close it. You turn persistence on
+deliberately with `NUCLEUS_LOGGING=1`.
+
+API keys you add are stored in `var/.env` in plaintext, readable only by your user. Treat that
+file as a secret; it's git-ignored. Reports you generate with the report engine are written where
+you tell the CLI to write them. And browser-side state (remembered inputs, recent scans, deep-link
+state) lives in your browser's `localStorage`, scoped to the loopback origin, never sent anywhere.
 
 Nothing in `var/` leaves your machine. There is no sync, no upload, no backup phone-home.
 
 ## What this does NOT defend against
 
-- **A compromised local machine.** Any code running as your user can reach a loopback port and read
-  your files, including `var/.env`. Loopback keeps the network out; it does not sandbox hostile
-  local software. Nucleus is not a substitute for not running malware.
-- **Another user on a shared machine.** On a multi-user box, another account may reach
-  `127.0.0.1:88xx`. Run Nucleus only on a machine you control.
-- **Your network-level anonymity, by default.** With no proxy set, passive recon originates from
-  your real IP and a source or target can see that a request came from your address. Set
-  `NUCLEUS_SOCKS` (below) to route everything, DNS included, through Tor or a proxy; without it,
-  assume your IP is exposed to every source a scan touches. The always-on exposure indicator warns
-  you which state you're in, using only local signals.
-- **Correlation by the sources themselves.** The third-party services a lookup queries (crt.sh,
-  Shodan's InternetDB, breach oracles, and so on) see the query. Nucleus can't hide a lookup from
-  the service you're asking.
-- **Misuse.** The authorization gate stops accidents and cross-site requests. It is not permission.
-  Only investigate and only scan what you are authorized to.
+A compromised local machine is out of scope. Any code running as your user can reach a loopback
+port and read your files, including `var/.env`. Loopback keeps the network out; it does not
+sandbox hostile local software. Nucleus is not a substitute for not running malware. Same goes for
+another user on a shared machine: on a multi-user box, another account may reach `127.0.0.1:88xx`,
+so run Nucleus only on a machine you control.
+
+Nucleus doesn't hide your network-level identity by default, either. With no proxy set, passive
+recon originates from your real IP, and a source or target can see that a request came from your
+address. Set `NUCLEUS_SOCKS` (below) to route everything, DNS included, through Tor or a proxy;
+without it, assume your IP is exposed to every source a scan touches. The always-on exposure
+indicator warns you which state you're in, using only local signals. Correlation by the sources
+themselves is out of reach too: the third-party services a lookup queries (crt.sh, Shodan's
+InternetDB, breach oracles, and so on) see the query, and Nucleus can't hide a lookup from the
+service you're asking.
+
+Last: the authorization gate is not permission. It stops accidents and cross-site requests, but
+you're still the one who decides what's in scope. Only investigate and only scan what you are
+authorized to.
 
 ## Residual risks we're honest about
 
