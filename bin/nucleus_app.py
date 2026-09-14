@@ -86,7 +86,7 @@ def _stop_coleos_hub():
 
 def run_browser_fallback():
     import webbrowser
-    print("[nucleus] Qt not available — opening in your browser instead.")
+    print("[nucleus] Qt not available, opening in your browser instead.")
     webbrowser.open(f"http://127.0.0.1:{HUB_PORT}/")
     print("Servers are running. Press Ctrl-C to stop.")
     try:
@@ -111,15 +111,16 @@ def run_app(selftest: bool = False) -> int:
             return 0
         return 3
 
-    app = QApplication(sys.argv[:1])
-    app.setApplicationName("Nucleus")
+    app = QApplication(["nucleus"])
+    app.setApplicationName("nucleus")
     app.setApplicationDisplayName("Nucleus")
+    app.setDesktopFileName("nucleus")  # match nucleus.desktop for taskbar pinning
     icon_path = REPO / "bin" / "nucleus.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
     win = QMainWindow()
-    win.setWindowTitle("Nucleus — Security Command Center")
+    win.setWindowTitle("Nucleus Security Command Center")
     view = QWebEngineView()
 
     def go(port):

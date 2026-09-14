@@ -34,12 +34,13 @@ cat > "$APPS/nucleus.desktop" <<EOF
 Type=Application
 Name=Nucleus
 GenericName=Security Command Center
-Comment=Recon, offense, defense — one local command center
-Exec=/usr/bin/env python3 $REPO/bin/nucleus_app.py
+Comment=Recon, offense, defense, one local command center
+Exec=/usr/bin/env python3 "$REPO/bin/nucleus_app.py"
 Icon=nucleus
 Terminal=false
-StartupWMClass=Nucleus
-Categories=Security;Network;Development;Utility;System;
+StartupNotify=true
+StartupWMClass=nucleus
+Categories=System;Security;
 Keywords=osint;pentest;security;opsec;recon;devtools;encode;hash;jwt;system;monitor;dork;
 EOF
 echo "   • menu entry: Nucleus (native app, one click)"

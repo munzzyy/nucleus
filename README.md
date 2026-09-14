@@ -33,7 +33,7 @@ bash bin/install.sh           # PATH command + app-menu entry + icon
 nucleus                       # from anywhere
 ```
 
-Install puts `nucleus` on your PATH (`~/.local/bin`), adds a Nucleus app-menu entry with an icon (one click, no terminal), and drops in a systemd `--user` unit for optional autostart. No root, loopback only, fully reversible (the undo lines print at the end).
+Install puts `nucleus` on your PATH (`~/.local/bin`), adds a Nucleus app-menu entry with an icon (one click, no terminal), and drops in a systemd `--user` unit for optional autostart. The entry lands in your app launcher, so you can pin Nucleus to your dock or taskbar like any other app. No root, loopback only, fully reversible (the undo lines print at the end).
 
 You need Python 3.11 or newer and a browser, nothing else. The one-click install targets Linux desktops; the app itself runs anywhere Python does. Redcell's runners use whatever pentest tools you already have on the box, and the scrub panel uses mat2 when it's present. Both say what's missing and keep working without it.
 
