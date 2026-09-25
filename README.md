@@ -165,4 +165,6 @@ bin/                    launcher, installer, desktop + systemd files
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Authorized, lab, and educational use only.
+[GPL-3.0-or-later](LICENSE). You can use, study, change and share it. If you distribute a copy
+or a modified version, it has to stay under the GPL and come with its source. Authorized, lab,
+and educational use only. Earlier commits were under MIT.
