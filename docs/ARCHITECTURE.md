@@ -26,7 +26,7 @@ The design constraint was to match how the rest of your stack already works: a s
   - loopback bind, Host-header allowlist, per-POST Origin/Referer check, strict CSP, static file sandbox
   - `fetch()`: the single SSRF-guarded outbound HTTP path (recon's only door out). Its response-header collapse preserves every `Set-Cookie` (repeats joined with `\n`, since cookie values carry their own commas) so downstream cookie analysis sees all of them, not just the last. Callers split `resp_headers.get("Set-Cookie","")` on `\n`.
   - `_origin_ok()`: the per-POST CSRF check requires an **exact port match**; a port-less Origin (`http://localhost` = `:80`, `https://127.0.0.1` = `:443`) is refused, since Nucleus only ever serves on its fixed 88xx/89xx ports and a real same-origin request always carries the real port.
-  - `dns_query()`: encrypted DNS-over-HTTPS (Google→Cloudflare), so no dnspython and no repeat of the old shared-`Resolver` thread-safety bug
+  - `dns_query()`: encrypted DNS-over-HTTPS (Cloudflare first, Google as the fallback, and `NUCLEUS_DOH` replaces both), so no dnspython and no repeat of the old shared-`Resolver` thread-safety bug
   - `run_tool()`: the single no-shell, time-bounded execution primitive (argv list only)
   - `which()` / `tool_version()`: tool detection
   - `siblings_status()` / `local_get_json()`: server-side health and aggregation, so the browser never makes a cross-origin call

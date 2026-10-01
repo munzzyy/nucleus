@@ -768,7 +768,8 @@ def dns_query(name: str, rtype: str = "A", timeout: float = DEFAULT_TIMEOUT,
     Returns the raw Answer list. Using DoH JSON here means no dnspython — and so
     no repeat of the shared-Resolver thread-safety bug that bit the old
     osint-console — while still keeping every lookup encrypted in transit.
-    Google is primary, Cloudflare the fallback.
+    Cloudflare is tried first and Google is the fallback; NUCLEUS_DOH
+    replaces both (see _doh_endpoints).
 
     A valid 200 response (even with an empty Answer) is a definitive result and
     returns []. Only when NO endpoint produced one does strict=True raise
