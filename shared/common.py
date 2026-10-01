@@ -1238,7 +1238,25 @@ def _make_handler(app: App, port: int):
         def _host_ok(self) -> bool:
             return self.headers.get("Host", "") in _allowed_hosts(port)
 
+        def _request_has_unread_body(self) -> bool:
+            # True when the client declared a body this request did not consume.
+            # Left on a keep-alive socket, those bytes would be parsed as the
+            # next request, so a refused POST could smuggle a same-origin one.
+            if getattr(self, "_body_consumed", False):
+                return False
+            if self.headers.get("Transfer-Encoding"):
+                return True
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                return False
+            try:
+                return int(raw) > 0
+            except ValueError:
+                return True
+
         def _send(self, resp: Response):
+            if self._request_has_unread_body():
+                self.close_connection = True
             body = resp.body
             self.send_response(resp.status)
             self.send_header("Content-Type", resp.content_type)
@@ -1335,6 +1353,7 @@ def _make_handler(app: App, port: int):
                     self._send(Response.error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body too large"))
                     return
                 body = self.rfile.read(length) if length > 0 else b""
+                self._body_consumed = True
 
             req = Request(method, path, query, dict(self.headers), body,
                           self.client_address[0])
@@ -1360,6 +1379,7 @@ def _make_handler(app: App, port: int):
             self._send(Response.raw(data, ctype))
 
         def _guarded(self, method: str):
+            self._body_consumed = False  # reset per request on a keep-alive socket
             if not slots.acquire(timeout=15):
                 self._send(Response.error(HTTPStatus.SERVICE_UNAVAILABLE, "server busy"))
                 return

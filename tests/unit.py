@@ -1175,6 +1175,141 @@ class ClientDisconnectQuietTests(unittest.TestCase):
         self.assertIn("ValueError: boom", err.getvalue())
 
 
+class KeepAliveDesyncTests(unittest.TestCase):
+    """A refused POST must close the connection, not leave its unread body on a
+    keep-alive socket. Otherwise a cross-origin page can POST a body that is
+    itself a full same-origin request, and the server runs that inner request
+    after refusing the outer one, bypassing the Host and Origin guards."""
+
+    def _free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def setUp(self):
+        static_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(static_dir, ignore_errors=True))
+        self.hits = []
+        lock = threading.Lock()
+
+        def act(req):
+            with lock:
+                self.hits.append((req.headers.get("Origin"), req.body))
+            return common.Response.json({"ran": True})
+
+        app = common.App(slug="unit-test-app", static_dir=static_dir,
+                         routes={"POST /api/act": act})
+        self.httpd = None
+        for _attempt in range(3):
+            port = self._free_port()
+            try:
+                self.httpd = common.serve(app, port=port, block=False)
+                self.port = port
+                break
+            except OSError:
+                continue
+        if self.httpd is None:
+            self.skipTest("could not bind a loopback test port")
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _inner_request(self) -> bytes:
+        inner_body = b'{"smuggled":true}'
+        return (f"POST /api/act HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                f"Origin: http://127.0.0.1:{self.port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(inner_body)}\r\n\r\n").encode() + inner_body
+
+    def _send_outer(self, extra_headers: str, path: str = "/api/act") -> bytes:
+        inner = self._inner_request()
+        outer = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                 f"{extra_headers}Content-Type: application/json\r\n"
+                 f"Content-Length: {len(inner)}\r\n\r\n").encode() + inner
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            c.sendall(outer)
+            c.settimeout(3)
+            data = b""
+            while True:
+                try:
+                    chunk = c.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 65536:
+                    break
+        finally:
+            c.close()
+        time.sleep(0.2)
+        return data
+
+    def _status_line(self, raw: bytes) -> str:
+        return raw.split(b"\r\n", 1)[0].decode("latin1")
+
+    def test_foreign_origin_post_does_not_run_the_smuggled_request(self):
+        raw = self._send_outer("Origin: http://evil.example\r\n")
+        self.assertEqual(self.hits, [])
+        self.assertRegex(self._status_line(raw), r"40[34]")
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)  # only the refusal, no inner reply
+
+    def test_missing_origin_post_does_not_run_the_smuggled_request(self):
+        raw = self._send_outer("")
+        self.assertEqual(self.hits, [])
+        self.assertRegex(self._status_line(raw), r"40[34]")
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)
+
+    def test_foreign_host_post_does_not_run_the_smuggled_request(self):
+        inner = self._inner_request()
+        outer = (f"POST /api/act HTTP/1.1\r\nHost: evil.example:{self.port}\r\n"
+                 f"Origin: http://127.0.0.1:{self.port}\r\n"
+                 f"Content-Type: application/json\r\n"
+                 f"Content-Length: {len(inner)}\r\n\r\n").encode() + inner
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            c.sendall(outer)
+            c.settimeout(3)
+            raw = b""
+            while True:
+                try:
+                    chunk = c.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            c.close()
+        time.sleep(0.2)
+        self.assertEqual(self.hits, [])
+        self.assertRegex(self._status_line(raw), r"403")
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)
+
+    def test_unknown_route_post_does_not_run_the_smuggled_request(self):
+        raw = self._send_outer(f"Origin: http://127.0.0.1:{self.port}\r\n", path="/api/nope")
+        self.assertEqual(self.hits, [])
+        self.assertRegex(self._status_line(raw), r"404")
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)
+
+    def test_a_legitimate_post_still_runs(self):
+        body = b'{"ok":1}'
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("POST", "/api/act", body=body,
+                         headers={"Origin": f"http://127.0.0.1:{self.port}",
+                                  "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 200)
+        finally:
+            conn.close()
+        self.assertEqual(len(self.hits), 1)
+        self.assertEqual(self.hits[0][1], body)
+
+
 class TlsCertRebindTests(unittest.TestCase):
     """_tls_cert must connect to a resolved-and-validated IP, never re-resolve
     the hostname at connect time (DNS-rebinding TOCTOU the verify pass caught)."""
