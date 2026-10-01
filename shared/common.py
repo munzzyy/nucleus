@@ -1250,9 +1250,7 @@ def _make_handler(app: App, port: int):
             return self.headers.get("Host", "") in _allowed_hosts(port)
 
         def _request_has_unread_body(self) -> bool:
-            # True when the client declared a body this request did not consume.
-            # Left on a keep-alive socket, those bytes would be parsed as the
-            # next request, so a refused POST could smuggle a same-origin one.
+            # Unread body bytes on a keep-alive socket parse as the next request.
             if getattr(self, "_body_consumed", False):
                 return False
             if self.headers.get("Transfer-Encoding"):
@@ -1279,6 +1277,8 @@ def _make_handler(app: App, port: int):
             self.send_header("Cache-Control", "no-store")
             for k, v in resp.headers.items():
                 self.send_header(k, v)
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
@@ -1353,9 +1353,11 @@ def _make_handler(app: App, port: int):
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
-                    length = 0
+                    length = -1
                 if length < 0:
-                    length = 0  # a negative Content-Length is malformed; treat as no body
+                    # Malformed: treat as no body, and close since its end is unknown.
+                    length = 0
+                    self.close_connection = True
                 limit = app.body_limits.get(key, MAX_BODY)  # per-route override (uploads)
                 if length > limit:
                     # Close instead of leaving the oversized body on a keep-alive
