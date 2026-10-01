@@ -94,22 +94,22 @@
       </div>
       <div class="row mt">
         <div class="field w-220">
-          <label>Tool</label>
+          <label for="run-tool">Tool</label>
           <select id="run-tool"></select>
         </div>
         <div class="field grow-2">
-          <label>Target</label>
+          <label for="run-target">Target</label>
           <input type="text" id="run-target" placeholder="scanme.nmap.org or https://example.com">
         </div>
       </div>
       <div class="row mt" id="run-options-row"></div>
       <div class="row mt hidden" id="run-wordlist-row">
         <div class="field grow-2">
-          <label>Wordlist search</label>
+          <label for="run-wordlist-search">Wordlist search</label>
           <input type="text" id="run-wordlist-search" placeholder="type to filter, e.g. 'common', 'subdomains', 'raft'…">
         </div>
         <div class="field w-320">
-          <label>Wordlist <span id="run-wordlist-count" class="sub"></span></label>
+          <label for="run-wordlist">Wordlist <span id="run-wordlist-count" class="sub"></span></label>
           <select id="run-wordlist"></select>
         </div>
       </div>
@@ -255,7 +255,7 @@
         run couldn't.</p>
       <div class="row mt">
         <div class="field grow-2">
-          <label>Target</label>
+          <label for="web-target">Target</label>
           <input type="text" id="web-target" placeholder="https://example.com — or a bare host for domain-recon playbooks">
         </div>
       </div>
@@ -269,7 +269,7 @@
         server disclosures, and probes for a CORS misconfiguration.</p>
       <div class="row mt">
         <div class="field grow-2">
-          <label>URL</label>
+          <label for="web-analyze-target">URL</label>
           <input type="text" id="web-analyze-target" placeholder="https://example.com">
         </div>
         <div class="field fit">
@@ -488,7 +488,7 @@
         command string, never executes it.</p>
       <div class="row mt">
         <div class="field w-220">
-          <label>Tool</label>
+          <label for="pw-build-tool">Tool</label>
           <select id="pw-build-tool"></select>
         </div>
       </div>
@@ -529,11 +529,11 @@
       </div>
       <div class="row arsenal-controls">
         <div class="field grow-2">
-          <label>Search</label>
+          <label for="inv-search">Search</label>
           <input type="search" id="inv-search" placeholder="Search by tool name or purpose…">
         </div>
         <div class="field w-220">
-          <label>Category</label>
+          <label for="inv-cat">Category</label>
           <select id="inv-cat"><option value="">All categories</option></select>
         </div>
         <div class="field w-160">
@@ -558,7 +558,7 @@
         if a value looks weird.</p>
       <div class="row mt">
         <div class="field w-220">
-          <label>Tool</label>
+          <label for="build-tool">Tool</label>
           <select id="build-tool"></select>
         </div>
       </div>
@@ -635,11 +635,11 @@
     <div class="card">
       <div class="row">
         <div class="field w-220">
-          <label>Tool</label>
+          <label for="x-tool">Tool</label>
           <select id="x-tool"></select>
         </div>
         <div class="field grow-2">
-          <label>Arguments</label>
+          <label for="x-args">Arguments</label>
           <input type="text" id="x-args" placeholder="-sV -p 80,443 --script vuln scanme.nmap.org" autocomplete="off" spellcheck="false">
         </div>
         <div class="field fit">

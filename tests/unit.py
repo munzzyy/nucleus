@@ -21,6 +21,7 @@ import collections
 import datetime
 import hashlib
 import hmac
+import html.parser
 import http.client
 import http.server
 import json
@@ -6341,6 +6342,133 @@ class NucleusCliTests(unittest.TestCase):
                 rc = self.cli.cmd_wipe(mock.Mock(yes=False))
         self.assertEqual(rc, 1)
         self.assertTrue((repo / "var" / "redcell-out" / "out.txt").exists())  # untouched
+
+
+class _A11yScan(html.parser.HTMLParser):
+    """Collects what a screen reader needs from a static page: <html lang>,
+    a name for every form control, and a name for every button."""
+
+    _CONTROLS = ("input", "select", "textarea")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.lang = None
+        self.ids = set()
+        self.label_text = {}          # for= id -> label text
+        self.wrapped_named = set()    # ids of controls inside a wrapping label with text
+        self.controls = []            # (id or "<tag>@line", attrs)
+        self.buttons = []             # ("<button>@line", attrs, text)
+        self._labels = []             # open labels: [for_id, text parts, wrapped control keys]
+        self._buttons = []            # open buttons: [key, attrs, text parts]
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if a.get("id"):
+            self.ids.add(a["id"])
+        if tag == "html":
+            self.lang = a.get("lang")
+        elif tag == "label":
+            self._labels.append([a.get("for"), [], []])
+        elif tag == "button":
+            self._buttons.append([f"<button>@{self.getpos()[0]}", a, []])
+        elif tag in self._CONTROLS:
+            if a.get("type", "").lower() == "hidden" or a.get("aria-hidden") == "true":
+                return
+            key = a.get("id") or f"<{tag}>@{self.getpos()[0]}"
+            self.controls.append((key, a))
+            for lab in self._labels:
+                if not lab[0]:
+                    lab[2].append(key)
+        elif tag == "img":
+            for b in self._buttons:
+                b[2].append(a.get("alt", ""))
+
+    def handle_data(self, data):
+        for lab in self._labels:
+            lab[1].append(data)
+        for b in self._buttons:
+            b[2].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "label" and self._labels:
+            for_id, parts, wrapped = self._labels.pop()
+            text = "".join(parts).strip()
+            if for_id:
+                self.label_text[for_id] = text
+            elif text:
+                self.wrapped_named.update(wrapped)
+        elif tag == "button" and self._buttons:
+            key, a, parts = self._buttons.pop()
+            self.buttons.append((key, a, "".join(parts).strip()))
+
+    def _refs_ok(self, a):
+        refs = a.get("aria-labelledby", "").split()
+        return bool(refs) and all(r in self.ids for r in refs)
+
+    def unnamed_controls(self):
+        return [key for key, a in self.controls
+                if not (self.label_text.get(a.get("id", ""))
+                        or key in self.wrapped_named
+                        or a.get("aria-label", "").strip()
+                        or self._refs_ok(a))]
+
+    def unnamed_buttons(self):
+        return [key for key, a, text in self.buttons
+                if not (text or a.get("aria-label", "").strip() or self._refs_ok(a))]
+
+
+class StaticPageA11yTests(unittest.TestCase):
+    """Every console page, scanned with the stdlib parser: a page language, an
+    accessible name on every form control, and one on every button. A visible
+    <label> that isn't tied to its control (no for=, not wrapping it) names
+    nothing, which is what this catches."""
+
+    PAGES = sorted(common.REPO_ROOT.glob("consoles/*/static/index.html")) + \
+        [common.REPO_ROOT / "hub" / "static" / "index.html"]
+
+    def _scan(self, page):
+        scan = _A11yScan()
+        scan.feed(page.read_text(encoding="utf-8"))
+        scan.close()
+        return scan
+
+    def test_scans_every_console_page(self):
+        self.assertEqual(len(self.PAGES), len(common.CONSOLES))
+        for page in self.PAGES:
+            self.assertTrue(page.is_file(), page)
+
+    def test_every_page_declares_a_language(self):
+        for page in self.PAGES:
+            with self.subTest(page=str(page.relative_to(common.REPO_ROOT))):
+                self.assertTrue(self._scan(page).lang)
+
+    def test_every_form_control_has_a_name(self):
+        for page in self.PAGES:
+            with self.subTest(page=str(page.relative_to(common.REPO_ROOT))):
+                self.assertEqual(self._scan(page).unnamed_controls(), [])
+
+    def test_every_button_has_a_name(self):
+        for page in self.PAGES:
+            with self.subTest(page=str(page.relative_to(common.REPO_ROOT))):
+                self.assertEqual(self._scan(page).unnamed_buttons(), [])
+
+    def test_scanner_catches_a_detached_label(self):
+        scan = _A11yScan()
+        scan.feed('<html lang="en"><label>Tool</label><select id="t"></select>'
+                  '<label for="u">Target</label><input id="u">'
+                  '<label>Lab <input type="checkbox" id="v"></label>'
+                  '<input id="w" aria-label="Search"><input type="hidden" id="x">'
+                  '<button id="b1"></button><button aria-label="Close"></button>'
+                  '<button><span>Run</span></button></html>')
+        self.assertEqual(scan.unnamed_controls(), ["t"])
+        self.assertEqual(len(scan.unnamed_buttons()), 1)
+
+    def test_toasts_reach_a_polite_live_region(self):
+        # The live region is built in JS, so the HTML scan can't see it.
+        js = (common.REPO_ROOT / "shared" / "static" / "nucleus.js").read_text(encoding="utf-8")
+        self.assertIn('"aria-live": "polite"', js)
+        toast = js[js.index("N.toast = function"):]
+        self.assertIn("N.announce(msg)", toast[:toast.index("};")])
 
 
 class FindingsModuleTests(unittest.TestCase):
