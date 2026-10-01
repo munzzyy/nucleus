@@ -146,6 +146,8 @@ def cmd_status(args):
         name = common.CONSOLE_BY_SLUG[slug]["name"]
         print(f"  {'● up  ' if up else '○ down'}  {name:8} http://127.0.0.1:{port}/")
     for a in common.EXTERNAL_APPS:
+        if not common._external_app_present(a):
+            continue
         up = _port_busy(a["port"])
         print(f"  {'● up  ' if up else '○ down'}  {a['name']:8} http://127.0.0.1:{a['port']}/  (external)")
     return 0 if any_up else 1

@@ -41,7 +41,7 @@ Install puts `nucleus` on your PATH (`~/.local/bin`), adds a Nucleus app-menu en
 
 You need Python 3.11 or newer and a browser, nothing else. The one-click install targets Linux desktops; the app itself runs anywhere Python does. Redcell's runners use whatever pentest tools you already have on the box, and the scrub panel uses mat2 when it's present. Both say what's missing and keep working without it.
 
-The app starts every console (and your coleos-hub, if it's there) in the background, then opens the hub. The switcher at the top moves between consoles inside the same window. Set your API keys from the hub's Settings panel, no file editing.
+The app starts every console in the background, then opens the hub. The switcher at the top moves between consoles inside the same window. Set your API keys from the hub's Settings panel, no file editing.
 
 Hit Ctrl-K (Cmd-K on a Mac) anywhere and you get a command palette: type a few letters to jump to another console or straight to any tool section on the page you're on. It reads the page's own headings, so it works the same on every console with nothing to configure, and it shows your most-recently-used commands first when the box is empty. Both the palette and the `?` help overlay trap focus and restore it on close.
 

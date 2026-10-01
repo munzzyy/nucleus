@@ -4,7 +4,7 @@
 
 You had three piles of security work that never talked to each other: the OSINT website (lost in a migration), the pentest/opsec kit staged in `~/security-setup/`, and the client-facing OSINT report engine (also lost). Nucleus pulls all of it into one place.
 
-The design constraint was to match how the rest of your stack already works: a small stdlib-only Python server bound to loopback, serving a hardened local web UI, with zero dependencies to audit. Same shape as coleos-hub and the old osint-console. That keeps the security surface tiny and means there's nothing to `pip install` and vet.
+The design constraint was a small stdlib-only Python server bound to loopback, serving a hardened local web UI, with zero dependencies to audit. The old osint-console had the same shape. That keeps the security surface tiny and means there's nothing to `pip install` and vet.
 
 "One app, but it can be many" is solved by making one shared server core and thin consoles on top of it. It started as three security consoles; it's now six. Two toolbelt consoles most machines want (a developer kit and a live system monitor) and a search-dork generator all ride the exact same core. Run them together on one box and the launcher + switcher make it feel like a single app. Copy the repo to more machines and run one console on each; they still cross-link over loopback.
 
@@ -34,7 +34,7 @@ The design constraint was to match how the rest of your stack already works: a s
 
 - **Consoles** are tiny. Each is a `build_app()` that hands `common.serve()` a `static_dir` and a `routes` dict of `"GET /api/x" -> handler`. All the hard stuff is inherited from the core, so a console can't accidentally weaken a guard.
 
-- **The hub** aggregates. It calls each console on loopback (`local_get_json`) to show headline numbers (tools installed, opsec posture) and draws the status of everything, including external local apps like coleos-hub. It's the "one app" you open.
+- **The hub** aggregates. It calls each console on loopback (`local_get_json`) to show headline numbers (tools installed, opsec posture) and draws the status of everything, including any external local app it finds. It's the "one app" you open.
 
 ## Why the browser never talks cross-origin
 

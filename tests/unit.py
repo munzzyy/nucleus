@@ -6590,6 +6590,43 @@ class ChangelogTests(unittest.TestCase):
         self.assertNotIn("–", self.text)
 
 
+class ExternalAppVisibilityTests(unittest.TestCase):
+    """An external app (the personal COLE-OS Hub) only shows up when this
+    machine actually has it: its launcher script is on disk, or its port is
+    answering. A stranger's hub never shows a permanently-offline card."""
+
+    def test_absent_when_no_launcher_and_port_closed(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        with mock.patch.object(common.Path, "home", return_value=Path(empty.name)), \
+             mock.patch.object(common, "_tcp_open", return_value=False), \
+             mock.patch.object(common, "_ping", return_value=False):
+            slugs = [i["slug"] for i in common.siblings_status()]
+        self.assertNotIn("coleos-hub", slugs)
+        self.assertEqual(len(slugs), len(common.CONSOLES))
+
+    def test_present_when_port_is_open(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        with mock.patch.object(common.Path, "home", return_value=Path(empty.name)), \
+             mock.patch.object(common, "_tcp_open", return_value=True), \
+             mock.patch.object(common, "_ping", return_value=False):
+            items = common.siblings_status()
+        self.assertIn("coleos-hub", [i["slug"] for i in items])
+
+    def test_present_when_launcher_exists(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        launcher = Path(home.name) / "Projects" / "coleos-hub" / "server.py"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("# marker")
+        with mock.patch.object(common.Path, "home", return_value=Path(home.name)), \
+             mock.patch.object(common, "_tcp_open", return_value=False), \
+             mock.patch.object(common, "_ping", return_value=False):
+            slugs = [i["slug"] for i in common.siblings_status()]
+        self.assertIn("coleos-hub", slugs)
+
+
 class _A11yScan(html.parser.HTMLParser):
     """Collects what a screen reader needs from a static page: <html lang>,
     a name for every form control, and a name for every button."""

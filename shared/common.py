@@ -76,7 +76,8 @@ CONSOLES: list[dict] = [
 # Other local apps Nucleus knows how to point at (not part of this repo).
 EXTERNAL_APPS: list[dict] = [
     {"slug": "coleos-hub", "name": "COLE-OS Hub", "port": 4747,
-     "tag": "vault", "desc": "The Obsidian control panel.", "path": "/"},
+     "tag": "vault", "desc": "The Obsidian control panel.", "path": "/",
+     "launcher": "Projects/coleos-hub/server.py"},
 ]
 
 CONSOLE_BY_SLUG = {c["slug"]: c for c in CONSOLES}
@@ -1172,10 +1173,20 @@ def opsec_status(force: bool = False, oracles: bool = False) -> dict:
     return data
 
 
+def _external_app_present(app: dict) -> bool:
+    """Only surface an external app a given machine actually has: its launcher
+    script is on disk, or something is already listening on its port."""
+    launcher = app.get("launcher")
+    if launcher and (Path.home() / launcher).exists():
+        return True
+    return _tcp_open(app["port"])
+
+
 def siblings_status() -> list[dict]:
-    """Health of every console + known external app, checked in parallel."""
+    """Health of every console + the external apps this machine has, in parallel."""
     our_ports = {c["port"] for c in CONSOLES}
-    items = [dict(c) for c in CONSOLES] + [dict(a) for a in EXTERNAL_APPS]
+    externals = [dict(a) for a in EXTERNAL_APPS if _external_app_present(a)]
+    items = [dict(c) for c in CONSOLES] + externals
     results: dict[int, bool] = {}
     lock = threading.Lock()
 
