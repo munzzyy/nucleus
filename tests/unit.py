@@ -6588,8 +6588,8 @@ class ChangelogTests(unittest.TestCase):
         self.assertIn("GPL-3.0-or-later", entry)
 
     def test_no_em_or_en_dashes(self):
-        self.assertNotIn("—", self.text)
-        self.assertNotIn("–", self.text)
+        self.assertNotIn("\u2014", self.text)
+        self.assertNotIn("\u2013", self.text)
 
 
 class ExternalAppVisibilityTests(unittest.TestCase):
