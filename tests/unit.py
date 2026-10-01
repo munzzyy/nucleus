@@ -1094,6 +1094,87 @@ class BodyLimitTests(unittest.TestCase):
         self.assertIn("400", status_line)
 
 
+class ClientDisconnectQuietTests(unittest.TestCase):
+    """A browser tab closed mid-scan drops the socket before the reply is
+    written. That is not a server fault, so `nucleus up` (which serves in
+    process, on the user's terminal) must not print a traceback for it. Any
+    other handler-level error still prints one."""
+
+    def _free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def setUp(self):
+        static_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(static_dir, ignore_errors=True))
+        self.handled = threading.Event()
+
+        def slow(req):
+            time.sleep(0.5)
+            self.handled.set()
+            return common.Response.raw(b"x" * (2 * 1024 * 1024), "application/octet-stream")
+
+        app = common.App(slug="unit-test-app", static_dir=static_dir,
+                         routes={"GET /slow": slow})
+        self.httpd = None
+        for _attempt in range(3):
+            port = self._free_port()
+            try:
+                self.httpd = common.serve(app, port=port, block=False)
+                self.port = port
+                break
+            except OSError:
+                continue
+        if self.httpd is None:
+            self.skipTest("could not bind a loopback test port")
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _hang_up_mid_request(self, reset: bool) -> str:
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            if reset:
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            c.sendall(f"GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+            c.close()
+            self.assertTrue(self.handled.wait(5), "the route never ran")
+            time.sleep(1.0)
+        return err.getvalue()
+
+    def test_client_closing_mid_response_prints_no_traceback(self):
+        self.assertNotIn("Traceback", self._hang_up_mid_request(reset=False))
+
+    def test_client_resetting_mid_response_prints_no_traceback(self):
+        self.assertNotIn("Traceback", self._hang_up_mid_request(reset=True))
+
+    def test_disconnect_errors_are_swallowed_by_handle_error(self):
+        import io, contextlib
+        for exc in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                try:
+                    raise exc()
+                except exc:
+                    self.httpd.handle_error(None, ("127.0.0.1", 1))
+            self.assertEqual(err.getvalue(), "", exc.__name__)
+
+    def test_other_errors_still_print_a_traceback(self):
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                self.httpd.handle_error(None, ("127.0.0.1", 1))
+        self.assertIn("Traceback", err.getvalue())
+        self.assertIn("ValueError: boom", err.getvalue())
+
+
 class TlsCertRebindTests(unittest.TestCase):
     """_tls_cert must connect to a resolved-and-validated IP, never re-resolve
     the hostname at connect time (DNS-rebinding TOCTOU the verify pass caught)."""

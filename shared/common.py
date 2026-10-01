@@ -28,6 +28,7 @@ import signal
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -1378,11 +1379,22 @@ def _make_handler(app: App, port: int):
     return Handler
 
 
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A tab closed mid-response is routine, not a fault worth a traceback.
+        if isinstance(sys.exc_info()[1], _CLIENT_GONE):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(app: App, *, port: Optional[int] = None, block: bool = True):
     """Start the app on 127.0.0.1. Returns the server (for tests) if block=False."""
     port = port or app.meta["port"]
     handler = _make_handler(app, port)
-    httpd = ThreadingHTTPServer((BIND_ADDR, port), handler)
+    httpd = _Server((BIND_ADDR, port), handler)
     httpd.daemon_threads = True
     if not block:
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
