@@ -178,6 +178,12 @@ def run_app(selftest: bool = False) -> int:
 
 
 def main():
+    if sys.version_info < common.MIN_PYTHON:
+        v = sys.version_info
+        need = ".".join(str(n) for n in common.MIN_PYTHON)
+        print(f"[nucleus] needs Python {need} or newer; this is {v.major}.{v.minor}.{v.micro}.",
+              file=sys.stderr)
+        return 1
     selftest = "--selftest" in sys.argv[1:]
     if not start_backend():
         print("[nucleus] backend did not come up on :8890", file=sys.stderr)

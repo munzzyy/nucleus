@@ -17,6 +17,7 @@ don't "fix" it by loosening the assertion.
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 import hashlib
 import hmac
@@ -6260,6 +6261,45 @@ class NucleusCliTests(unittest.TestCase):
              contextlib.redirect_stdout(buf):
             self.cli.cmd_doctor(mock.Mock())
         self.assertIn("All good.", buf.getvalue())
+
+    _OLD_PY = collections.namedtuple(
+        "VI", "major minor micro releaselevel serial")(3, 9, 25, "final", 0)
+
+    def test_doctor_flags_python_under_the_floor(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with mock.patch.object(sys, "version_info", self._OLD_PY), \
+             mock.patch.object(self.cli, "_probe_native_gui", return_value=(True, "")), \
+             contextlib.redirect_stdout(buf):
+            rc = self.cli.cmd_doctor(mock.Mock())
+        self.assertEqual(rc, 1)
+        self.assertIn("  python 3.9.25  NEEDS >= 3.11\n", buf.getvalue())
+        self.assertNotIn("All good.", buf.getvalue())
+
+    def test_every_command_but_doctor_refuses_python_under_the_floor(self):
+        import io, contextlib
+        for argv in (["nucleus"], ["nucleus", "app"], ["nucleus", "up"],
+                     ["nucleus", "firefox"], ["nucleus", "wipe", "--yes"]):
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(sys, "version_info", self._OLD_PY), \
+                 mock.patch.object(self.cli, "cmd_app") as app, \
+                 mock.patch.object(self.cli, "cmd_up") as up, \
+                 mock.patch.object(self.cli, "cmd_firefox") as ff, \
+                 mock.patch.object(self.cli, "cmd_wipe") as wipe, \
+                 contextlib.redirect_stderr(err):
+                rc = self.cli.main()
+            self.assertEqual(rc, 1, argv)
+            self.assertIn("needs Python 3.11 or newer", err.getvalue())
+            for m in (app, up, ff, wipe):
+                m.assert_not_called()
+
+    def test_current_python_passes_the_floor(self):
+        self.assertIsNone(self.cli._too_old_python())
+        with mock.patch.object(sys, "argv", ["nucleus", "up"]), \
+             mock.patch.object(self.cli, "cmd_up", return_value=0) as up:
+            self.assertEqual(self.cli.main(), 0)
+        up.assert_called_once()
 
     def test_wipe_securely_removes_sensitive_files(self):
         import io, contextlib

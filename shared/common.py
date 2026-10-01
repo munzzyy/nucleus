@@ -42,6 +42,7 @@ from urllib.parse import parse_qs, urlparse
 
 BIND_ADDR = "127.0.0.1"  # loopback only — never a config knob
 VERSION = "1.0.0"
+MIN_PYTHON = (3, 11)  # the oldest CI proves; older ones fail to import a console
 
 # Persistent activity logging — the redcell audit trail (var/redcell-scans.jsonl),
 # the recon case history (var/recon-scans.jsonl), and saved nmap/nuclei output

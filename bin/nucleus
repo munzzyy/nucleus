@@ -228,6 +228,19 @@ def cmd_firefox(args):
     return 0
 
 
+def _min_python():
+    return ".".join(str(n) for n in common.MIN_PYTHON)
+
+
+def _too_old_python():
+    """A refusal message when this interpreter is under the floor, else None."""
+    if sys.version_info >= common.MIN_PYTHON:
+        return None
+    v = sys.version_info
+    return (f"nucleus needs Python {_min_python()} or newer; this is "
+            f"{v.major}.{v.minor}.{v.micro} ({sys.executable}).")
+
+
 def _probe_native_gui():
     """(ok, install_hint) for the native-window stack. The desktop app needs
     both PySide6 and its QtWebEngine widget; either missing means `nucleus app`
@@ -245,8 +258,9 @@ def cmd_doctor(args):
     ok = True
     print("Nucleus doctor\n")
     v = sys.version_info
-    print(f"  python {v.major}.{v.minor}.{v.micro}  {'ok' if v >= (3, 9) else 'NEEDS >= 3.9'}")
-    if v < (3, 9):
+    new_enough = v >= common.MIN_PYTHON
+    print(f"  python {v.major}.{v.minor}.{v.micro}  {'ok' if new_enough else 'NEEDS >= ' + _min_python()}")
+    if not new_enough:
         ok = False
     for slug in ORDER:
         modpath = MODULES[slug]
@@ -265,7 +279,9 @@ def cmd_doctor(args):
         print(f"           install it with: {hint}")
         print("           the app still runs headless: `nucleus up` then open http://127.0.0.1 in a browser")
 
-    if not ok:
+    if not new_enough:
+        print(f"\nNucleus needs Python {_min_python()} or newer.")
+    elif not ok:
         print("\nSome consoles are not importable yet.")
     elif not native_ok:
         print("\nConsoles OK — headless only (no native window until PySide6/QtWebEngine is installed).")
@@ -365,10 +381,15 @@ def main():
     wp.set_defaults(func=cmd_wipe)
 
     args = p.parse_args()
-    if not getattr(args, "func", None):
+    func = getattr(args, "func", None)
+    too_old = _too_old_python()
+    if too_old and func is not cmd_doctor:
+        print(too_old + " Run `nucleus doctor` for details.", file=sys.stderr)
+        return 1
+    if not func:
         # no subcommand → launch the app, the friendly default
         return cmd_app(args)
-    return args.func(args)
+    return func(args)
 
 
 if __name__ == "__main__":
