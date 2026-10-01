@@ -352,6 +352,7 @@ def main():
     p = argparse.ArgumentParser(
         prog="nucleus", description="Nucleus command center launcher",
         epilog="With no command, launches the desktop app.")
+    p.add_argument("--version", action="version", version=f"nucleus {common.VERSION}")
     sub = p.add_subparsers(dest="cmd")
 
     ap = sub.add_parser("app", help="launch the native desktop app (default)")

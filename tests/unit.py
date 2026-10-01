@@ -6424,6 +6424,36 @@ class NucleusCliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue((repo / "var" / "redcell-out" / "out.txt").exists())  # untouched
 
+    def test_version_flag_prints_the_version(self):
+        import subprocess
+        out = subprocess.run([sys.executable, str(common.REPO_ROOT / "bin" / "nucleus"), "--version"],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, f"nucleus {common.VERSION}\n")
+
+
+class ChangelogTests(unittest.TestCase):
+    """The CHANGELOG's top released version matches the code, and the release
+    note records the license change users need to know about."""
+
+    def setUp(self):
+        self.path = common.REPO_ROOT / "CHANGELOG.md"
+        self.text = self.path.read_text(encoding="utf-8")
+
+    def test_top_released_version_matches_the_code(self):
+        m = re.search(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", self.text, re.M)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), common.VERSION)
+
+    def test_release_entry_records_the_license_change(self):
+        entry = self.text[self.text.index(f"## [{common.VERSION}]"):]
+        entry = entry[:entry.index("\n## ", 1)] if "\n## " in entry[1:] else entry
+        self.assertIn("GPL-3.0-or-later", entry)
+
+    def test_no_em_or_en_dashes(self):
+        self.assertNotIn("—", self.text)
+        self.assertNotIn("–", self.text)
+
 
 class _A11yScan(html.parser.HTMLParser):
     """Collects what a screen reader needs from a static page: <html lang>,
