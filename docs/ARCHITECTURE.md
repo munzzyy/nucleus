@@ -2,7 +2,7 @@
 
 ## The idea
 
-You had three piles of security work that never talked to each other: the OSINT website (lost in a migration), the pentest/opsec kit staged in `~/security-setup/`, and the client-facing OSINT report engine (also lost). Nucleus pulls all of it into one place.
+There were three piles of security work that never talked to each other: the OSINT website (lost in a migration), the pentest/opsec kit staged in `~/security-setup/`, and the client-facing OSINT report engine (also lost). Nucleus pulls all of it into one place.
 
 The design constraint was a small stdlib-only Python server bound to loopback, serving a hardened local web UI, with zero dependencies to audit. The old osint-console had the same shape. That keeps the security surface tiny and means there's nothing to `pip install` and vet.
 
@@ -16,8 +16,8 @@ The design constraint was a small stdlib-only Python server bound to loopback, s
                        │  strict CSP, same-origin only │
                        └──────────────┬──────────────┘
                                       │ each tab talks ONLY to its own origin
-   hub :8890   recon :8900   redcell :8910   bastion :8920   devkit :8930   systems :8940   dork :8950   coleos-hub :4747
-        │           │             │               │              │              │            (external)
+   hub :8890   recon :8900   redcell :8910   bastion :8920   devkit :8930   systems :8940   dork :8950
+        │           │             │               │              │              │
         └──────────── all import shared/common.py ──────────────────────────────┘
                         (one server core, one set of guards)
 ```
@@ -45,6 +45,7 @@ Three consoles on three ports are three origins. Rather than open CORS and widen
 1. Handler dispatch checks the `Host` header against the allowlist → 403 if foreign.
 2. `/healthz`, `/api/siblings`, and static routes are served by the core.
 3. A registered route runs. For POST, the core first checks a same-origin `Origin`/`Referer` (exact host **and** port) and caps the body size (per-route override via `App.body_limits`, e.g. the scrub and devkit file-hash uploads).
+   A request refused before its body is read gets `Connection: close` and the socket closes. Left on a keep-alive socket, those body bytes would be read as a second request that never went through these checks.
 4. The handler returns a `common.Response`; a handler exception becomes a clean 500, never a crash.
 
 ## Recon data flow (OSINT)
