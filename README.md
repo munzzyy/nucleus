@@ -165,7 +165,7 @@ bin/                    launcher, installer, desktop + systemd files
 
 ## Roadmap
 
-What is left here is a release, not more code.
+Nothing is waiting on a person right now. 1.0.0 is tagged and released, and the next thing to build comes from an issue, not from this list.
 
 
 ## License
