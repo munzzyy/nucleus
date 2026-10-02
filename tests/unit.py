@@ -3896,9 +3896,13 @@ class TestDevkitHardening(unittest.TestCase):
             fn(*args, **kwargs)
 
     def test_nested_json_is_clean_error(self):
-        # json.loads blows its parser stack on this; the tool must translate
-        # that into a ValueError, not let RecursionError escape.
+        # Whether json.loads blows its parser stack on this depends on the
+        # interpreter (3.14.0 on CI parses it, 3.14.7 raises). The tool caps
+        # nesting itself, so the answer is a ValueError everywhere.
         self._assert_raises_value(devkit_tools.json_tool, "[" * 60000 + "]" * 60000, "validate")
+        self._assert_raises_value(devkit_tools.json_tool, "[" * 513 + "]" * 513, "validate")
+        self.assertTrue(devkit_tools.json_tool("[" * 512 + "]" * 512, "validate")["valid"])
+        self.assertTrue(devkit_tools.json_tool('{"a": "[[[[[[[[[["}', "validate")["valid"])
 
     def test_humanize_bytes_rejects_non_finite_and_oversized(self):
         self._assert_raises_value(devkit_tools.humanize_bytes, float("inf"))

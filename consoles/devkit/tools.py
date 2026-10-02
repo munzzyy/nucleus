@@ -358,8 +358,37 @@ def jwt_decode(token, secret: str = "", verify: bool = False) -> dict:
 # --------------------------------------------------------------------------
 # JSON
 # --------------------------------------------------------------------------
+# Deeper than any real document and shallower than any interpreter's parser
+# stack, so a pathological [[[[...]]]] fails the same way on every Python.
+JSON_MAX_DEPTH = 512
+
+
+def _json_depth(text: str) -> int:
+    depth = peak = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > peak:
+                peak = depth
+        elif ch in "]}":
+            depth -= 1
+    return peak
+
+
 def json_tool(text, mode: str = "pretty", sort_keys: bool = False) -> dict:
     text = "" if text is None else str(text)
+    if _json_depth(text) > JSON_MAX_DEPTH:
+        raise ValueError("JSON is nested too deeply to parse")
     try:
         obj = json.loads(text)
     except json.JSONDecodeError as e:
