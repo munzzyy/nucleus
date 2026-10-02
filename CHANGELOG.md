@@ -6,6 +6,12 @@ for [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-02
+
+First public release. Nucleus is a loopback-only security command center in
+plain stdlib Python with zero dependencies. A hub and six consoles share one
+hardened server core.
+
 ### Security
 - A refused request no longer leaves its body on a keep-alive connection.
   Before this, a page on any site could POST to a console with a body that was
@@ -13,33 +19,6 @@ for [semantic versioning](https://semver.org/spec/v2.0.0.html).
   and then ran the inner one, past the Origin and Host checks. Every refusal
   now closes the connection with `Connection: close`. So does a request with a
   malformed Content-Length.
-
-### Added
-- `nucleus --version` prints the running version and exits.
-- A static accessibility check in the test suite. Every console page must set a
-  page language and give every form control and button an accessible name.
-
-### Changed
-- Nucleus now needs Python 3.11 or newer and checks at startup. `doctor` reports
-  the shortfall and every other command refuses before it binds a port. CI runs
-  the suite on 3.11 through 3.14.
-- The hub only lists the external COLE-OS Hub when this machine has it. That
-  means its launcher is on disk or its port answers. Everyone else gets the
-  empty Apps panel instead of a card that is always offline.
-- The `dns_query` docstring and `docs/ARCHITECTURE.md` now say DoH goes to
-  Cloudflare first with Google as the fallback. That is what the code does.
-
-### Fixed
-- A browser tab closed mid-response no longer prints a BrokenPipeError or
-  ConnectionResetError traceback to the terminal.
-- The 12 Redcell form controls whose visible label was not tied to the control
-  now carry a real `for=`. A screen reader announces each one by name.
-
-## [1.0.0] - 2026-09-25
-
-First public release. Nucleus is a loopback-only security command center in
-plain stdlib Python with zero dependencies. A hub and six consoles share one
-hardened server core.
 
 ### Added
 - The core in `shared/common.py` keeps the whole security model in one place.
@@ -80,6 +59,9 @@ hardened server core.
   palette on every console.
 - SECURITY, THREAT_MODEL and CONTRIBUTING docs, a dependency-free CI matrix and
   issue and PR templates.
+- `nucleus --version` prints the running version and exits.
+- A static accessibility check in the test suite. Every console page must set a
+  page language and give every form control and button an accessible name.
 
 ### Changed
 - Relicensed from MIT to GPL-3.0-or-later, so copies and modified versions stay
@@ -87,3 +69,18 @@ hardened server core.
 
 [Unreleased]: https://github.com/munzzyy/nucleus/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/munzzyy/nucleus/releases/tag/v1.0.0
+- Nucleus now needs Python 3.11 or newer and checks at startup. `doctor` reports
+  the shortfall and every other command refuses before it binds a port. CI runs
+  the suite on 3.11 through 3.14.
+- The hub only lists the external COLE-OS Hub when this machine has it. That
+  means its launcher is on disk or its port answers. Everyone else gets the
+  empty Apps panel instead of a card that is always offline.
+- The `dns_query` docstring and `docs/ARCHITECTURE.md` now say DoH goes to
+  Cloudflare first with Google as the fallback. That is what the code does.
+
+### Fixed
+- A browser tab closed mid-response no longer prints a BrokenPipeError or
+  ConnectionResetError traceback to the terminal.
+- The 12 Redcell form controls whose visible label was not tied to the control
+  now carry a real `for=`. A screen reader announces each one by name.
+

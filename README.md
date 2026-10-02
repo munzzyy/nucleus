@@ -167,7 +167,6 @@ bin/                    launcher, installer, desktop + systemd files
 
 What is left here is a release, not more code.
 
-- A tagged release. The code calls itself 1.0.0 but has no git tag or GitHub release yet, so there is no version to pin. The tag waits until the fixes under Unreleased in [CHANGELOG.md](CHANGELOG.md) reach main. The keep-alive fix matters most. Before it, a cross-site page could hide a second request inside a POST the server refused, and that request got past the Origin and Host checks. Until the tag exists, please pin a commit.
 
 ## License
 
